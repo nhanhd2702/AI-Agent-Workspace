@@ -162,13 +162,14 @@ export function TurnTimelineDrawer({
           ) : (
             <ol className="relative border-l border-gray-800 ml-2.5 space-y-4">
               {logs.map((entry, idx) => {
+                const entryKey = entry.id || String(idx);
                 const logType = entry.logType ?? entry.log_type ?? "turn";
                 const createdAt = entry.createdAt ?? entry.created_at;
                 const durationMs = entry.durationMs ?? entry.duration_ms;
                 const agentName = entry.agentName ?? entry.agent_name;
                 const turnNum = entry.turnNumber ?? entry.turn_number;
                 const steps = entry.steps || [];
-                const isStepsExpanded = Boolean(expandedStepsByLog[entry.id]);
+                const isStepsExpanded = Boolean(expandedStepsByLog[entryKey]);
                 const hiddenCount = Math.max(0, steps.length - collapsedStepLimit);
                 const visibleSteps = isStepsExpanded
                   ? steps
@@ -177,7 +178,7 @@ export function TurnTimelineDrawer({
                 const inputPayload = entry.inputPayload ?? entry.input_payload;
                 const outputPayload =
                   entry.outputPayload ?? entry.output_payload;
-                const isPayloadExpanded = Boolean(expandedPayloadByLog[entry.id]);
+                const isPayloadExpanded = Boolean(expandedPayloadByLog[entryKey]);
                 const hasPayloads =
                   inputPayload !== undefined && inputPayload !== null
                     ? true
@@ -187,7 +188,7 @@ export function TurnTimelineDrawer({
                   const fromSt = entry.fromStatus ?? entry.from_status;
                   const toSt = entry.toStatus ?? entry.to_status;
                   return (
-                    <li key={entry.id || idx} className="ml-5 relative">
+                    <li key={entryKey} className="ml-5 relative">
                       <span className="absolute -left-[27px] top-1.5 w-3 h-3 rounded-full bg-gray-800 border-2 border-purple-400" />
                       <div className="rounded-xl bg-gray-900/70 border border-gray-800 p-3 space-y-1">
                         <div className="flex items-center justify-between gap-2 text-xs">
@@ -214,7 +215,7 @@ export function TurnTimelineDrawer({
                 }
 
                 return (
-                  <li key={entry.id || idx} className="ml-5 relative">
+                  <li key={entryKey} className="ml-5 relative">
                     <span
                       className={`absolute -left-[27px] top-2 w-3 h-3 rounded-full border-2 ${
                         entry.status === "failed" || entry.status === "rejected"
@@ -308,7 +309,7 @@ export function TurnTimelineDrawer({
                               onClick={() =>
                                 setExpandedStepsByLog((prev) => ({
                                   ...prev,
-                                  [entry.id]: !isStepsExpanded,
+                                  [entryKey]: !isStepsExpanded,
                                 }))
                               }
                               className="inline-flex items-center gap-1 text-[11px] font-medium text-sky-400 hover:text-sky-300 cursor-pointer"
@@ -342,7 +343,7 @@ export function TurnTimelineDrawer({
                             onClick={() =>
                               setExpandedPayloadByLog((prev) => ({
                                 ...prev,
-                                [entry.id]: !isPayloadExpanded,
+                                [entryKey]: !isPayloadExpanded,
                               }))
                             }
                             className="text-[11px] text-gray-400 hover:text-gray-200 underline cursor-pointer"

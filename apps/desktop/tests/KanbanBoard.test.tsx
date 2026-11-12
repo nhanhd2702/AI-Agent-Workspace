@@ -87,4 +87,80 @@ describe("KanbanBoard", () => {
     fireEvent.click(screen.getByText("Beta Task"));
     expect(onSelectTask).toHaveBeenCalledWith(expect.objectContaining({ id: "t2" }));
   });
+
+  it("reverts ONLY the failed card without clobbering concurrent moves or other card states", async () => {
+    let rejectMoveA!: (reason?: unknown) => void;
+    let resolveMoveB!: () => void;
+
+    const onMoveTask = vi.fn().mockImplementation((taskId: string) => {
+      if (taskId === "tA") {
+        return new Promise((_res, rej) => {
+          rejectMoveA = rej;
+        });
+      }
+      return new Promise<void>((res) => {
+        resolveMoveB = res;
+      });
+    });
+
+    render(
+      <KanbanBoard
+        tasks={[
+          { id: "tA", title: "Task A", status: "running", agentName: "ContentWriter" },
+          { id: "tB", title: "Task B", status: "running", agentName: "UIDesigner" },
+        ]}
+        onMoveTask={onMoveTask}
+      />
+    );
+
+    const selectA = screen.getByLabelText("Chuyển trạng thái cho Task A");
+    const selectB = screen.getByLabelText("Chuyển trạng thái cho Task B");
+
+    // Start moving Task A (will fail later) and Task B (will succeed) concurrently
+    fireEvent.change(selectA, { target: { value: "waiting_review" } });
+    fireEvent.change(selectB, { target: { value: "delivered" } });
+
+    await waitFor(() => {
+      expect(onMoveTask).toHaveBeenCalledWith("tA", "waiting_review");
+      expect(onMoveTask).toHaveBeenCalledWith("tB", "delivered");
+    });
+
+    // Resolve Task B first
+    resolveMoveB();
+
+    // Reject Task A
+    rejectMoveA(new Error("409 Conflict on Task A"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("409 Conflict on Task A");
+    });
+
+    // Task A reverted to running (Đang làm), while Task B stays in delivered (Đã bàn giao)
+    expect(screen.getByTestId("kanban-column-running")).toHaveTextContent("Task A");
+    expect(screen.getByTestId("kanban-column-delivered")).toHaveTextContent("Task B");
+  });
+
+  it("allows resuming paused -> running and advancing approved -> delivered via select", async () => {
+    const onMoveTask = vi.fn().mockResolvedValue(undefined);
+    render(
+      <KanbanBoard
+        tasks={[
+          { id: "t-paused", title: "Paused Task", status: "paused", agentName: "ContentWriter" },
+          { id: "t-approved", title: "Approved Task", status: "approved", agentName: "UIDesigner" },
+        ]}
+        onMoveTask={onMoveTask}
+      />
+    );
+
+    const pausedSelect = screen.getByLabelText("Chuyển trạng thái cho Paused Task");
+    fireEvent.change(pausedSelect, { target: { value: "running" } });
+
+    const approvedSelect = screen.getByLabelText("Chuyển trạng thái cho Approved Task");
+    fireEvent.change(approvedSelect, { target: { value: "delivered" } });
+
+    await waitFor(() => {
+      expect(onMoveTask).toHaveBeenCalledWith("t-paused", "running");
+      expect(onMoveTask).toHaveBeenCalledWith("t-approved", "delivered");
+    });
+  });
 });

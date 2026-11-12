@@ -40,7 +40,7 @@ const KANBAN_COLUMNS: ColumnConfig[] = [
     id: "pending",
     label: "Chờ",
     targetStatus: "pending",
-    statuses: ["pending", "backlog"],
+    statuses: ["pending"],
     accentClass: "border-gray-700/80",
     dotClass: "bg-gray-400",
   },
@@ -80,7 +80,6 @@ const KANBAN_COLUMNS: ColumnConfig[] = [
 
 const ALLOWED_TRANSITIONS: Record<string, Set<string>> = {
   pending: new Set(["running", "cancelled", "paused"]),
-  backlog: new Set(["running", "cancelled", "paused"]),
   running: new Set([
     "waiting_review",
     "delivered",
@@ -115,7 +114,6 @@ const ALLOWED_TRANSITIONS: Record<string, Set<string>> = {
 
 const STATUS_LABELS: Record<string, string> = {
   pending: "Mới",
-  backlog: "Tồn đọng",
   running: "Đang chạy",
   paused: "Tạm dừng",
   waiting_review: "Cần duyệt",
@@ -215,20 +213,24 @@ export function KanbanBoard({
   const [viewMode, setViewMode] = useState<"kanban" | "list">(defaultViewMode);
   const [localTasks, setLocalTasks] = useState<BoardTask[]>(tasks);
   const [dragOverColumn, setDragOverColumn] = useState<string | null>(null);
-  const [movingTaskId, setMovingTaskId] = useState<string | null>(null);
+  const [movingTaskIds, setMovingTaskIds] = useState<Record<string, boolean>>({});
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const draggingTaskIdRef = useRef<string | null>(null);
+  const movingTaskIdsRef = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
     setLocalTasks(tasks);
   }, [tasks]);
 
   const attemptMoveTask = async (taskId: string, targetStatus: string) => {
+    const resolvedTarget = targetStatus.toLowerCase();
+    if (!resolvedTarget || movingTaskIdsRef.current[taskId]) return;
+
     const task = localTasks.find((t) => t.id === taskId);
     if (!task) return;
 
+    const previousStatus = task.status;
     const currentStatus = (task.status || "pending").toLowerCase();
-    const resolvedTarget = targetStatus.toLowerCase();
 
     if (currentStatus === resolvedTarget) {
       return;
@@ -244,8 +246,8 @@ export function KanbanBoard({
     }
 
     setErrorBanner(null);
-    const snapshot = localTasks;
-    setMovingTaskId(taskId);
+    movingTaskIdsRef.current[taskId] = true;
+    setMovingTaskIds((prev) => ({ ...prev, [taskId]: true }));
     setLocalTasks((prev) =>
       prev.map((item) =>
         item.id === taskId ? { ...item, status: resolvedTarget } : item
@@ -255,15 +257,58 @@ export function KanbanBoard({
     try {
       await onMoveTask(taskId, resolvedTarget);
     } catch (err) {
-      setLocalTasks(snapshot);
+      setLocalTasks((prev) =>
+        prev.map((item) =>
+          item.id === taskId ? { ...item, status: previousStatus } : item
+        )
+      );
       const message =
         err instanceof Error
           ? err.message
           : "Không thể cập nhật trạng thái task. Đã hoàn tác vị trí cũ.";
       setErrorBanner(message);
     } finally {
-      setMovingTaskId(null);
+      delete movingTaskIdsRef.current[taskId];
+      setMovingTaskIds((prev) => {
+        const next = { ...prev };
+        delete next[taskId];
+        return next;
+      });
     }
+  };
+
+  const renderMoveSelect = (
+    task: BoardTask,
+    isMoving: boolean,
+    selectClassName: string
+  ) => {
+    const normalizedStatus = (task.status || "pending").toLowerCase();
+    const currentCol = getColumnForStatus(normalizedStatus);
+    const selectValue =
+      normalizedStatus === currentCol.targetStatus
+        ? currentCol.targetStatus
+        : "";
+
+    return (
+      <select
+        aria-label={`Chuyển trạng thái cho ${task.title}`}
+        value={selectValue}
+        disabled={isMoving}
+        onChange={(e) => attemptMoveTask(task.id, e.target.value)}
+        className={selectClassName}
+      >
+        {selectValue === "" && (
+          <option value="" disabled>
+            {`• ${STATUS_LABELS[normalizedStatus] || normalizedStatus}`}
+          </option>
+        )}
+        {KANBAN_COLUMNS.map((opt) => (
+          <option key={opt.id} value={opt.targetStatus}>
+            {`→ ${opt.label}`}
+          </option>
+        ))}
+      </select>
+    );
   };
 
   const handleDropOnColumn = async (
@@ -397,7 +442,7 @@ export function KanbanBoard({
                       const turnCount =
                         task.turnCount ?? task.turn_count ?? 0;
                       const isSelected = selectedTaskId === task.id;
-                      const isMoving = movingTaskId === task.id;
+                      const isMoving = Boolean(movingTaskIds[task.id]);
 
                       return (
                         <article
@@ -443,21 +488,11 @@ export function KanbanBoard({
                           </div>
 
                           <div className="pt-2 border-t border-gray-800/80 flex items-center justify-between gap-2">
-                            <select
-                              aria-label={`Chuyển trạng thái cho ${task.title}`}
-                              value={getColumnForStatus(task.status).targetStatus}
-                              disabled={isMoving}
-                              onChange={(e) =>
-                                attemptMoveTask(task.id, e.target.value)
-                              }
-                              className="bg-gray-900 border border-gray-800 rounded-lg px-2 py-1 text-[11px] text-gray-300 focus:outline-none focus:border-sky-500 cursor-pointer"
-                            >
-                              {KANBAN_COLUMNS.map((opt) => (
-                                <option key={opt.id} value={opt.targetStatus}>
-                                  {`→ ${opt.label}`}
-                                </option>
-                              ))}
-                            </select>
+                            {renderMoveSelect(
+                              task,
+                              isMoving,
+                              "bg-gray-900 border border-gray-800 rounded-lg px-2 py-1 text-[11px] text-gray-300 focus:outline-none focus:border-sky-500 cursor-pointer"
+                            )}
 
                             <button
                               type="button"
@@ -504,7 +539,7 @@ export function KanbanBoard({
                 localTasks.map((task) => {
                   const agentLabel = task.agentName || task.agent_name || "Chưa gán";
                   const turnCount = task.turnCount ?? task.turn_count ?? 0;
-                  const isMoving = movingTaskId === task.id;
+                  const isMoving = Boolean(movingTaskIds[task.id]);
                   return (
                     <tr
                       key={task.id}
@@ -526,21 +561,11 @@ export function KanbanBoard({
                       </td>
                       <td className="py-3 px-4">{renderStatusBadge(task.status)}</td>
                       <td className="py-3 px-4">
-                        <select
-                          aria-label={`Chuyển trạng thái cho ${task.title}`}
-                          value={getColumnForStatus(task.status).targetStatus}
-                          disabled={isMoving}
-                          onChange={(e) =>
-                            attemptMoveTask(task.id, e.target.value)
-                          }
-                          className="bg-gray-950 border border-gray-800 rounded-lg px-2 py-1 text-[11px] text-gray-300 focus:outline-none focus:border-sky-500 cursor-pointer"
-                        >
-                          {KANBAN_COLUMNS.map((opt) => (
-                            <option key={opt.id} value={opt.targetStatus}>
-                              {`→ ${opt.label}`}
-                            </option>
-                          ))}
-                        </select>
+                        {renderMoveSelect(
+                          task,
+                          isMoving,
+                          "bg-gray-950 border border-gray-800 rounded-lg px-2 py-1 text-[11px] text-gray-300 focus:outline-none focus:border-sky-500 cursor-pointer"
+                        )}
                       </td>
                       <td className="py-3 px-4 text-right">
                         <button

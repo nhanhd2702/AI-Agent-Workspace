@@ -9,6 +9,7 @@ Implements:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import re
 from typing import Any, Optional
 import uuid
@@ -132,9 +133,38 @@ class DepartmentUpdate(BaseModel):
 # Helper Serializers
 # ============================================================================
 
-def _serialize_agent(agent: Agent, db: Session) -> dict[str, Any]:
-    skills = db.query(AgentSkill).filter_by(agent_id=agent.id).all()
-    skill_ids = [s.skill_id for s in skills]
+def _format_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc).isoformat()
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _batch_agent_skill_ids(db: Session, agent_ids: list[str]) -> dict[str, list[str]]:
+    if not agent_ids:
+        return {}
+    rows = (
+        db.query(AgentSkill.agent_id, AgentSkill.skill_id)
+        .filter(AgentSkill.agent_id.in_(agent_ids))
+        .all()
+    )
+    grouped: dict[str, list[str]] = {aid: [] for aid in agent_ids}
+    for aid, sid in rows:
+        grouped.setdefault(aid, []).append(sid)
+    return grouped
+
+
+def _serialize_agent(
+    agent: Agent,
+    db: Session,
+    skill_ids: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    if skill_ids is None:
+        skills = db.query(AgentSkill).filter_by(agent_id=agent.id).all()
+        resolved_skill_ids = [s.skill_id for s in skills]
+    else:
+        resolved_skill_ids = skill_ids
     return {
         "id": agent.id,
         "name": agent.name,
@@ -151,15 +181,29 @@ def _serialize_agent(agent: Agent, db: Session) -> dict[str, Any]:
         "max_tokens": agent.max_tokens,
         "status": agent.status,
         "is_system": agent.is_system,
-        "skills_count": len(skill_ids),
-        "skill_ids": skill_ids,
-        "created_at": agent.created_at.isoformat() if agent.created_at else None,
-        "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
+        "skills_count": len(resolved_skill_ids),
+        "skill_ids": resolved_skill_ids,
+        "created_at": _format_utc_iso(agent.created_at),
+        "updated_at": _format_utc_iso(agent.updated_at),
     }
 
 
-def _serialize_department(dept: Department, db: Session) -> dict[str, Any]:
-    dept_agents = db.query(Agent).filter_by(department_id=dept.id).all()
+def _serialize_department(
+    dept: Department,
+    db: Session,
+    dept_agents: Optional[list[Agent]] = None,
+    skill_ids_by_agent: Optional[dict[str, list[str]]] = None,
+) -> dict[str, Any]:
+    resolved_agents = (
+        dept_agents
+        if dept_agents is not None
+        else db.query(Agent).filter_by(department_id=dept.id).all()
+    )
+    resolved_skills_map = (
+        skill_ids_by_agent
+        if skill_ids_by_agent is not None
+        else _batch_agent_skill_ids(db, [agent.id for agent in resolved_agents])
+    )
     return {
         "id": dept.id,
         "name": dept.name,
@@ -167,10 +211,17 @@ def _serialize_department(dept: Department, db: Session) -> dict[str, Any]:
         "icon": dept.icon,
         "color": dept.color,
         "status": dept.status,
-        "agents_count": len(dept_agents),
-        "agents": [_serialize_agent(agent, db) for agent in dept_agents],
-        "created_at": dept.created_at.isoformat() if dept.created_at else None,
-        "updated_at": dept.updated_at.isoformat() if dept.updated_at else None,
+        "agents_count": len(resolved_agents),
+        "agents": [
+            _serialize_agent(
+                agent,
+                db,
+                skill_ids=resolved_skills_map.get(agent.id, []),
+            )
+            for agent in resolved_agents
+        ],
+        "created_at": _format_utc_iso(dept.created_at),
+        "updated_at": _format_utc_iso(dept.updated_at),
     }
 
 
@@ -194,9 +245,13 @@ def list_agents(
         query = query.filter(Agent.status == status_filter)
 
     agents = query.all()
+    skills_map = _batch_agent_skill_ids(db, [a.id for a in agents])
     return {
         "status": "success",
-        "data": [_serialize_agent(agent, db) for agent in agents],
+        "data": [
+            _serialize_agent(agent, db, skill_ids=skills_map.get(agent.id, []))
+            for agent in agents
+        ],
     }
 
 
@@ -677,9 +732,30 @@ def list_departments(
 ) -> dict[str, Any]:
     """List all functional departments and current member counts."""
     departments = db.query(Department).all()
+    dept_ids = [d.id for d in departments]
+    all_agents = (
+        db.query(Agent).filter(Agent.department_id.in_(dept_ids)).all()
+        if dept_ids
+        else []
+    )
+    agents_by_dept: dict[str, list[Agent]] = {did: [] for did in dept_ids}
+    for agent in all_agents:
+        if agent.department_id:
+            agents_by_dept.setdefault(agent.department_id, []).append(agent)
+
+    skills_by_agent = _batch_agent_skill_ids(db, [a.id for a in all_agents])
+
     return {
         "status": "success",
-        "data": [_serialize_department(dept, db) for dept in departments],
+        "data": [
+            _serialize_department(
+                dept,
+                db,
+                dept_agents=agents_by_dept.get(dept.id, []),
+                skill_ids_by_agent=skills_by_agent,
+            )
+            for dept in departments
+        ],
     }
 
 

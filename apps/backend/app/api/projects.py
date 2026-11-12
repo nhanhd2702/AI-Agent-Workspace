@@ -56,28 +56,41 @@ def _format_utc_iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def _project_task_summary(db: Session, project_id: str) -> tuple[int, dict[str, int]]:
+def _projects_task_summaries(
+    db: Session,
+    project_ids: list[str],
+) -> dict[str, tuple[int, dict[str, int]]]:
+    if not project_ids:
+        return {}
     rows = (
-        db.query(Task.status, func.count(Task.id))
-        .filter(Task.project_id == project_id)
-        .group_by(Task.status)
+        db.query(Task.project_id, Task.status, func.count(Task.id))
+        .filter(Task.project_id.in_(project_ids))
+        .group_by(Task.project_id, Task.status)
         .all()
     )
-    summary: dict[str, int] = {}
-    total = 0
-    for st, count in rows:
+    totals: dict[str, int] = {pid: 0 for pid in project_ids}
+    summaries: dict[str, dict[str, int]] = {pid: {} for pid in project_ids}
+    for pid, st, count in rows:
         key = st.value if isinstance(st, TaskStatus) else str(st)
-        summary[key] = int(count)
-        total += int(count)
-    return total, summary
+        cnt = int(count)
+        summaries[pid][key] = cnt
+        totals[pid] += cnt
+    return {pid: (totals[pid], summaries[pid]) for pid in project_ids}
+
+
+def _project_task_summary(db: Session, project_id: str) -> tuple[int, dict[str, int]]:
+    return _projects_task_summaries(db, [project_id]).get(project_id, (0, {}))
 
 
 def _serialize_project(
     project: Project,
     db: Session,
     extra_secrets: Optional[list[str]] = None,
+    summary: Optional[tuple[int, dict[str, int]]] = None,
 ) -> dict[str, Any]:
-    task_count, status_summary = _project_task_summary(db, project.id)
+    task_count, status_summary = (
+        summary if summary is not None else _project_task_summary(db, project.id)
+    )
     return mask_secrets(
         {
             "id": project.id,
@@ -101,11 +114,18 @@ def list_projects(
 ) -> dict[str, Any]:
     """List all workspace projects with task status summaries."""
     projects = db.query(Project).order_by(Project.created_at.asc()).all()
+    summaries = _projects_task_summaries(db, [p.id for p in projects])
     extra_secrets = _get_extra_secrets(request)
     return {
         "status": "success",
         "data": [
-            _serialize_project(p, db, extra_secrets=extra_secrets) for p in projects
+            _serialize_project(
+                p,
+                db,
+                extra_secrets=extra_secrets,
+                summary=summaries.get(p.id, (0, {})),
+            )
+            for p in projects
         ],
     }
 
@@ -124,19 +144,34 @@ def create_project(
             detail="Project name cannot be blank",
         )
 
-    project_id = payload.id.strip() if payload.id else f"proj-{uuid.uuid4().hex[:10]}"
+    if payload.id is not None:
+        stripped_id = payload.id.strip()
+        if not stripped_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Project id cannot be blank",
+            )
+        project_id = stripped_id
+    else:
+        project_id = f"proj-{uuid.uuid4().hex[:10]}"
+
     if db.get(Project, project_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Project '{project_id}' already exists",
         )
 
-    if payload.default_department_id:
-        dept = db.get(Department, payload.default_department_id)
+    clean_dept_id = (
+        payload.default_department_id.strip() or None
+        if payload.default_department_id is not None
+        else None
+    )
+    if clean_dept_id:
+        dept = db.get(Department, clean_dept_id)
         if not dept:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Department '{payload.default_department_id}' not found",
+                detail=f"Department '{clean_dept_id}' not found",
             )
 
     extra_secrets = _get_extra_secrets(request)
@@ -157,7 +192,7 @@ def create_project(
         name=str(mask_secrets(clean_name, extra_secrets=extra_secrets)),
         description=masked_desc,
         tags=masked_tags,
-        default_department_id=payload.default_department_id,
+        default_department_id=clean_dept_id,
         created_at=now,
         updated_at=now,
     )
@@ -178,7 +213,9 @@ def create_project(
 
     return {
         "status": "success",
-        "data": _serialize_project(project, db, extra_secrets=extra_secrets),
+        "data": _serialize_project(
+            project, db, extra_secrets=extra_secrets, summary=(0, {})
+        ),
     }
 
 
@@ -237,14 +274,15 @@ def update_project(
         project.tags = mask_secrets(payload.tags, extra_secrets=extra_secrets)
 
     if payload.default_department_id is not None:
-        if payload.default_department_id != "":
-            dept = db.get(Department, payload.default_department_id)
+        clean_dept_id = payload.default_department_id.strip()
+        if clean_dept_id:
+            dept = db.get(Department, clean_dept_id)
             if not dept:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Department '{payload.default_department_id}' not found",
+                    detail=f"Department '{clean_dept_id}' not found",
                 )
-            project.default_department_id = payload.default_department_id
+            project.default_department_id = clean_dept_id
         else:
             project.default_department_id = None
 
@@ -279,9 +317,23 @@ def delete_project(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Project '{project_id}' not found",
         )
+
+    referencing_task = db.query(Task.id).filter(Task.project_id == project_id).first()
+    if referencing_task:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete project '{project_id}' while tasks still reference it",
+        )
+
     try:
         db.delete(project)
         db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete project '{project_id}' due to existing references",
+        ) from exc
     except Exception:
         db.rollback()
         raise

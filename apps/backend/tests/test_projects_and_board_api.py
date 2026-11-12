@@ -259,6 +259,61 @@ def test_departments_endpoint_returns_agents_and_skill_counts(env):
     content_dept = next(d for d in depts if d["id"] == "dept-content")
     assert "agents" in content_dept
     assert len(content_dept["agents"]) >= 3
+    assert content_dept["created_at"].endswith("+00:00")
     first_agent = content_dept["agents"][0]
     assert "skills_count" in first_agent
     assert "status" in first_agent
+    assert first_agent["created_at"].endswith("+00:00")
+
+
+def test_project_blank_id_422_empty_dept_and_delete_conflict_409(env):
+    client, app, _ = env
+
+    # Blank whitespace id -> 422
+    blank_resp = client.post(
+        "/api/v1/projects",
+        json={"id": "   ", "name": "Valid Name"},
+    )
+    assert blank_resp.status_code == 422
+
+    # Empty default_department_id normalizes cleanly to None
+    p_resp = client.post(
+        "/api/v1/projects",
+        json={"id": "  proj-clean-1  ", "name": "Clean Project", "defaultDepartmentId": "  "},
+    )
+    assert p_resp.status_code == 201
+    created = p_resp.json()["data"]
+    assert created["id"] == "proj-clean-1"
+    assert created["default_department_id"] is None
+
+    # Empty project can be deleted (200)
+    p2_resp = client.post(
+        "/api/v1/projects",
+        json={"id": "proj-empty-del", "name": "Empty Project"},
+    )
+    assert p2_resp.status_code == 201
+    del_ok = client.delete("/api/v1/projects/proj-empty-del")
+    assert del_ok.status_code == 200
+    assert del_ok.json()["data"]["deleted"] is True
+
+    # Project with referencing tasks returns 409 Conflict on DELETE
+    with app.state.session_factory() as db:
+        db.add(
+            Task(
+                id="task-guard-1",
+                project_id="proj-clean-1",
+                title="Blocking task",
+                status=TaskStatus.PENDING,
+            )
+        )
+        db.commit()
+
+    del_conflict = client.delete("/api/v1/projects/proj-clean-1")
+    assert del_conflict.status_code == 409
+
+    # Batched list_projects includes accurate task_count & status_summary
+    list_resp = client.get("/api/v1/projects")
+    assert list_resp.status_code == 200
+    clean_item = next(p for p in list_resp.json()["data"] if p["id"] == "proj-clean-1")
+    assert clean_item["task_count"] == 1
+    assert clean_item["status_summary"]["pending"] == 1

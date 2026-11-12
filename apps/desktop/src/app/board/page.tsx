@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
+  AlertCircle,
   FolderKanban,
   RefreshCw,
   Search,
@@ -23,45 +24,15 @@ import type {
   TaskLogEntry,
 } from "@/lib/types";
 
-const DEMO_PROJECTS: Project[] = [
-  { id: "proj-default", name: "Văn phòng Mặc định" },
-];
-
-const DEMO_TASKS: BoardTask[] = [
-  {
-    id: "task-demo-1",
-    projectId: "proj-default",
-    title: "Soạn kịch bản TikTok 60s chủ đề tài chính cá nhân",
-    status: "running",
-    agentName: "ContentWriter",
-    turnCount: 2,
-  },
-  {
-    id: "task-demo-2",
-    projectId: "proj-default",
-    title: "Thiết kế Landing Page khóa học Solopreneur",
-    status: "waiting_review",
-    agentName: "UIDesigner",
-    turnCount: 3,
-  },
-  {
-    id: "task-demo-3",
-    projectId: "proj-default",
-    title: "Nghiên cứu thị trường AI Agents 2026",
-    status: "completed",
-    agentName: "DeepResearcher",
-    turnCount: 4,
-  },
-];
-
 export default function BoardPage() {
   const [apiClient] = useState(() => new ApiClient());
-  const [projects, setProjects] = useState<Project[]>(DEMO_PROJECTS);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [tasks, setTasks] = useState<BoardTask[]>(DEMO_TASKS);
+  const [tasks, setTasks] = useState<BoardTask[]>([]);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   // Selected task + TurnTimelineDrawer state
   const [selectedTask, setSelectedTask] = useState<BoardTask | null>(null);
@@ -73,9 +44,21 @@ export default function BoardPage() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestDetailsReqRef = useRef(0);
+  const selectedTaskRef = useRef<BoardTask | null>(null);
+  const drawerOpenRef = useRef(false);
+
+  useEffect(() => {
+    selectedTaskRef.current = selectedTask;
+  }, [selectedTask]);
+
+  useEffect(() => {
+    drawerOpenRef.current = drawerOpen;
+  }, [drawerOpen]);
 
   const loadBoardData = useCallback(async () => {
     setIsLoading(true);
+    setErrorBanner(null);
     try {
       const [loadedProjects, loadedTasks] = await Promise.all([
         apiClient.listProjects(),
@@ -86,12 +69,15 @@ export default function BoardPage() {
         ),
       ]);
       setBackendOnline(true);
-      if (loadedProjects && loadedProjects.length > 0) {
-        setProjects(loadedProjects);
-      }
+      setProjects(loadedProjects || []);
       setTasks(loadedTasks || []);
-    } catch {
+    } catch (err) {
       setBackendOnline(false);
+      setErrorBanner(
+        err instanceof Error
+          ? err.message
+          : "Không thể tải danh sách dự án và công việc từ máy chủ."
+      );
     } finally {
       setIsLoading(false);
     }
@@ -103,6 +89,7 @@ export default function BoardPage() {
 
   const loadTaskDetails = useCallback(
     async (task: BoardTask) => {
+      const reqId = ++latestDetailsReqRef.current;
       setLogsLoading(true);
       setLogsError(null);
       try {
@@ -110,20 +97,29 @@ export default function BoardPage() {
           apiClient.getTaskLogs(task.id),
           apiClient.listReviews(task.id, "pending").catch(() => []),
         ]);
+        if (reqId !== latestDetailsReqRef.current) return;
         setTaskLogs(logs);
         setActiveReview(reviews && reviews.length > 0 ? reviews[0] : null);
       } catch (err) {
+        if (reqId !== latestDetailsReqRef.current) return;
         setLogsError(
           err instanceof Error
             ? err.message
             : "Không thể tải nhật ký các lượt của task."
         );
       } finally {
-        setLogsLoading(false);
+        if (reqId === latestDetailsReqRef.current) {
+          setLogsLoading(false);
+        }
       }
     },
     [apiClient]
   );
+
+  const loadTaskDetailsRef = useRef(loadTaskDetails);
+  useEffect(() => {
+    loadTaskDetailsRef.current = loadTaskDetails;
+  }, [loadTaskDetails]);
 
   // Determine which task ID to subscribe over WebSocket for live updates
   const streamTaskId = useMemo(() => {
@@ -183,9 +179,19 @@ export default function BoardPage() {
                       : item
                   )
                 );
+                setSelectedTask((prev) =>
+                  prev && prev.id === msg.task_id
+                    ? { ...prev, status: msg.task_status }
+                    : prev
+                );
               }
-              if (selectedTask && selectedTask.id === msg.task_id && drawerOpen) {
-                void loadTaskDetails(selectedTask);
+              const currentSelected = selectedTaskRef.current;
+              if (
+                currentSelected &&
+                currentSelected.id === msg.task_id &&
+                drawerOpenRef.current
+              ) {
+                void loadTaskDetailsRef.current(currentSelected);
               }
             }
           } catch {
@@ -195,7 +201,13 @@ export default function BoardPage() {
 
         ws.onclose = () => {
           if (!cancelled) {
-            reconnectTimerRef.current = setTimeout(connectWs, 3000);
+            if (reconnectTimerRef.current) {
+              clearTimeout(reconnectTimerRef.current);
+            }
+            reconnectTimerRef.current = setTimeout(() => {
+              reconnectTimerRef.current = null;
+              if (!cancelled) connectWs();
+            }, 3000);
           }
         };
       } catch {
@@ -216,7 +228,7 @@ export default function BoardPage() {
         wsRef.current = null;
       }
     };
-  }, [apiClient, backendOnline, drawerOpen, loadTaskDetails, selectedTask, streamTaskId]);
+  }, [apiClient, backendOnline, streamTaskId]);
 
   const handleMoveTask = async (taskId: string, targetStatus: string) => {
     const updated = await apiClient.transitionTaskState(taskId, targetStatus, {
@@ -226,9 +238,9 @@ export default function BoardPage() {
     setTasks((prev) =>
       prev.map((t) => (t.id === taskId ? { ...t, ...updated } : t))
     );
-    if (selectedTask?.id === taskId) {
+    if (selectedTaskRef.current?.id === taskId) {
       setSelectedTask((prev) => (prev ? { ...prev, ...updated } : prev));
-      if (drawerOpen) {
+      if (drawerOpenRef.current) {
         await loadTaskDetails(updated);
       }
     }
@@ -240,6 +252,9 @@ export default function BoardPage() {
     if (backendOnline) {
       await loadTaskDetails(task);
     } else {
+      latestDetailsReqRef.current += 1;
+      setLogsLoading(false);
+      setLogsError(null);
       setTaskLogs([]);
       setActiveReview(null);
     }
@@ -391,7 +406,26 @@ export default function BoardPage() {
         </div>
 
         {/* Board Canvas */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+          {errorBanner && (
+            <div
+              role="alert"
+              className="p-3 rounded-xl bg-rose-950/60 border border-rose-800/70 text-xs text-rose-200 flex items-center justify-between gap-3"
+            >
+              <span className="flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                <span>{errorBanner}</span>
+              </span>
+              <button
+                type="button"
+                onClick={loadBoardData}
+                className="px-2.5 py-1 rounded-lg bg-rose-900/70 hover:bg-rose-800 text-rose-100 font-medium shrink-0 cursor-pointer"
+              >
+                Thử lại
+              </button>
+            </div>
+          )}
+
           <KanbanBoard
             tasks={filteredTasks}
             onMoveTask={handleMoveTask}

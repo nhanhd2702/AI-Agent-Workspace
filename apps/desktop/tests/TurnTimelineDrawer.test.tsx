@@ -53,4 +53,47 @@ describe("TurnTimelineDrawer", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  it("tracks step and payload expansion independently when log entry id is empty", () => {
+    render(
+      <TurnTimelineDrawer
+        isOpen={true}
+        task={{ id: "t2", title: "No ID Logs", status: "running" }}
+        logs={[
+          {
+            id: "",
+            logType: "turn",
+            turnNumber: 1,
+            agentName: "AgentOne",
+            steps: [
+              { name: "First A", status: "completed" },
+              { name: "First B", status: "completed" },
+              { name: "First Hidden Step", status: "completed" },
+            ],
+            inputPayload: { hello: "one" },
+          },
+          {
+            id: "",
+            logType: "turn",
+            turnNumber: 2,
+            agentName: "AgentTwo",
+            steps: [
+              { name: "Second A", status: "completed" },
+              { name: "Second B", status: "completed" },
+              { name: "Second Hidden Step", status: "completed" },
+            ],
+            inputPayload: { hello: "two" },
+          },
+        ]}
+        onClose={vi.fn()}
+      />
+    );
+
+    const expandBtns = screen.getAllByRole("button", { name: /xem thêm 1 bước/i });
+    expect(expandBtns).toHaveLength(2);
+    fireEvent.click(expandBtns[0]);
+
+    expect(screen.getByText("First Hidden Step")).toBeInTheDocument();
+    expect(screen.queryByText("Second Hidden Step")).not.toBeInTheDocument();
+  });
 });

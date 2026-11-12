@@ -23,151 +23,14 @@ import { SidebarNav } from "@/components/layout/SidebarNav";
 import { ApiClient } from "@/lib/apiClient";
 import type { Agent, Department } from "@/lib/types";
 
-const FALLBACK_DEPARTMENTS: Department[] = [
-  {
-    id: "dept-content",
-    name: "Đội Content",
-    description: "Sáng tạo nội dung đa kênh, viết bài, kịch bản, video & hình ảnh",
-    status: "active",
-    agentsCount: 3,
-    agents: [
-      {
-        id: "agent-content-writer",
-        name: "ContentWriter",
-        displayName: "Content Writer",
-        role: "Content Copywriter",
-        departmentId: "dept-content",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 3,
-      },
-      {
-        id: "agent-image-studio",
-        name: "ImageStudio",
-        displayName: "Image Studio",
-        role: "Visual & Image Designer",
-        departmentId: "dept-content",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-      {
-        id: "agent-video-editor",
-        name: "VideoEditor",
-        displayName: "Video Editor",
-        role: "Video Production Specialist",
-        departmentId: "dept-content",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-    ],
-  },
-  {
-    id: "dept-funnels",
-    name: "Đội Funnels",
-    description: "Thiết kế phễu bán hàng, landing page, tối ưu tỷ lệ chuyển đổi",
-    status: "active",
-    agentsCount: 3,
-    agents: [
-      {
-        id: "agent-funnels-agent",
-        name: "FunnelsAgent",
-        displayName: "Funnels Strategist",
-        role: "Funnels Strategist",
-        departmentId: "dept-funnels",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-      {
-        id: "agent-growth-advisor",
-        name: "GrowthAdvisor",
-        displayName: "Growth Advisor",
-        role: "Growth & Pricing Advisor",
-        departmentId: "dept-funnels",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-      {
-        id: "agent-ui-designer",
-        name: "UIDesigner",
-        displayName: "UI Designer",
-        role: "UI/UX Landing Page Designer",
-        departmentId: "dept-funnels",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-    ],
-  },
-  {
-    id: "dept-rd",
-    name: "Nghiên cứu & Phát triển",
-    description: "Nghiên cứu thị trường, phân tích đối thủ, xu hướng YouTube & web",
-    status: "active",
-    agentsCount: 1,
-    agents: [
-      {
-        id: "agent-deep-researcher",
-        name: "DeepResearcher",
-        displayName: "Deep Researcher",
-        role: "Deep Research Specialist",
-        departmentId: "dept-rd",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 3,
-      },
-    ],
-  },
-  {
-    id: "dept-ecommerce",
-    name: "Thương mại điện tử",
-    description: "Quản lý sản phẩm, giá bán, tư vấn bán hàng & chăm sóc khách hàng",
-    status: "active",
-    agentsCount: 3,
-    agents: [
-      {
-        id: "agent-sales-agent",
-        name: "SalesAgent",
-        displayName: "Sales Specialist",
-        role: "Sales Consultant",
-        departmentId: "dept-ecommerce",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-      {
-        id: "agent-customer-support-agent",
-        name: "CustomerSupportAgent",
-        displayName: "Customer Support",
-        role: "Support Specialist",
-        departmentId: "dept-ecommerce",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-      {
-        id: "agent-product-analyst",
-        name: "ProductAnalyst",
-        displayName: "Product Analyst",
-        role: "Product Analyst",
-        departmentId: "dept-ecommerce",
-        defaultModel: "gemini-2.5-flash",
-        status: "idle",
-        skillsCount: 2,
-      },
-    ],
-  },
-];
-
 const CORE_DEPARTMENT_ORDER = [
   "Đội Content",
   "Đội Funnels",
   "Nghiên cứu & Phát triển",
   "Thương mại điện tử",
 ];
+
+type OfficeDepartment = Department & { isFallback?: boolean };
 
 function getDepartmentIcon(name: string) {
   switch (name) {
@@ -206,14 +69,15 @@ function getAgentStatusBadge(status?: string) {
 
 export default function OfficePage() {
   const [apiClient] = useState(() => new ApiClient());
-  const [departments, setDepartments] = useState<Department[]>(FALLBACK_DEPARTMENTS);
+  const [departments, setDepartments] = useState<OfficeDepartment[]>([]);
   const [allAgents, setAllAgents] = useState<Agent[]>([]);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const [loadedFromBackend, setLoadedFromBackend] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   // Add/Assign agent modal state
-  const [targetDept, setTargetDept] = useState<Department | null>(null);
+  const [targetDept, setTargetDept] = useState<OfficeDepartment | null>(null);
   const [modalTab, setModalTab] = useState<"assign" | "create">("assign");
   const [selectedAgentId, setSelectedAgentId] = useState<string>("");
   const [newAgentName, setNewAgentName] = useState("");
@@ -221,6 +85,7 @@ export default function OfficePage() {
   const [newAgentRole, setNewAgentRole] = useState("");
   const [newAgentModel, setNewAgentModel] = useState("gemini-2.5-flash");
   const [isSaving, setIsSaving] = useState(false);
+  const [modalError, setModalError] = useState<string | null>(null);
 
   const loadOfficeData = useCallback(async () => {
     setIsLoading(true);
@@ -231,12 +96,17 @@ export default function OfficePage() {
         apiClient.listAgents(),
       ]);
       setBackendOnline(true);
-      if (loadedDepts && loadedDepts.length > 0) {
-        setDepartments(loadedDepts);
-      }
+      setLoadedFromBackend(true);
+      setDepartments(loadedDepts || []);
       setAllAgents(loadedAgents || []);
-    } catch {
+    } catch (err) {
       setBackendOnline(false);
+      setLoadedFromBackend(false);
+      setErrorBanner(
+        err instanceof Error
+          ? err.message
+          : "Không thể tải danh sách phòng ban và tác tử từ máy chủ."
+      );
     } finally {
       setIsLoading(false);
     }
@@ -254,7 +124,7 @@ export default function OfficePage() {
 
   const orderedDepartments = useMemo(() => {
     const byName = new Map(departments.map((d) => [d.name, d]));
-    const core = CORE_DEPARTMENT_ORDER.map(
+    const core: OfficeDepartment[] = CORE_DEPARTMENT_ORDER.map(
       (name) =>
         byName.get(name) || {
           id: `dept-${name}`,
@@ -262,9 +132,10 @@ export default function OfficePage() {
           status: "active",
           agentsCount: 0,
           agents: [],
+          isFallback: true,
         }
     );
-    const extras = departments.filter(
+    const extras: OfficeDepartment[] = departments.filter(
       (d) => !CORE_DEPARTMENT_ORDER.includes(d.name)
     );
     return [...core, ...extras];
@@ -293,6 +164,7 @@ export default function OfficePage() {
       agentsCount: unassignedAgents.length,
       resolvedAgents: unassignedAgents,
       isUnassignedGroup: true,
+      isFallback: false,
     });
 
     return groups;
@@ -306,7 +178,15 @@ export default function OfficePage() {
     return candidates;
   }, [allAgents, targetDept]);
 
-  const openAddModal = (dept: Department) => {
+  const closeAddModal = () => {
+    setTargetDept(null);
+    setModalError(null);
+  };
+
+  const openAddModal = (dept: OfficeDepartment) => {
+    if (!loadedFromBackend || dept.isFallback) {
+      return;
+    }
     setTargetDept(dept);
     const candidates = allAgents.filter(
       (a) => (a.departmentId || a.department_id) !== dept.id
@@ -321,34 +201,65 @@ export default function OfficePage() {
     setNewAgentName("");
     setNewAgentDisplayName("");
     setNewAgentRole("");
-    setErrorBanner(null);
+    setModalError(null);
   };
 
   const handleAssignOrCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!targetDept) return;
-    setIsSaving(true);
-    setErrorBanner(null);
+    if (!targetDept || isSaving) return;
 
+    if (!loadedFromBackend || targetDept.isFallback) {
+      setModalError("Phòng ban này chưa được đồng bộ từ máy chủ.");
+      return;
+    }
+
+    setModalError(null);
+
+    if (modalTab === "assign") {
+      if (!selectedAgentId) {
+        setModalError("Vui lòng chọn một Agent để chuyển vào phòng.");
+        return;
+      }
+    } else {
+      const trimmedName = newAgentName.trim();
+      const trimmedDisplayName = newAgentDisplayName.trim();
+      const trimmedRole = newAgentRole.trim();
+
+      if (!trimmedName || !/^[a-zA-Z0-9_]+$/.test(trimmedName)) {
+        setModalError(
+          "Mã định danh (@name) không được để trống và chỉ gồm chữ cái, số hoặc dấu gạch dưới (_)."
+        );
+        return;
+      }
+      if (!trimmedDisplayName) {
+        setModalError("Tên hiển thị không được để trống.");
+        return;
+      }
+      if (!trimmedRole) {
+        setModalError("Vai trò không được để trống.");
+        return;
+      }
+    }
+
+    setIsSaving(true);
     try {
       if (modalTab === "assign") {
-        if (!selectedAgentId) return;
         await apiClient.updateAgent(selectedAgentId, {
           departmentId: targetDept.id,
         });
       } else {
         await apiClient.createAgent({
           name: newAgentName.trim(),
-          displayName: newAgentDisplayName.trim() || newAgentName.trim(),
-          role: newAgentRole.trim() || "Chuyên viên AI",
+          displayName: newAgentDisplayName.trim(),
+          role: newAgentRole.trim(),
           departmentId: targetDept.id,
-          defaultModel: newAgentModel,
+          defaultModel: newAgentModel.trim() || "gemini-2.5-flash",
         });
       }
-      setTargetDept(null);
+      closeAddModal();
       await loadOfficeData();
     } catch (err) {
-      setErrorBanner(
+      setModalError(
         err instanceof Error
           ? err.message
           : "Không thể cập nhật thành viên phòng ban."
@@ -430,10 +341,19 @@ export default function OfficePage() {
           {errorBanner && (
             <div
               role="alert"
-              className="p-3 rounded-xl bg-rose-950/60 border border-rose-800/70 text-xs text-rose-200 flex items-center gap-2"
+              className="p-3 rounded-xl bg-rose-950/60 border border-rose-800/70 text-xs text-rose-200 flex items-center justify-between gap-3"
             >
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-              <span>{errorBanner}</span>
+              <span className="flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                <span>{errorBanner}</span>
+              </span>
+              <button
+                type="button"
+                onClick={loadOfficeData}
+                className="px-2.5 py-1 rounded-lg bg-rose-900/70 hover:bg-rose-800 text-rose-100 font-medium shrink-0 cursor-pointer"
+              >
+                Thử lại
+              </button>
             </div>
           )}
 
@@ -443,6 +363,8 @@ export default function OfficePage() {
             <div className="space-y-6 max-w-7xl mx-auto">
               {departmentGroups.map((group) => {
                 const Icon = getDepartmentIcon(group.name);
+                const isSyntheticDept =
+                  !loadedFromBackend || Boolean(group.isFallback);
                 return (
                   <section
                     key={group.id}
@@ -474,8 +396,14 @@ export default function OfficePage() {
                       {!group.isUnassignedGroup && (
                         <button
                           type="button"
+                          disabled={isSyntheticDept}
+                          title={
+                            isSyntheticDept
+                              ? "Cần kết nối backend với phòng ban thật để thêm hoặc gán Agent"
+                              : "Thêm hoặc gán Agent vào phòng ban này"
+                          }
                           onClick={() => openAddModal(group)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-700/50 transition-colors cursor-pointer"
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-700/50 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           <Plus className="w-3.5 h-3.5" />
                           <span>+ Thêm vào phòng</span>
@@ -567,7 +495,7 @@ export default function OfficePage() {
               </div>
               <button
                 type="button"
-                onClick={() => setTargetDept(null)}
+                onClick={closeAddModal}
                 aria-label="Đóng"
                 className="p-1.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 cursor-pointer"
               >
@@ -578,7 +506,10 @@ export default function OfficePage() {
             <div className="flex gap-2 border-b border-gray-800 pb-2">
               <button
                 type="button"
-                onClick={() => setModalTab("assign")}
+                onClick={() => {
+                  setModalTab("assign");
+                  setModalError(null);
+                }}
                 className={`px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer ${
                   modalTab === "assign"
                     ? "bg-sky-600 text-white"
@@ -589,7 +520,10 @@ export default function OfficePage() {
               </button>
               <button
                 type="button"
-                onClick={() => setModalTab("create")}
+                onClick={() => {
+                  setModalTab("create");
+                  setModalError(null);
+                }}
                 className={`px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer ${
                   modalTab === "create"
                     ? "bg-sky-600 text-white"
@@ -600,7 +534,7 @@ export default function OfficePage() {
               </button>
             </div>
 
-            <form onSubmit={handleAssignOrCreate} className="space-y-3">
+            <form onSubmit={handleAssignOrCreate} noValidate className="space-y-3">
               {modalTab === "assign" ? (
                 <div className="space-y-1.5">
                   <label className="block text-xs font-medium text-gray-300">
@@ -680,10 +614,20 @@ export default function OfficePage() {
                 </>
               )}
 
+              {modalError && (
+                <div
+                  role="alert"
+                  className="p-2.5 rounded-xl bg-rose-950/70 border border-rose-800/70 text-xs text-rose-200 flex items-center gap-2"
+                >
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{modalError}</span>
+                </div>
+              )}
+
               <div className="flex items-center justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setTargetDept(null)}
+                  onClick={closeAddModal}
                   className="px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-800 cursor-pointer"
                 >
                   Hủy
