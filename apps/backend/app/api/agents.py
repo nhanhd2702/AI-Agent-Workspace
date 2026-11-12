@@ -15,6 +15,7 @@ import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -222,8 +223,8 @@ def create_agent(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Register a new Agent with unique name validation and optional skill attachment."""
-    # 1. Enforce unique name
-    existing_name = db.query(Agent).filter_by(name=payload.name).first()
+    # 1. Enforce unique name (case-insensitive)
+    existing_name = db.query(Agent).filter(func.lower(Agent.name) == payload.name.lower()).first()
     if existing_name:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -239,14 +240,16 @@ def create_agent(
                 detail=f"Department '{payload.department_id}' not found",
             )
 
-    # 3. Validate initial skill_ids if provided
+    # 3. Validate initial skill_ids if provided (deduplicated preserving order)
+    unique_skill_ids: list[str] = []
     if payload.skill_ids:
-        if len(payload.skill_ids) > 20:
+        unique_skill_ids = list(dict.fromkeys(payload.skill_ids))
+        if len(unique_skill_ids) > 20:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Agent cannot have more than 20 skills",
             )
-        for skill_id in payload.skill_ids:
+        for skill_id in unique_skill_ids:
             if not db.get(Skill, skill_id):
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -282,8 +285,8 @@ def create_agent(
         db.add(agent)
         db.flush()
 
-        if payload.skill_ids:
-            for skill_id in payload.skill_ids:
+        if unique_skill_ids:
+            for skill_id in unique_skill_ids:
                 askill = AgentSkill(
                     id=f"askill-{uuid.uuid4().hex[:12]}",
                     agent_id=agent.id,
@@ -324,9 +327,23 @@ def update_agent(
             detail=f"Agent '{agent_id}' not found",
         )
 
-    # Validate name uniqueness if changed
-    if payload.name and payload.name != agent.name:
-        existing = db.query(Agent).filter_by(name=payload.name).first()
+    # Safety rule: Cannot rename system agent
+    if agent.is_system and payload.name is not None and payload.name.lower() != agent.name.lower():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot rename system agent",
+        )
+
+    # Safety rule: Cannot deactivate system agent
+    if agent.is_system and payload.status is not None and payload.status.lower() in ["inactive", "disabled"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot deactivate system agent",
+        )
+
+    # Validate name uniqueness if changed (case-insensitive)
+    if payload.name and payload.name.lower() != agent.name.lower():
+        existing = db.query(Agent).filter(func.lower(Agent.name) == payload.name.lower()).first()
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -689,8 +706,9 @@ def create_department(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Create a new department with unique name check."""
-    existing = db.query(Department).filter_by(name=payload.name).first()
-    if existing:
+    # Case-insensitive duplicate department check (Unicode-aware)
+    existing_depts = db.query(Department).all()
+    if any(d.name.strip().lower() == payload.name.strip().lower() for d in existing_depts):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Department with name '{payload.name}' already exists",
@@ -740,9 +758,9 @@ def update_department(
             detail=f"Department '{department_id}' not found",
         )
 
-    if payload.name and payload.name != dept.name:
-        existing = db.query(Department).filter_by(name=payload.name).first()
-        if existing:
+    if payload.name and payload.name.strip().lower() != dept.name.strip().lower():
+        existing_depts = db.query(Department).filter(Department.id != department_id).all()
+        if any(d.name.strip().lower() == payload.name.strip().lower() for d in existing_depts):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Department with name '{payload.name}' already exists",

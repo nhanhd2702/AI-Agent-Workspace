@@ -474,3 +474,84 @@ def test_departments_crud_and_safety(client_with_db: TestClient):
     block_del = client_with_db.delete("/api/v1/departments/dept-content")
     assert block_del.status_code == 400
     assert "agent" in block_del.json()["detail"].lower()
+
+
+# --- 9. Fix Round 1/5 Tests: System Agent Guards & Case-Insensitivity ---
+
+def test_cannot_rename_or_deactivate_system_agent(client_with_db: TestClient):
+    """System agents (is_system=True) cannot be renamed or set to inactive status."""
+    # Attempt rename -> 400
+    rename_resp = client_with_db.put(
+        "/api/v1/agents/agent-commander",
+        json={"name": "CommanderV2"},
+    )
+    assert rename_resp.status_code == 400
+    assert "cannot rename system agent" in rename_resp.json()["detail"].lower()
+
+    # Attempt deactivation -> 400
+    deactivate_resp = client_with_db.put(
+        "/api/v1/agents/agent-commander",
+        json={"status": "inactive"},
+    )
+    assert deactivate_resp.status_code == 400
+    assert "cannot deactivate system agent" in deactivate_resp.json()["detail"].lower()
+
+    # Non-breaking edits (e.g. display_name, description) are permitted
+    ok_resp = client_with_db.put(
+        "/api/v1/agents/agent-commander",
+        json={"display_name": "Supreme Master Commander"},
+    )
+    assert ok_resp.status_code == 200
+    assert ok_resp.json()["data"]["display_name"] == "Supreme Master Commander"
+
+
+def test_create_agent_deduplicates_initial_skill_ids(client_with_db: TestClient):
+    """Creating an agent with duplicate skill_ids deduplicates them cleanly."""
+    settings: AppSettings = client_with_db.app_settings  # type: ignore[attr-defined]
+    SessionLocal = init_db(settings.resolved_db_path)
+    with SessionLocal() as db:
+        db.add(Skill(id="skill-dup-check", name="DupCheckSkill", description="Test dup skill"))
+        db.commit()
+
+    payload = {
+        "name": "DedupeAgent",
+        "display_name": "Dedupe Agent",
+        "role": "Dedupe Tester",
+        "skill_ids": ["skill-dup-check", "skill-dup-check", "skill-dup-check"],
+    }
+    resp = client_with_db.post("/api/v1/agents", json=payload)
+    assert resp.status_code == 201
+    agent_data = resp.json()["data"]
+    assert agent_data["skills_count"] == 1
+    assert agent_data["skill_ids"] == ["skill-dup-check"]
+
+    # Verify directly in DB that only 1 AgentSkill record exists
+    with SessionLocal() as db:
+        agent_skills = db.query(AgentSkill).filter_by(agent_id=agent_data["id"]).all()
+        assert len(agent_skills) == 1
+
+
+def test_case_insensitive_duplicate_agent_name(client_with_db: TestClient):
+    """Case-insensitive duplicate agent name check returns 409 Conflict."""
+    # Seeded agent is 'ContentWriter'
+    payload = {
+        "name": "contentwriter",  # lowercase variant of ContentWriter
+        "display_name": "Content Writer Lower",
+        "role": "Writer",
+    }
+    resp = client_with_db.post("/api/v1/agents", json=payload)
+    assert resp.status_code == 409
+    assert "already exists" in resp.json()["detail"].lower()
+
+
+def test_case_insensitive_duplicate_department_name(client_with_db: TestClient):
+    """Case-insensitive duplicate department name check returns 409 Conflict."""
+    # Seeded department is 'Đội Content'
+    payload = {
+        "name": "đội content",  # lowercase variant
+        "description": "Lowercase content team",
+    }
+    resp = client_with_db.post("/api/v1/departments", json=payload)
+    assert resp.status_code == 409
+    assert "already exists" in resp.json()["detail"].lower()
+
