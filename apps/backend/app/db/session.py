@@ -265,6 +265,19 @@ def init_db(
         cursor.close()
 
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight automatic schema migration for SQLite
+    try:
+        with engine.connect() as conn:
+            cursor = conn.connection.cursor()
+            cursor.execute("PRAGMA table_info(agents)")
+            agent_cols = {row[1] for row in cursor.fetchall()}
+            if agent_cols and "config" not in agent_cols:
+                cursor.execute("ALTER TABLE agents ADD COLUMN config JSON")
+                conn.connection.commit()
+            cursor.close()
+    except Exception:
+        pass
     factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     if should_cache:

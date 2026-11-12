@@ -131,6 +131,7 @@ class Agent(Base):
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
     status: Mapped[str] = mapped_column(String(32), default="idle")
     is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+    config: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

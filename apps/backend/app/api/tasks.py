@@ -19,6 +19,14 @@ from app.orchestrator.dispatcher import (
     TaskDispatchConflictError,
     mask_secrets,
 )
+from app.orchestrator.handoff import (
+    HandoffContractError,
+    HandoffError,
+    HandoffLimitError,
+    HandoffLoopError,
+    HandoffManager,
+    HandoffNotFoundError,
+)
 from app.orchestrator.parser import ParsedIntent, PromptValidationError, TaskParser
 from app.orchestrator.planner import DagCycleError, DagPlanner, ExecutionPlan, SubTaskNode
 
@@ -58,6 +66,17 @@ class DispatchTaskRequest(BaseModel):
     nodes: Optional[list[SubTaskNodeInput]] = None
     timeout_seconds: Optional[float] = Field(default=None, gt=0.0, alias="timeoutSeconds")
     max_parallel: Optional[int] = Field(default=None, ge=1, le=10, alias="maxParallel")
+
+
+class TaskHandoffRequest(BaseModel):
+    """Payload to transfer task execution to another agent via handoff protocol."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_agent: str = Field(..., alias="fromAgent", min_length=1)
+    to_agent: str = Field(..., alias="toAgent", min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    artifact_ids: list[str] = Field(default_factory=list, alias="artifactIds")
 
 
 def _get_history_file(request: Request) -> Path:
@@ -448,4 +467,66 @@ def get_task_turns(
     return {
         "status": "success",
         "data": [_serialize_turn(t, extra_secrets=extra_secrets) for t in turns],
+    }
+
+
+@router.post("/{task_id}/handoff", status_code=status.HTTP_200_OK)
+async def handoff_task(
+    task_id: str,
+    payload: TaskHandoffRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Execute validated Agent-to-Agent handoff protocol according to F05.2."""
+    extra_secrets = _get_extra_secrets(request)
+    manager = HandoffManager(max_depth=5, extra_secrets=extra_secrets)
+
+    try:
+        record = manager.execute_handoff(
+            db=db,
+            task_id=task_id,
+            from_agent=payload.from_agent,
+            to_agent=payload.to_agent,
+            payload=payload.payload,
+            artifact_ids=payload.artifact_ids,
+        )
+    except HandoffNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except HandoffContractError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    except (HandoffLoopError, HandoffLimitError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except HandoffError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    # Broadcast handoff event via WebSocket manager if attached
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if ws_manager is not None:
+        try:
+            await ws_manager.broadcast(
+                task_id=task_id,
+                event={
+                    "type": "handoff",
+                    "task_id": task_id,
+                    "data": record.to_dict(),
+                },
+            )
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "data": record.to_dict(),
     }
