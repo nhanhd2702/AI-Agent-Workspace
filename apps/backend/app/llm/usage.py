@@ -78,6 +78,17 @@ class QuotaExceededError(RuntimeError):
     pass
 
 
+def _format_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    """Serialize datetime as ISO-8601 string normalized with UTC timezone offset."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
+
+
 @dataclass
 class QuotaStatus:
     """Current daily spending quota state and warning triggers."""
@@ -100,7 +111,7 @@ class QuotaStatus:
             "warning_triggered": self.warning_triggered,
             "exceeded": self.exceeded,
             "total_tokens_today": self.total_tokens_today,
-            "as_of": self.as_of.isoformat() if self.as_of else None,
+            "as_of": _format_utc_iso(self.as_of),
         }
 
 
@@ -203,10 +214,14 @@ class QuotaService:
             created_at=datetime.now(timezone.utc),
         )
 
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-        return record
+        try:
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+            return record
+        except Exception:
+            db.rollback()
+            raise
 
     def check_quota(self, db: Session) -> QuotaStatus:
         """Check current day spend vs daily limit, evaluating warning and exceeded triggers."""

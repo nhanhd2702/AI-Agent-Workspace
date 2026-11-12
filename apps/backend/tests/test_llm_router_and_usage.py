@@ -511,3 +511,115 @@ def test_monitoring_usage_endpoint_breakdown_and_periods(client_with_db: TestCli
         r = client_with_db.get(f"/api/v1/monitoring/usage?period={p}")
         assert r.status_code == 200
         assert r.json()["data"]["period"] == p
+
+
+# ============================================================================
+# 7. Fix Round 1: OpenAI usage keys, UTC ISO normalization, error details
+# ============================================================================
+
+
+def test_openai_prompt_and_completion_tokens_usage_keys(mock_providers):
+    """P2-1: Router supports OpenAI prompt_tokens and completion_tokens metadata without estimation."""
+    mock_providers.set_custom_response(
+        "gpt-4o",
+        content="OpenAI formatted completion",
+        usage={"prompt_tokens": 120, "completion_tokens": 45, "cached_tokens": 0},
+    )
+
+    router = LlmRouter(providers=mock_providers)
+    res = router.complete_sync(
+        primary="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert res.is_estimated is False
+    assert res.input_tokens == 120
+    assert res.output_tokens == 45
+    assert res.total_tokens == 165
+
+    # Test exact 0 token values
+    mock_providers.set_custom_response(
+        "gpt-4o-mini",
+        content="Zero prompt token test",
+        usage={"prompt_tokens": 0, "completion_tokens": 10},
+    )
+    res_zero = router.complete_sync(
+        primary="gpt-4o-mini",
+        messages=[],
+    )
+    assert res_zero.is_estimated is False
+    assert res_zero.input_tokens == 0
+    assert res_zero.output_tokens == 10
+
+
+def test_provider_error_history_attached_to_provider_error(mock_providers):
+    """P3-1: ProviderError details attribute contains full retry/failover error history."""
+    mock_providers.set_failures("gemini-2.5-flash", count=3, status=500)
+    mock_providers.set_failures("claude-3-5-sonnet", count=3, status=503)
+
+    router = LlmRouter(providers=mock_providers, max_retries=1, base_delay=0.01)
+
+    with pytest.raises(ProviderError) as exc_info:
+        router.complete_sync(
+            primary="gemini-2.5-flash",
+            fallback="claude-3-5-sonnet",
+            messages=[{"role": "user", "content": "all fail"}],
+        )
+
+    err = exc_info.value
+    assert err.model == "claude-3-5-sonnet"
+    assert err.details is not None
+    assert len(err.details) == 4  # 2 attempts on primary + 2 attempts on fallback
+    assert err.details[0]["model"] == "gemini-2.5-flash"
+    assert err.details[-1]["model"] == "claude-3-5-sonnet"
+
+
+def test_monitoring_usage_normalizes_naive_datetime_to_utc_iso(client_with_db: TestClient):
+    """P2-2: Monitoring usage endpoint serializes created_at with explicit UTC offset (+00:00)."""
+    SessionLocal = init_db(client_with_db.app_settings.resolved_db_path)
+    with SessionLocal() as session:
+        # Create a record explicitly with naive datetime as SQLite typically returns
+        naive_dt = datetime.now()  # tzinfo=None
+        record = UsageRecord(
+            id="usage-naive-dt",
+            model_name="gemini-2.5-flash",
+            prompt_tokens=10,
+            completion_tokens=20,
+            total_tokens=30,
+            cost_usd=0.005,
+            created_at=naive_dt,
+        )
+        session.add(record)
+        session.commit()
+
+    resp = client_with_db.get("/api/v1/monitoring/usage")
+    assert resp.status_code == 200
+    records = resp.json()["data"]["recent_records"]
+    assert len(records) > 0
+
+    target = next((r for r in records if r["id"] == "usage-naive-dt"), None)
+    assert target is not None
+    assert target["created_at"].endswith("+00:00") or target["created_at"].endswith("Z")
+
+    quota_as_of = resp.json()["data"]["quota"]["as_of"]
+    assert quota_as_of.endswith("+00:00") or quota_as_of.endswith("Z")
+
+
+def test_record_cost_rolls_back_on_integrity_error(db_session):
+    """P2-3: QuotaService.record_cost performs db.rollback() when commit fails."""
+    from unittest.mock import patch
+
+    svc = QuotaService(daily_limit_usd=1.0)
+
+    # Patch db_session.commit to simulate database lock / integrity error
+    with patch.object(db_session, "commit", side_effect=RuntimeError("Simulated DB commit error")):
+        with patch.object(db_session, "rollback") as mock_rollback:
+            with pytest.raises(RuntimeError, match="Simulated DB commit error"):
+                svc.record_cost(
+                    db_session,
+                    task_id="t1",
+                    agent_id="Commander",
+                    model="gemini-2.5-flash",
+                )
+            mock_rollback.assert_called_once()
+

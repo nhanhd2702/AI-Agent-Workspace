@@ -18,9 +18,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import time
 from typing import Any, Callable, Optional
 import uuid
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -265,6 +268,7 @@ class LlmRouter:
                     f"Model '{primary}' failed after {attempts} attempts: {last_err.get('error', 'unknown error')}",
                     status_code=last_err.get("status_code", 500),
                     model=primary,
+                    details=provider_error_history,
                 )
 
             fallback_triggered = True
@@ -302,6 +306,7 @@ class LlmRouter:
                     f"Fallback model '{fallback}' failed after retries: {last_err.get('error', 'unknown error')}",
                     status_code=last_err.get("status_code", 500),
                     model=fallback,
+                    details=provider_error_history,
                 )
 
         # 4. Extract content and token usage metadata
@@ -309,15 +314,25 @@ class LlmRouter:
         content = str(raw_response.get("content", ""))
         usage = raw_response.get("usage")
 
-        if (
-            usage
-            and isinstance(usage, dict)
-            and "input_tokens" in usage
-            and "output_tokens" in usage
-        ):
-            input_tokens = int(usage["input_tokens"])
-            output_tokens = int(usage["output_tokens"])
-            cached_tokens = int(usage.get("cached_tokens", 0))
+        # Resolve usage tokens: support both standard input/output_tokens and OpenAI prompt/completion_tokens
+        in_tok = None
+        out_tok = None
+        if usage and isinstance(usage, dict):
+            in_tok = (
+                usage.get("input_tokens")
+                if usage.get("input_tokens") is not None
+                else usage.get("prompt_tokens")
+            )
+            out_tok = (
+                usage.get("output_tokens")
+                if usage.get("output_tokens") is not None
+                else usage.get("completion_tokens")
+            )
+
+        if in_tok is not None and out_tok is not None:
+            input_tokens = int(in_tok)
+            output_tokens = int(out_tok)
+            cached_tokens = int(usage.get("cached_tokens", 0) or 0)
             is_estimated = False
         else:
             # Fallback to local token estimation len(text) // 4
@@ -368,10 +383,15 @@ class LlmRouter:
                     status="completed",
                     created_at=datetime.now(timezone.utc),
                 )
-                db.add(turn_log)
-                db.commit()
-                db.refresh(turn_log)
-                turn_log_id = turn_log.id
+                try:
+                    db.add(turn_log)
+                    db.commit()
+                    db.refresh(turn_log)
+                    turn_log_id = turn_log.id
+                except Exception as log_exc:
+                    db.rollback()
+                    logger.warning("Failed to record fallback TurnLog: %s", log_exc)
+                    turn_log_id = None
 
         # 6. Record UsageRecord in database via QuotaService
         if db is not None:

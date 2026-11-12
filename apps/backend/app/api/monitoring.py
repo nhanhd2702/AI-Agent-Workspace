@@ -20,6 +20,17 @@ from app.llm.usage import QuotaService
 router = APIRouter(prefix="/api/v1/monitoring", tags=["monitoring"])
 
 
+def _format_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    """Serialize datetime as ISO-8601 string normalized with UTC timezone offset."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
+
+
 @router.get("/usage", status_code=status.HTTP_200_OK)
 def get_usage_metrics(
     period: str = Query(default="today", pattern="^(today|7d|30d|all)$"),
@@ -124,7 +135,7 @@ def get_usage_metrics(
             "total_tokens": r.total_tokens,
             "cost_usd": round(r.cost_usd, 6),
             "is_estimated": r.is_estimated,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "created_at": _format_utc_iso(r.created_at),
         }
         for r in records[:50]
     ]
