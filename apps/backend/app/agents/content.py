@@ -1,8 +1,9 @@
-"""Content and Research Worker Agents (Task 3.3).
+"""Content, Research, and Visual Worker Agents (Tasks 3.3 & 3.4).
 
 Implements:
 - DeepResearcherAgent: channel video indexing, transcript retrieval, offline HTML report card deck.
 - ContentWriterAgent: platform-specific copywriting with brand profile injection, hooks, and legal disclaimers.
+- ImageStudioAgent: offline HTML/CSS/SVG graphic templates rendered to PNG via BrowserController screenshot.
 - AgentResult & ArtifactOutput: aligned with BaseWorkerAgent and WorkerResult contracts.
 """
 
@@ -29,6 +30,14 @@ from app.mcp.external_apis import TranscriptResult, VideoMeta, YouTubeClient
 from app.orchestrator.dispatcher import mask_secrets
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ArtifactOutput",
+    "AgentResult",
+    "DeepResearcherAgent",
+    "ContentWriterAgent",
+    "ImageStudioAgent",
+]
 
 
 # ============================================================================
@@ -187,7 +196,10 @@ class DeepResearcherAgent(BaseWorkerAgent):
         # Collect secrets for automatic redaction
         extra_secrets: list[str] = list(task_ctx.get("extra_secrets") or [])
         for k, v in task_ctx.items():
-            if any(term in k.lower() for term in ("key", "token", "secret", "auth", "pwd")):
+            k_lower = k.lower()
+            if k_lower in {"author"}:
+                continue
+            if any(term in k_lower for term in ("key", "token", "secret", "pwd", "passwd", "password", "bearer")) or k_lower.startswith("auth_") or k_lower in {"auth", "authorization"}:
                 if isinstance(v, str) and len(v) >= 6:
                     extra_secrets.append(v)
 
@@ -793,7 +805,10 @@ class ContentWriterAgent(BaseWorkerAgent):
         # Collect secrets for automatic redaction
         extra_secrets: list[str] = list(task_ctx.get("extra_secrets") or [])
         for k, v in task_ctx.items():
-            if any(term in k.lower() for term in ("key", "token", "secret", "auth", "pwd")):
+            k_lower = k.lower()
+            if k_lower in {"author"}:
+                continue
+            if any(term in k_lower for term in ("key", "token", "secret", "pwd", "passwd", "password", "bearer")) or k_lower.startswith("auth_") or k_lower in {"auth", "authorization"}:
                 if isinstance(v, str) and len(v) >= 6:
                     extra_secrets.append(v)
 
@@ -1209,3 +1224,965 @@ class ContentWriterAgent(BaseWorkerAgent):
     </div>
 </body>
 </html>"""
+
+
+# ============================================================================
+# ImageStudioAgent (Task 3.4)
+# ============================================================================
+
+
+class ImageStudioAgent(BaseWorkerAgent):
+    """Agent that produces marketing graphics via offline HTML/CSS/SVG templates and PNG screenshot rendering."""
+
+    def __init__(
+        self,
+        agent: Optional[Agent] = None,
+        browser: Optional[BrowserController] = None,
+        llm: Optional[Any] = None,
+        llm_router: Optional[LlmRouter] = None,
+        brand_profile: Optional[BrandProfile | dict[str, Any]] = None,
+        session_factory: Optional[Any] = None,
+        db: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        synth_agent = agent or Agent(
+            id="agent-image-studio",
+            name="image_studio",
+            display_name="Image Studio",
+            role="visual_designer",
+            default_model="gemini-2.5-flash",
+            temperature=0.4,
+            max_tokens=4096,
+        )
+        router = llm_router or (llm if isinstance(llm, LlmRouter) else None)
+        super().__init__(
+            agent=synth_agent,
+            llm_router=router,
+            session_factory=session_factory,
+            db=db,
+            **kwargs,
+        )
+        self.browser = browser
+        self.brand_profile = brand_profile
+        self.llm = llm or router
+
+    async def run(self, task_ctx: dict[str, Any]) -> AgentResult:
+        """Render offline HTML/CSS/SVG graphics and capture crisp PNG at specified dimensions."""
+        t0 = time.perf_counter()
+
+        # Collect secrets for automatic redaction
+        extra_secrets: list[str] = list(task_ctx.get("extra_secrets") or [])
+        for k, v in task_ctx.items():
+            k_lower = k.lower()
+            if k_lower in {"author"}:
+                continue
+            if any(term in k_lower for term in ("key", "token", "secret", "pwd", "passwd", "password", "bearer")) or k_lower.startswith("auth_") or k_lower in {"auth", "authorization"}:
+                if isinstance(v, str) and len(v) >= 6:
+                    extra_secrets.append(v)
+
+        # 1. Paid generative image model HIL review gate
+        is_paid, provider, prompt = self._is_paid_image_api_requested(task_ctx)
+        if is_paid:
+            duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            provider_name = provider or "DALL-E 3"
+            masked_prompt = mask_secrets(prompt or "", extra_secrets=extra_secrets)
+            review_gate_data = {
+                "gate_type": "paid_image_api",
+                "provider": provider_name,
+                "prompt": masked_prompt,
+                "status": "waiting_review",
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+                "estimated_cost": {
+                    "usd": 0.040,
+                    "vnd": 1000,
+                },
+                "cost_usd": 0.040,
+                "cost_vnd": 1000,
+                "note": "Yêu cầu phê duyệt chi phí API hình ảnh trả phí trước khi thực hiện.",
+            }
+            return AgentResult(
+                subtask_id=str(task_ctx.get("subtask_id", "image-studio")),
+                agent_id=self.agent.id,
+                status="waiting_review",
+                error=None,
+                content=(
+                    f"Yêu cầu phê duyệt chi phí API hình ảnh trả phí ({provider_name}). "
+                    f"Chi phí ước tính: 0.040 USD (~1.000 VNĐ) mỗi lượt sinh ảnh. "
+                    f"Vui lòng xác nhận phê duyệt để tiếp tục."
+                ),
+                structured_data={"review_gate": review_gate_data},
+                artifacts=[],
+                duration_ms=duration_ms,
+            )
+
+        # 2. Dimensions and template resolution
+        width, height = self._resolve_dimensions(task_ctx)
+        template_name = str(task_ctx.get("template") or "quote_card").strip().lower()
+        if template_name not in {"quote_card", "product_showcase", "infographic"}:
+            template_name = "quote_card"
+
+        # 3. BrandProfile resolution
+        raw_brand = task_ctx.get("brand_profile") or self.brand_profile
+        brand_data = self._resolve_brand_profile(raw_brand)
+        colors = self._resolve_brand_colors(brand_data)
+        font_family = self._resolve_font_family(brand_data)
+
+        # 4. Generate self-contained HTML/CSS/SVG template
+        raw_html = self._render_template(
+            template_name=template_name,
+            task_ctx=task_ctx,
+            brand_data=brand_data,
+            colors=colors,
+            font_family=font_family,
+            width=width,
+            height=height,
+        )
+
+        # 5. Mask secrets in HTML
+        masked_html = mask_secrets(raw_html, extra_secrets=extra_secrets)
+
+        # 6. Sanitize for secure offline sandbox rendering
+        sanitized_html, _warnings = sanitize_offline_html(masked_html)
+
+        # 7. Output directory and artifact paths
+        output_dir = Path(task_ctx.get("output_dir") or Path.cwd() / "artifacts")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        subtask_id = str(task_ctx.get("subtask_id", "image-studio"))
+        slug = re.sub(r"[^\w\-]", "_", subtask_id)
+        html_filename = f"{template_name}_{slug}_{timestamp_str}.html"
+        png_filename = f"{template_name}_{slug}_{timestamp_str}.png"
+
+        html_path = output_dir / html_filename
+        png_path = output_dir / png_filename
+
+        html_path.write_text(sanitized_html, encoding="utf-8")
+
+        # 8. PNG screenshot rendering via BrowserController
+        browser = task_ctx.get("browser") or self.browser
+        if browser is not None:
+            await browser.render_html_to_png(
+                sanitized_html,
+                output_path=png_path,
+                width=width,
+                height=height,
+                task_workspace=output_dir,
+            )
+        else:
+            try:
+                browser = BrowserController(workspace_root=output_dir)
+                await browser.render_html_to_png(
+                    sanitized_html,
+                    output_path=png_path,
+                    width=width,
+                    height=height,
+                    task_workspace=output_dir,
+                )
+            except Exception as exc:
+                logger.warning("Browser rendering fallback failed: %s", exc)
+
+        # 9. Artifact outputs
+        html_artifact = ArtifactOutput(
+            filename=html_filename,
+            content=sanitized_html,
+            artifact_type="html",
+            title=f"Graphic Template ({template_name})",
+            metadata={
+                "width": width,
+                "height": height,
+                "template": template_name,
+                "path": str(html_path),
+            },
+        )
+        png_artifact = ArtifactOutput(
+            filename=png_filename,
+            content=str(png_path),
+            artifact_type="png",
+            title=f"Rendered Graphic ({width}x{height})",
+            metadata={
+                "width": width,
+                "height": height,
+                "template": template_name,
+                "path": str(png_path),
+            },
+        )
+
+        duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
+        structured_data = {
+            "template": template_name,
+            "width": width,
+            "height": height,
+            "size": f"{width}x{height}",
+            "html_path": str(html_path),
+            "png_path": str(png_path),
+            "brand_name": brand_data.get("brand_name"),
+        }
+
+        summary = (
+            f"Đã tạo đồ họa hình ảnh thành công ({template_name}, {width}x{height}px).\n"
+            f"- File HTML: {html_filename}\n"
+            f"- File PNG: {png_filename}"
+        )
+        summary = mask_secrets(summary, extra_secrets=extra_secrets)
+
+        return AgentResult(
+            subtask_id=subtask_id,
+            agent_id=self.agent.id,
+            status="completed",
+            content=summary,
+            structured_data=structured_data,
+            artifacts=[html_artifact, png_artifact],
+            duration_ms=duration_ms,
+        )
+
+    async def execute(
+        self,
+        subtask: Any,
+        context: Optional[dict[str, Any]] = None,
+        db_session_factory: Optional[Any] = None,
+    ) -> WorkerResult:
+        """Adapter method for BaseWorkerAgent orchestrator dispatch."""
+        ctx = dict(context or {})
+        task_ctx: dict[str, Any] = {}
+        if isinstance(subtask, dict):
+            task_ctx.update(subtask.get("metadata") or {})
+            task_ctx.setdefault("headline", subtask.get("instruction", ""))
+            task_ctx["subtask_id"] = subtask.get("id", "subtask")
+        else:
+            meta = getattr(subtask, "metadata", None) or {}
+            task_ctx.update(meta)
+            task_ctx.setdefault("headline", getattr(subtask, "instruction", ""))
+            task_ctx["subtask_id"] = getattr(subtask, "id", "subtask")
+
+        task_ctx.update(ctx)
+        return await self.run(task_ctx)
+
+    def _is_paid_image_api_requested(
+        self, task_ctx: dict[str, Any]
+    ) -> tuple[bool, Optional[str], Optional[str]]:
+        """Check if task context explicitly requests a paid generative image API."""
+        if task_ctx.get("use_paid_api") is True:
+            provider = str(task_ctx.get("provider") or task_ctx.get("model") or "dall-e-3")
+            prompt = str(task_ctx.get("prompt") or task_ctx.get("headline") or "")
+            return True, provider, prompt
+
+        provider_raw = str(task_ctx.get("provider") or "").lower().strip()
+        model_raw = str(task_ctx.get("model") or "").lower().strip()
+
+        paid_signatures = {
+            "dall-e",
+            "dall-e-3",
+            "dalle3",
+            "dall-e-2",
+            "midjourney",
+            "imagen",
+            "stability",
+            "stable-diffusion",
+            "recraft",
+            "flux-pro",
+        }
+        for sig in paid_signatures:
+            if sig in provider_raw or sig in model_raw:
+                prompt = str(task_ctx.get("prompt") or task_ctx.get("headline") or "")
+                return True, provider_raw or model_raw, prompt
+
+        return False, None, None
+
+    def _resolve_dimensions(self, task_ctx: dict[str, Any]) -> tuple[int, int]:
+        """Parse image dimensions from size or width/height parameters."""
+        w = task_ctx.get("width")
+        h = task_ctx.get("height")
+        if w is not None and h is not None:
+            try:
+                iw, ih = int(w), int(h)
+                if 100 <= iw <= 4096 and 100 <= ih <= 4096:
+                    return iw, ih
+            except (ValueError, TypeError):
+                pass
+
+        size_raw = str(task_ctx.get("size") or "").strip().lower()
+        if not size_raw:
+            return 1080, 1080
+
+        # Known size presets
+        if size_raw in {"square", "feed", "instagram", "facebook", "post", "1:1"}:
+            return 1080, 1080
+        if size_raw in {"landscape", "og", "meta", "fb_link", "web", "twitter", "16:9", "1.91:1"}:
+            return 1200, 630
+        if size_raw in {"story", "stories", "reels", "tiktok", "shorts", "vertical", "9:16"}:
+            return 1080, 1920
+
+        # Pattern: WxH or W*H
+        match = re.search(r"^(\d{3,4})\s*[xX*]\s*(\d{3,4})$", size_raw)
+        if match:
+            try:
+                pw, ph = int(match.group(1)), int(match.group(2))
+                if 100 <= pw <= 4096 and 100 <= ph <= 4096:
+                    return pw, ph
+            except (ValueError, TypeError):
+                pass
+
+        return 1080, 1080
+
+    def _resolve_brand_profile(
+        self, raw_brand: Optional[BrandProfile | dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Extract brand profile fields into normalized dictionary."""
+        if not raw_brand:
+            return {
+                "brand_name": "Thương hiệu chuẩn mực",
+                "tagline": "Khơi nguồn cảm hứng & giá trị sống",
+                "tone_of_voice": "Chuyên nghiệp, tinh tế, truyền cảm hứng",
+                "brand_colors": ["#1e40af", "#3b82f6", "#f59e0b", "#0f172a"],
+                "fonts": ["system-ui", "sans-serif"],
+            }
+
+        if isinstance(raw_brand, dict):
+            return {
+                "brand_name": raw_brand.get("brand_name", "Thương hiệu"),
+                "tagline": raw_brand.get("tagline", ""),
+                "tone_of_voice": raw_brand.get("tone_of_voice", "Chuyên nghiệp"),
+                "brand_colors": raw_brand.get("brand_colors", []),
+                "fonts": raw_brand.get("fonts", []),
+                "primary_color": raw_brand.get("primary_color"),
+                "secondary_color": raw_brand.get("secondary_color"),
+                "accent_color": raw_brand.get("accent_color"),
+                "background_color": raw_brand.get("background_color"),
+                "font_family": raw_brand.get("font_family"),
+            }
+
+        if isinstance(raw_brand, BrandProfile):
+            return {
+                "brand_name": raw_brand.brand_name,
+                "tagline": raw_brand.tagline or "",
+                "tone_of_voice": raw_brand.tone_of_voice or "Chuyên nghiệp",
+                "brand_colors": raw_brand.brand_colors or [],
+                "fonts": raw_brand.fonts or [],
+            }
+
+        return {
+            "brand_name": "Thương hiệu",
+            "tagline": "",
+            "brand_colors": [],
+            "fonts": [],
+        }
+
+    def _resolve_brand_colors(self, brand_data: dict[str, Any]) -> dict[str, str]:
+        """Extract primary, secondary, accent, and background colors with fallbacks."""
+        colors = {
+            "primary": "#1e40af",
+            "secondary": "#3b82f6",
+            "accent": "#f59e0b",
+            "background": "#0f172a",
+            "text": "#ffffff",
+        }
+        raw_colors = brand_data.get("brand_colors")
+        if isinstance(raw_colors, list) and raw_colors:
+            c_list = [str(c).strip() for c in raw_colors if c]
+            if len(c_list) >= 1:
+                colors["primary"] = c_list[0]
+            if len(c_list) >= 2:
+                colors["secondary"] = c_list[1]
+            if len(c_list) >= 3:
+                colors["accent"] = c_list[2]
+            if len(c_list) >= 4:
+                colors["background"] = c_list[3]
+        elif isinstance(raw_colors, dict):
+            for k in ("primary", "secondary", "accent", "background"):
+                if raw_colors.get(k):
+                    colors[k] = str(raw_colors[k]).strip()
+
+        for k in ("primary_color", "secondary_color", "accent_color", "background_color"):
+            short = k.replace("_color", "")
+            if brand_data.get(k):
+                colors[short] = str(brand_data[k]).strip()
+
+        return colors
+
+    def _resolve_font_family(self, brand_data: dict[str, Any]) -> str:
+        """Construct CSS font-family stack ensuring standard system fonts for Vietnamese diacritics."""
+        system_fonts = "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        fonts = brand_data.get("fonts")
+        chosen = ""
+        if isinstance(fonts, list) and fonts:
+            chosen = str(fonts[0]).strip()
+        elif isinstance(fonts, str) and fonts.strip():
+            chosen = fonts.strip()
+        elif brand_data.get("font_family"):
+            chosen = str(brand_data["font_family"]).strip()
+
+        if chosen:
+            if chosen in system_fonts:
+                return system_fonts
+            return f"{chosen}, {system_fonts}"
+        return system_fonts
+
+    def _render_template(
+        self,
+        template_name: str,
+        task_ctx: dict[str, Any],
+        brand_data: dict[str, Any],
+        colors: dict[str, str],
+        font_family: str,
+        width: int,
+        height: int,
+    ) -> str:
+        """Route to appropriate HTML/CSS/SVG template builder."""
+        if template_name == "product_showcase":
+            return self._render_product_showcase(
+                task_ctx=task_ctx,
+                brand_data=brand_data,
+                colors=colors,
+                font_family=font_family,
+                width=width,
+                height=height,
+            )
+        elif template_name == "infographic":
+            return self._render_infographic(
+                task_ctx=task_ctx,
+                brand_data=brand_data,
+                colors=colors,
+                font_family=font_family,
+                width=width,
+                height=height,
+            )
+        else:
+            return self._render_quote_card(
+                task_ctx=task_ctx,
+                brand_data=brand_data,
+                colors=colors,
+                font_family=font_family,
+                width=width,
+                height=height,
+            )
+
+    def _render_quote_card(
+        self,
+        task_ctx: dict[str, Any],
+        brand_data: dict[str, Any],
+        colors: dict[str, str],
+        font_family: str,
+        width: int,
+        height: int,
+    ) -> str:
+        """Render modern offline quote card template."""
+        safe_headline = _safe_text(
+            task_ctx.get("headline") or task_ctx.get("quote") or "Dành cho mình một khoảng nghỉ"
+        )
+        safe_author = _safe_text(
+            task_ctx.get("author") or brand_data.get("brand_name") or "Tác giả"
+        )
+        safe_subhead = _safe_text(
+            task_ctx.get("subhead") or brand_data.get("tagline") or ""
+        )
+        safe_brand_name = _safe_text(brand_data.get("brand_name") or "ImageStudio")
+
+        return f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{safe_headline}</title>
+    <style>
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        html, body {{
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: {colors['background']};
+            font-family: {font_family};
+            color: {colors['text']};
+        }}
+        .card-container {{
+            width: 100%;
+            height: 100%;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: clamp(40px, 6vw, 90px);
+            background: radial-gradient(120% 120% at 90% 10%, {colors['secondary']} 0%, {colors['primary']} 45%, {colors['background']} 100%);
+        }}
+        .bg-decorative-svg {{
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 50%;
+            height: 50%;
+            opacity: 0.08;
+            pointer-events: none;
+        }}
+        .header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: relative;
+            z-index: 2;
+        }}
+        .brand-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 18px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 9999px;
+            font-size: clamp(14px, 1.6vw, 18px);
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            color: #ffffff;
+        }}
+        .quote-body {{
+            position: relative;
+            z-index: 2;
+            margin: auto 0;
+        }}
+        .quote-icon {{
+            margin-bottom: clamp(16px, 2.5vw, 32px);
+            opacity: 0.9;
+        }}
+        .quote-text {{
+            font-size: clamp(28px, 4vw, 54px);
+            font-weight: 800;
+            line-height: 1.35;
+            letter-spacing: -0.02em;
+            color: #ffffff;
+        }}
+        .footer {{
+            position: relative;
+            z-index: 2;
+            border-top: 1px solid rgba(255, 255, 255, 0.15);
+            padding-top: clamp(20px, 2.5vw, 36px);
+        }}
+        .accent-bar {{
+            width: 48px;
+            height: 4px;
+            background: {colors['accent']};
+            border-radius: 2px;
+            margin-bottom: 14px;
+        }}
+        .author-name {{
+            font-size: clamp(18px, 2.2vw, 26px);
+            font-weight: 700;
+            color: {colors['accent']};
+            margin-bottom: 4px;
+        }}
+        .subhead {{
+            font-size: clamp(13px, 1.5vw, 17px);
+            color: rgba(255, 255, 255, 0.7);
+            font-weight: 400;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card-container">
+        <svg class="bg-decorative-svg" viewBox="0 0 400 400" fill="none">
+            <circle cx="200" cy="200" r="180" stroke="{colors['accent']}" stroke-width="40" stroke-dasharray="20 20"/>
+            <path d="M50 200 Q 200 50 350 200 T 650 200" stroke="#ffffff" stroke-width="16"/>
+        </svg>
+        <div class="header">
+            <div class="brand-badge">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="{colors['accent']}">
+                    <circle cx="12" cy="12" r="10"/>
+                </svg>
+                <span>{safe_brand_name}</span>
+            </div>
+        </div>
+        <div class="quote-body">
+            <svg class="quote-icon" width="60" height="44" viewBox="0 0 60 44" fill="{colors['accent']}">
+                <path d="M0 26.4C0 11.7 10.3 1.5 25 0l2.9 4.4C19.1 5.9 14.7 11.7 14.7 19.1H29.3V44H0V26.4zm30.7 0C30.7 11.7 41 1.5 55.7 0l2.9 4.4C49.8 5.9 45.4 11.7 45.4 19.1H60V44H30.7V26.4z"/>
+            </svg>
+            <div class="quote-text">{safe_headline}</div>
+        </div>
+        <div class="footer">
+            <div class="accent-bar"></div>
+            <div class="author-name">{safe_author}</div>
+            <div class="subhead">{safe_subhead}</div>
+        </div>
+    </div>
+</body>
+</html>"""
+
+    def _render_product_showcase(
+        self,
+        task_ctx: dict[str, Any],
+        brand_data: dict[str, Any],
+        colors: dict[str, str],
+        font_family: str,
+        width: int,
+        height: int,
+    ) -> str:
+        """Render modern offline product showcase template."""
+        safe_headline = _safe_text(
+            task_ctx.get("headline") or task_ctx.get("product_name") or "Sản phẩm chất lượng cao"
+        )
+        safe_badge = _safe_text(task_ctx.get("badge") or "Bán Chạy Nhất")
+        safe_price = _safe_text(
+            task_ctx.get("price") or task_ctx.get("price_vnd") or "289.000₫"
+        )
+        safe_cta_text = _safe_text(
+            task_ctx.get("cta_text") or task_ctx.get("cta") or "Mua Ngay"
+        )
+        safe_brand_name = _safe_text(brand_data.get("brand_name") or "ImageStudio")
+        safe_tagline = _safe_text(
+            task_ctx.get("tagline") or brand_data.get("tagline") or ""
+        )
+
+        raw_features = task_ctx.get("features")
+        if not raw_features or not isinstance(raw_features, list):
+            raw_features = [
+                "100% sáp đậu nành tự nhiên thuần khiết",
+                "Tinh dầu chiết xuất cao cấp an toàn",
+                "Thiết kế tinh xảo, trải nghiệm thư thái",
+            ]
+        features_html = "\n".join(
+            f"""<li class="feature-item">
+                <svg width="22" height="22" viewBox="0 0 20 20" fill="none" style="flex-shrink:0;">
+                    <circle cx="10" cy="10" r="10" fill="{colors['accent']}"/>
+                    <path d="M6 10l3 3 5-5" stroke="#000000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>{_safe_text(f)}</span>
+            </li>"""
+            for f in raw_features
+        )
+
+        return f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{safe_headline}</title>
+    <style>
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        html, body {{
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: {colors['background']};
+            font-family: {font_family};
+            color: {colors['text']};
+        }}
+        .showcase-container {{
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: clamp(40px, 5.5vw, 80px);
+            background: linear-gradient(145deg, {colors['background']} 0%, {colors['primary']} 70%, {colors['secondary']} 100%);
+            position: relative;
+        }}
+        .header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }}
+        .brand-name {{
+            font-size: clamp(16px, 2vw, 22px);
+            font-weight: 700;
+            color: #ffffff;
+            letter-spacing: 0.5px;
+        }}
+        .badge {{
+            display: inline-block;
+            background: {colors['accent']};
+            color: #0f172a;
+            font-weight: 800;
+            font-size: clamp(12px, 1.4vw, 15px);
+            padding: 6px 16px;
+            border-radius: 9999px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .product-card {{
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 28px;
+            padding: clamp(28px, 4vw, 50px);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            margin: auto 0;
+        }}
+        .product-title {{
+            font-size: clamp(26px, 3.8vw, 46px);
+            font-weight: 800;
+            line-height: 1.25;
+            color: #ffffff;
+            margin-bottom: 12px;
+        }}
+        .price-box {{
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: clamp(18px, 2.5vw, 30px);
+        }}
+        .price-label {{
+            font-size: clamp(14px, 1.6vw, 18px);
+            color: rgba(255, 255, 255, 0.6);
+            font-weight: 500;
+        }}
+        .price-value {{
+            font-size: clamp(32px, 4.5vw, 56px);
+            font-weight: 900;
+            color: {colors['accent']};
+            letter-spacing: -0.02em;
+        }}
+        .features-list {{
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: clamp(10px, 1.6vw, 18px);
+        }}
+        .feature-item {{
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            font-size: clamp(15px, 1.8vw, 22px);
+            color: #e2e8f0;
+            font-weight: 500;
+        }}
+        .footer {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding-top: 20px;
+        }}
+        .cta-btn {{
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            background: {colors['accent']};
+            color: #0f172a;
+            font-weight: 800;
+            font-size: clamp(14px, 1.8vw, 20px);
+            padding: clamp(12px, 1.6vw, 18px) clamp(24px, 3vw, 36px);
+            border-radius: 14px;
+        }}
+        .tagline {{
+            font-size: clamp(13px, 1.5vw, 16px);
+            color: rgba(255, 255, 255, 0.6);
+            font-style: italic;
+        }}
+    </style>
+</head>
+<body>
+    <div class="showcase-container">
+        <div class="header">
+            <div class="brand-name">{safe_brand_name}</div>
+            <div class="badge">{safe_badge}</div>
+        </div>
+        <div class="product-card">
+            <div class="product-title">{safe_headline}</div>
+            <div class="price-box">
+                <span class="price-label">Giá ưu đãi:</span>
+                <span class="price-value">{safe_price}</span>
+            </div>
+            <ul class="features-list">
+                {features_html}
+            </ul>
+        </div>
+        <div class="footer">
+            <div class="cta-btn">
+                <span>{safe_cta_text}</span>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                    <polyline points="12 5 19 12 12 19"></polyline>
+                </svg>
+            </div>
+            <div class="tagline">{safe_tagline}</div>
+        </div>
+    </div>
+</body>
+</html>"""
+
+    def _render_infographic(
+        self,
+        task_ctx: dict[str, Any],
+        brand_data: dict[str, Any],
+        colors: dict[str, str],
+        font_family: str,
+        width: int,
+        height: int,
+    ) -> str:
+        """Render modern offline infographic template."""
+        safe_headline = _safe_text(
+            task_ctx.get("headline") or task_ctx.get("title") or "Cẩm nang hướng dẫn"
+        )
+        safe_brand_name = _safe_text(brand_data.get("brand_name") or "ImageStudio")
+        safe_footer = _safe_text(
+            task_ctx.get("footer") or "Thông tin tổng hợp & đối chiếu chuẩn xác 2026"
+        )
+
+        raw_items = task_ctx.get("items")
+        if not raw_items or not isinstance(raw_items, list):
+            raw_items = [
+                {
+                    "step": "01",
+                    "title": "Khám phá & Xác định mục tiêu",
+                    "desc": "Lắng nghe nhu cầu cốt lõi để xây dựng lộ trình chuẩn xác",
+                },
+                {
+                    "step": "02",
+                    "title": "Thực hiện có kỷ luật",
+                    "desc": "Duy trì hành động đều đặn mỗi ngày để tạo bước đột phá",
+                },
+                {
+                    "step": "03",
+                    "title": "Đánh giá & Tối ưu hóa",
+                    "desc": "Đo lường kết quả thực tế để không ngừng nâng cao hiệu quả",
+                },
+            ]
+        cards_html_list = []
+        for idx, item in enumerate(raw_items, start=1):
+            if isinstance(item, dict):
+                step_val = str(item.get("step") or f"{idx:02d}")
+                title_val = str(item.get("title") or f"Bước {idx}")
+                desc_val = str(item.get("desc") or item.get("description") or "")
+            else:
+                step_val = f"{idx:02d}"
+                title_val = str(item)
+                desc_val = ""
+            desc_markup = (
+                f'<div class="card-desc">{_safe_text(desc_val)}</div>'
+                if desc_val
+                else ""
+            )
+            card_html = f"""<div class="info-card">
+                <div class="step-badge">{_safe_text(step_val)}</div>
+                <div class="card-content">
+                    <div class="card-title">{_safe_text(title_val)}</div>
+                    {desc_markup}
+                </div>
+            </div>"""
+            cards_html_list.append(card_html)
+        cards_html = "\n".join(cards_html_list)
+
+        return f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{safe_headline}</title>
+    <style>
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        html, body {{
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: {colors['background']};
+            font-family: {font_family};
+            color: {colors['text']};
+        }}
+        .info-container {{
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: clamp(36px, 5vw, 72px);
+            background: linear-gradient(180deg, {colors['background']} 0%, #1e293b 100%);
+            position: relative;
+        }}
+        .header {{
+            margin-bottom: clamp(16px, 2.5vw, 30px);
+        }}
+        .category-tag {{
+            display: inline-block;
+            font-size: clamp(12px, 1.4vw, 15px);
+            font-weight: 800;
+            letter-spacing: 2px;
+            color: {colors['accent']};
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }}
+        .title {{
+            font-size: clamp(24px, 3.6vw, 44px);
+            font-weight: 800;
+            line-height: 1.25;
+            color: #ffffff;
+            letter-spacing: -0.01em;
+        }}
+        .cards-list {{
+            display: flex;
+            flex-direction: column;
+            gap: clamp(12px, 1.8vw, 22px);
+            margin: auto 0;
+        }}
+        .info-card {{
+            display: flex;
+            align-items: flex-start;
+            gap: clamp(16px, 2vw, 26px);
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-left: 5px solid {colors['accent']};
+            border-radius: 18px;
+            padding: clamp(16px, 2.2vw, 26px);
+        }}
+        .step-badge {{
+            flex-shrink: 0;
+            width: clamp(42px, 5vw, 56px);
+            height: clamp(42px, 5vw, 56px);
+            background: {colors['primary']};
+            border: 2px solid {colors['accent']};
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: clamp(18px, 2.2vw, 24px);
+            font-weight: 900;
+            color: #ffffff;
+        }}
+        .card-content {{
+            flex: 1;
+        }}
+        .card-title {{
+            font-size: clamp(17px, 2.2vw, 24px);
+            font-weight: 700;
+            color: #ffffff;
+            margin-bottom: 4px;
+        }}
+        .card-desc {{
+            font-size: clamp(13px, 1.6vw, 18px);
+            color: #94a3b8;
+            line-height: 1.45;
+        }}
+        .footer {{
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            padding-top: clamp(12px, 1.8vw, 20px);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: clamp(12px, 1.4vw, 15px);
+            color: #64748b;
+        }}
+    </style>
+</head>
+<body>
+    <div class="info-container">
+        <div class="header">
+            <div class="category-tag">{safe_brand_name} • INFOGRAPHIC</div>
+            <div class="title">{safe_headline}</div>
+        </div>
+        <div class="cards-list">
+            {cards_html}
+        </div>
+        <div class="footer">
+            <span>{safe_footer}</span>
+            <span>{safe_brand_name}</span>
+        </div>
+    </div>
+</body>
+</html>"""
+
