@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import secrets
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +9,7 @@ from app.api.agents import agents_router, departments_router
 from app.api.artifacts import router as artifacts_router
 from app.api.monitoring import router as monitoring_router
 from app.api.tasks import router as tasks_router
+from app.api.ws import TaskWebSocketManager, router as ws_router
 from app.config import AppSettings, get_settings
 from app.db.session import init_db, seed_defaults
 from app.orchestrator.graph import recover_interrupted_tasks
@@ -45,14 +47,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings
+    app.state.session_factory = factory
+    app.state.ws_manager = TaskWebSocketManager()
     app.state.recovered_tasks_count = 0
 
-    # Mount API routers
+    # Mount API & WebSocket routers
     app.include_router(tasks_router)
     app.include_router(agents_router)
     app.include_router(departments_router)
     app.include_router(artifacts_router)
     app.include_router(monitoring_router)
+    app.include_router(ws_router)
 
     # CORS configuration for desktop Next.js / Tauri shell
     app.add_middleware(
@@ -77,7 +82,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         # Enforce X-Local-Auth-Token on /api/v1/* endpoints
         if request.url.path.startswith("/api/v1"):
             token = request.headers.get("X-Local-Auth-Token")
-            if not token or token != resolved_settings.local_auth_token:
+            if not token or not secrets.compare_digest(
+                token.encode("utf-8"),
+                resolved_settings.local_auth_token.encode("utf-8"),
+            ):
                 return JSONResponse(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={"detail": "Invalid or missing X-Local-Auth-Token"},
