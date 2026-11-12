@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.config import AppSettings, get_settings
-from app.db.models import Agent, Task, TaskStatus
+from app.db.models import Agent, Project, Task, TaskStatus
 from app.db.session import DEFAULT_AGENTS, get_db
 from app.orchestrator.parser import PromptValidationError, TaskParser
 
@@ -54,13 +54,13 @@ def parse_task(
     if not known_agents:
         known_agents = [a["name"] for a in DEFAULT_AGENTS]
 
-    # 2. Parse and validate prompt
+    # 2. Parse and validate prompt (do not record history until commit succeeds)
     try:
         parsed = parser.parse(
             prompt_text=payload.prompt_text,
             attachment_ids=payload.attachment_ids,
             known_agents=known_agents,
-            record_history=True,
+            record_history=False,
         )
     except PromptValidationError as exc:
         raise HTTPException(
@@ -68,7 +68,15 @@ def parse_task(
             detail=str(exc),
         ) from exc
 
-    # 3. Resolve assigned agent if tagged
+    # 3. Validate project existence
+    project = db.get(Project, payload.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{payload.project_id}' not found",
+        )
+
+    # 4. Resolve assigned agent if tagged
     assigned_agent_id: Optional[str] = None
     if parsed.mentioned_agents:
         first_agent_name = parsed.mentioned_agents[0]
@@ -76,7 +84,7 @@ def parse_task(
         if agent_record:
             assigned_agent_id = agent_record.id
 
-    # 4. Create and persist Task in PENDING status
+    # 5. Create and persist Task in PENDING status
     task_id = f"task-{uuid.uuid4().hex[:12]}"
     raw_prompt = parsed.raw_prompt.strip()
     title = (raw_prompt[:77] + "...") if len(raw_prompt) > 80 else raw_prompt
@@ -99,9 +107,16 @@ def parse_task(
             "mode": payload.mode,
         },
     )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
+    try:
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+    except Exception:
+        db.rollback()
+        raise
+
+    # 6. Record prompt history ONLY after DB commit succeeds
+    parser.record_prompt(parsed.raw_prompt)
 
     return {
         "status": "success",

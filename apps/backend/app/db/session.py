@@ -325,7 +325,6 @@ def seed_defaults(session: Session) -> None:
 
 def get_db(
     request: Request = None,  # type: ignore[assignment]
-    db_path: Optional[Path | str] = None,
 ) -> Generator[Session, None, None]:
     """FastAPI dependency for yielding database sessions.
 
@@ -339,8 +338,6 @@ def get_db(
             resolved_path = app_settings.resolved_db_path
     elif isinstance(request, (Path, str)):
         resolved_path = request
-    elif db_path is not None:
-        resolved_path = db_path
 
     SessionLocal = init_db(resolved_path, cache=True)
     with SessionLocal() as session:

@@ -253,3 +253,33 @@ def test_api_tasks_history_endpoint(tmp_path: Path):
     filtered_data = resp_filter.json()["data"]
     assert len(filtered_data) == 1
     assert "YouTube" in filtered_data[0]
+
+
+def test_openapi_schema_does_not_leak_db_path(tmp_path: Path):
+    """Ensure get_db dependency does not expose db_path as a query param in OpenAPI schema."""
+    settings = AppSettings(workspace_dir=tmp_path, local_auth_token="test-token")
+    app = create_app(settings)
+    schema = app.openapi()
+    parse_op = schema["paths"]["/api/v1/tasks/parse"]["post"]
+    params = parse_op.get("parameters", [])
+    param_names = [p["name"] for p in params]
+    assert "db_path" not in param_names
+
+
+def test_api_parse_rejects_unknown_project_id(tmp_path: Path):
+    """POST /api/v1/tasks/parse returns 404 when project_id does not exist and does not pollute history."""
+    settings = AppSettings(workspace_dir=tmp_path, local_auth_token="test-token")
+    client = TestClient(create_app(settings))
+    headers = {"X-Local-Auth-Token": "test-token"}
+
+    resp = client.post(
+        "/api/v1/tasks/parse",
+        json={"project_id": "proj-nonexistent", "prompt_text": "Lệnh không hợp lệ"},
+        headers=headers,
+    )
+    assert resp.status_code == 404
+    assert "proj-nonexistent" in resp.json()["detail"]
+
+    # Verify history was not polluted
+    hist_resp = client.get("/api/v1/tasks/history", headers=headers)
+    assert "Lệnh không hợp lệ" not in hist_resp.json()["data"]

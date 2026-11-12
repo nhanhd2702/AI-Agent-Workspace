@@ -8,8 +8,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
+import threading
 from typing import Any, Optional
 
 
@@ -213,47 +216,66 @@ class TaskParser:
         self.history_file = Path(history_file).resolve() if history_file else None
         self.max_history = max_history
         self._history: list[str] = []
+        self._lock = threading.Lock()
         self._load_history()
 
     def _load_history(self) -> None:
         """Loads prompt history from persistent JSON file if available."""
         if self.history_file and self.history_file.exists():
-            try:
-                with open(self.history_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        self._history = [str(item).strip() for item in data if item][: self.max_history]
-            except Exception:
-                self._history = []
+            with self._lock:
+                try:
+                    with open(self.history_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            self._history = [str(item).strip() for item in data if item][: self.max_history]
+                except Exception:
+                    self._history = []
 
     def _save_history(self) -> None:
         """Saves prompt history to persistent JSON file atomically."""
         if self.history_file:
+            tmp_path: Optional[Path] = None
             try:
                 self.history_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.history_file, "w", encoding="utf-8") as f:
-                    json.dump(self._history, f, ensure_ascii=False, indent=2)
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    dir=self.history_file.parent,
+                    delete=False,
+                    encoding="utf-8",
+                    suffix=".tmp",
+                ) as tmp:
+                    tmp_path = Path(tmp.name)
+                    json.dump(self._history, tmp, ensure_ascii=False, indent=2)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.replace(tmp_path, self.history_file)
             except Exception:
-                pass
+                if tmp_path and tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
 
     def record_prompt(self, prompt: str) -> None:
         """Records a valid prompt into recent history (MRU order, max 50)."""
         clean = prompt.strip()
         if not clean:
             return
-        if clean in self._history:
-            self._history.remove(clean)
-        self._history.insert(0, clean)
-        if len(self._history) > self.max_history:
-            self._history = self._history[: self.max_history]
-        self._save_history()
+        with self._lock:
+            if clean in self._history:
+                self._history.remove(clean)
+            self._history.insert(0, clean)
+            if len(self._history) > self.max_history:
+                self._history = self._history[: self.max_history]
+            self._save_history()
 
     def get_history(self, query: Optional[str] = None, limit: int = 50) -> list[str]:
         """Returns recent prompts, optionally filtered by search substring."""
-        if not query:
-            return self._history[:limit]
-        q = query.strip().lower()
-        return [p for p in self._history if q in p.lower()][:limit]
+        with self._lock:
+            if not query:
+                return list(self._history[:limit])
+            q = query.strip().lower()
+            return [p for p in self._history if q in p.lower()][:limit]
 
     def parse(
         self,
