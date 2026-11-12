@@ -2,7 +2,9 @@
 
 import pytest
 from datetime import datetime, timezone
-from app.db.session import init_db, seed_defaults
+import concurrent.futures
+import threading
+from app.db.session import init_db, seed_defaults, get_db, reset_db_cache
 from app.db.models import (
     Base,
     Project,
@@ -396,3 +398,129 @@ def test_all_18_orm_models_can_be_created_and_persisted(tmp_path):
         assert db.get(ConnectorConfig, "conn-zalo") is not None
         assert db.get(UserSettings, "settings-test") is not None
         assert db.get(TaskAuditLog, "audit-1") is not None
+
+
+def test_fsm_completed_at_cleared_on_retry_from_failed(tmp_path):
+    """When retrying a FAILED task, completed_at timestamp must be reset to None."""
+    SessionLocal = init_db(tmp_path / "app.db")
+    with SessionLocal() as db:
+        seed_defaults(db)
+        task = Task(id="t_retry", project_id="proj-default", title="Retry Test", status=TaskStatus.RUNNING)
+        db.add(task)
+        db.commit()
+
+        # Transition to FAILED -> sets completed_at
+        TaskStateMachine.transition(db, "t_retry", TaskStatus.FAILED, actor="system", reason="Timeout")
+        assert task.status == TaskStatus.FAILED
+        assert task.completed_at is not None
+
+        # Retry: FAILED -> RUNNING -> completed_at must be cleared
+        TaskStateMachine.transition(db, "t_retry", TaskStatus.RUNNING, actor="user", reason="Manual retry")
+        assert task.status == TaskStatus.RUNNING
+        assert task.completed_at is None
+
+
+def test_fsm_rejects_running_directly_to_approved(tmp_path):
+    """APPROVED must only be entered via WAITING_REVIEW; RUNNING -> APPROVED is illegal."""
+    SessionLocal = init_db(tmp_path / "app.db")
+    with SessionLocal() as db:
+        seed_defaults(db)
+        task = Task(id="t_no_bypass", project_id="proj-default", title="No Bypass", status=TaskStatus.RUNNING)
+        db.add(task)
+        db.commit()
+
+        with pytest.raises(InvalidStateTransitionError):
+            TaskStateMachine.transition(db, "t_no_bypass", TaskStatus.APPROVED, actor="user")
+
+
+def test_get_db_reuses_cached_sessionmaker(tmp_path):
+    """get_db and init_db reuse the cached sessionmaker and Engine for the same db path."""
+    db_file = tmp_path / "cached_test.db"
+    f1 = init_db(db_file)
+    f2 = init_db(db_file)
+    assert f1 is f2
+
+    # Test get_db generator reuses the same bind
+    g1 = get_db(db_file)
+    g2 = get_db(db_file)
+    s1 = next(g1)
+    s2 = next(g2)
+    assert s1.bind is s2.bind
+    s1.close()
+    s2.close()
+
+
+def test_multithreaded_memory_db_access():
+    """Ensure multi-threaded access to in-memory SQLite works cleanly with StaticPool."""
+    SessionLocal = init_db(":memory:")
+    with SessionLocal() as db:
+        seed_defaults(db)
+
+    # Thread 1: performs write on different thread
+    def _writer_thread(task_id: str, results: list[str]) -> None:
+        with SessionLocal() as session:
+            task = Task(
+                id=task_id,
+                project_id="proj-default",
+                title=f"Task {task_id}",
+                status=TaskStatus.PENDING,
+            )
+            session.add(task)
+            session.commit()
+            results.append(task_id)
+
+    # Thread 2: verifies read on yet another thread
+    def _reader_thread(task_id: str, results: list[bool]) -> None:
+        with SessionLocal() as session:
+            t = session.get(Task, task_id)
+            results.append(t is not None)
+
+    written: list[str] = []
+    read_results: list[bool] = []
+
+    t1 = threading.Thread(target=_writer_thread, args=("t_cross_thread_1", written))
+    t1.start()
+    t1.join()
+
+    assert written == ["t_cross_thread_1"]
+
+    t2 = threading.Thread(target=_reader_thread, args=("t_cross_thread_1", read_results))
+    t2.start()
+    t2.join()
+
+    assert read_results == [True]
+
+    # Concurrent workers with thread synchronization
+    lock = threading.Lock()
+
+    def _concurrent_worker(worker_id: int) -> int:
+        with lock:
+            with SessionLocal() as session:
+                task = Task(
+                    id=f"t_thread_{worker_id}",
+                    project_id="proj-default",
+                    title=f"Thread Task {worker_id}",
+                    status=TaskStatus.PENDING,
+                )
+                session.add(task)
+                session.commit()
+                return session.query(Task).count()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_concurrent_worker, i) for i in range(4)]
+        worker_counts = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    assert len(worker_counts) == 4
+    with SessionLocal() as db:
+        # 1 from thread 1 + 4 from concurrent workers = 5 tasks
+        assert db.query(Task).count() == 5
+
+
+def test_fsm_transition_missing_task_raises_value_error(tmp_path):
+    """Attempting to transition a non-existent task must raise ValueError."""
+    SessionLocal = init_db(tmp_path / "app.db")
+    with SessionLocal() as db:
+        seed_defaults(db)
+        with pytest.raises(ValueError, match="Task with id 'missing-id' not found"):
+            TaskStateMachine.transition(db, "missing-id", TaskStatus.RUNNING, actor="user")
+

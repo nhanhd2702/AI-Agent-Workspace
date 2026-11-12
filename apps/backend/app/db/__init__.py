@@ -27,6 +27,7 @@ from app.db.session import (
     DEFAULT_DEPARTMENTS,
     get_db,
     init_db,
+    reset_db_cache,
     seed_defaults,
 )
 from app.db.state_machine import (
@@ -60,6 +61,7 @@ __all__ = [
     "DEFAULT_AGENTS",
     "init_db",
     "seed_defaults",
+    "reset_db_cache",
     "get_db",
     "ALLOWED_TRANSITIONS",
     "InvalidStateTransitionError",

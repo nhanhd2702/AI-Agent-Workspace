@@ -41,7 +41,6 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     },
     TaskStatus.RUNNING: {
         TaskStatus.WAITING_REVIEW,
-        TaskStatus.APPROVED,
         TaskStatus.DELIVERED,
         TaskStatus.COMPLETED,
         TaskStatus.PAUSED,
@@ -146,8 +145,10 @@ class TaskStateMachine:
         task.updated_at = now
 
         # Update lifecycle timestamps
-        if new_status == TaskStatus.RUNNING and task.started_at is None:
-            task.started_at = now
+        if new_status == TaskStatus.RUNNING:
+            if task.started_at is None:
+                task.started_at = now
+            task.completed_at = None
         elif new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
             task.completed_at = now
 

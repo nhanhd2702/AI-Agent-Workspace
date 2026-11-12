@@ -8,6 +8,7 @@ from typing import Generator, Optional
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.db.models import (
     Agent,
@@ -193,11 +194,30 @@ DEFAULT_AGENTS = [
 ]
 
 
-def init_db(db_path: Optional[Path | str] = None) -> sessionmaker[Session]:
+# Module-level sessionmaker factory cache
+_FACTORIES: dict[str, sessionmaker[Session]] = {}
+
+
+def reset_db_cache() -> None:
+    """Clears cached sessionmaker instances (useful for test isolation)."""
+    _FACTORIES.clear()
+
+
+def init_db(
+    db_path: Optional[Path | str] = None,
+    force_recreate: bool = False,
+    cache: Optional[bool] = None,
+) -> sessionmaker[Session]:
     """Initializes SQLite database, enables foreign keys & WAL mode, and returns a sessionmaker.
+
+    Caches the sessionmaker by resolved path to prevent recreating Engines and running DDL
+    create_all on each get_db() invocation.
 
     Args:
         db_path: Path to SQLite database file. If None, resolves from AppSettings.
+        force_recreate: If True, bypasses and replaces any existing cached sessionmaker.
+        cache: If True, caches the sessionmaker. Defaults to True for file databases and False
+            for in-memory databases (:memory:) to preserve test isolation.
 
     Returns:
         SQLAlchemy sessionmaker configured with the initialized SQLite engine.
@@ -207,14 +227,34 @@ def init_db(db_path: Optional[Path | str] = None) -> sessionmaker[Session]:
         settings = get_settings()
         db_path = settings.resolved_db_path
 
-    if str(db_path) == ":memory:":
-        engine_url = "sqlite:///:memory:"
-    else:
+    is_memory = str(db_path) == ":memory:"
+    should_cache = cache if cache is not None else not is_memory
+
+    if not is_memory:
         path = Path(db_path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        cache_key = str(path)
         engine_url = f"sqlite:///{path.as_posix()}"
+    else:
+        cache_key = ":memory:"
+        engine_url = "sqlite:///:memory:"
 
-    engine = create_engine(engine_url, echo=False)
+    if should_cache and not force_recreate and cache_key in _FACTORIES:
+        return _FACTORIES[cache_key]
+
+    if is_memory:
+        engine = create_engine(
+            engine_url,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+            echo=False,
+        )
+    else:
+        engine = create_engine(
+            engine_url,
+            connect_args={"check_same_thread": False},
+            echo=False,
+        )
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection: object, connection_record: object) -> None:
@@ -224,7 +264,12 @@ def init_db(db_path: Optional[Path | str] = None) -> sessionmaker[Session]:
         cursor.close()
 
     Base.metadata.create_all(bind=engine)
-    return sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    if should_cache:
+        _FACTORIES[cache_key] = factory
+
+    return factory
 
 
 def seed_defaults(session: Session) -> None:
@@ -247,7 +292,9 @@ def seed_defaults(session: Session) -> None:
     for dept_data in DEFAULT_DEPARTMENTS:
         existing_dept = session.get(Department, dept_data["id"])
         if not existing_dept:
-            session.add(Department(**dept_data))
+            by_name = session.query(Department).filter_by(name=dept_data["name"]).first()
+            if not by_name:
+                session.add(Department(**dept_data))
 
     session.flush()
 
@@ -277,6 +324,6 @@ def seed_defaults(session: Session) -> None:
 
 def get_db(db_path: Optional[Path | str] = None) -> Generator[Session, None, None]:
     """FastAPI dependency for yielding database sessions."""
-    SessionLocal = init_db(db_path)
+    SessionLocal = init_db(db_path, cache=True)
     with SessionLocal() as session:
         yield session
