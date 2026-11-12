@@ -314,6 +314,69 @@ async def test_deep_researcher_browser_safe_halt_on_captcha_gate(
     assert "captcha gate detected" in result.error or "CAPTCHA_REQUIRED" in result.error
 
 
+@pytest.mark.asyncio
+async def test_deep_researcher_handles_quotes_in_channel_names(
+    mock_yt_client: MockYouTubeClient, mock_llm: MockLlm
+) -> None:
+    """Channel names containing apostrophes/quotes must use data-channel attributes to prevent JS syntax errors."""
+    mock_yt_client.seed_videos(
+        [
+            {
+                "id": "v_quote",
+                "title": "Hormozi Playbook",
+                "view_count": 30000,
+                "url": "https://youtube.com/watch?v=v_quote",
+                "channel_title": "Alex's Channel",
+            }
+        ]
+    )
+    agent = DeepResearcherAgent(yt_client=mock_yt_client, llm=mock_llm)
+    result = await agent.run({"channels": ["https://youtube.com/@Alex"]})
+
+    content = result.artifacts[0].content
+    # Must use data-channel with escaped channel attribute
+    assert 'data-channel="Alex&#x27;s Channel"' in content or 'data-channel="Alex\'s Channel"' in content
+    # Onclick must delegate through getAttribute, not raw interpolation
+    assert "onclick=\"filterChannel(this.getAttribute('data-channel'))\"" in content
+    assert "onclick=\"filterChannel('Alex's Channel')\"" not in content
+
+
+@pytest.mark.asyncio
+async def test_deep_researcher_masks_secrets_in_html_and_structured_data(
+    mock_yt_client: MockYouTubeClient, mock_llm: MockLlm
+) -> None:
+    """DeepResearcherAgent must redact API secrets from HTML artifact and structured data."""
+    secret_key = "sk-live-deepresearchtoken12345"
+    mock_yt_client.seed_videos(
+        [
+            {
+                "id": "v_sec",
+                "title": f"Video title containing {secret_key}",
+                "view_count": 15000,
+                "url": "https://youtube.com/watch?v=v_sec",
+            }
+        ]
+    )
+    agent = DeepResearcherAgent(yt_client=mock_yt_client, llm=mock_llm)
+    result = await agent.run(
+        {
+            "channels": ["https://youtube.com/@SecretChannel"],
+            "api_key": secret_key,
+            "topic": f"Research on {secret_key}",
+        }
+    )
+
+    # Secret must be masked in HTML artifact
+    html_content = result.artifacts[0].content
+    assert secret_key not in html_content
+    assert "***REDACTED***" in html_content or "sk-live-" not in html_content
+
+    # Secret must be masked in structured_data
+    structured_str = json.dumps(result.structured_data)
+    assert secret_key not in structured_str
+
+
+
 # ============================================================================
 # ContentWriterAgent Tests
 # ============================================================================

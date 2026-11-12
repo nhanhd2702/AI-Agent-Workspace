@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import html
 import json
+import logging
 from pathlib import Path
 import re
 import time
@@ -26,6 +27,8 @@ from app.llm.router import LlmResponse, LlmRouter
 from app.mcp.browser_server import BrowserActionResult, BrowserController, BrowserGateStatus
 from app.mcp.external_apis import TranscriptResult, VideoMeta, YouTubeClient
 from app.orchestrator.dispatcher import mask_secrets
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -122,7 +125,8 @@ async def _invoke_llm(
             return str(raw)
 
         return None
-    except Exception:
+    except Exception as exc:
+        logger.warning("Error invoking LLM in content agent: %s", exc, exc_info=True)
         return None
 
 
@@ -179,6 +183,13 @@ class DeepResearcherAgent(BaseWorkerAgent):
         min_views = int(task_ctx.get("min_views", 0))
         limit = int(task_ctx.get("limit", 20))
         topic = str(task_ctx.get("topic", "")).strip()
+
+        # Collect secrets for automatic redaction
+        extra_secrets: list[str] = list(task_ctx.get("extra_secrets") or [])
+        for k, v in task_ctx.items():
+            if any(term in k.lower() for term in ("key", "token", "secret", "auth", "pwd")):
+                if isinstance(v, str) and len(v) >= 6:
+                    extra_secrets.append(v)
 
         yt = task_ctx.get("yt_client") or self.yt_client
         browser = task_ctx.get("browser") or self.browser
@@ -270,10 +281,11 @@ class DeepResearcherAgent(BaseWorkerAgent):
         )
 
         sanitized_html, _ = sanitize_offline_html(raw_html)
+        masked_html = mask_secrets(sanitized_html, extra_secrets=extra_secrets)
 
         html_artifact = ArtifactOutput(
             filename=f"research_report_{int(time.time())}.html",
-            content=sanitized_html,
+            content=str(masked_html),
             artifact_type="html",
             title=f"Báo cáo Nghiên cứu: {topic or 'Tổng hợp nội dung'}",
             metadata={"video_count": len(verified_videos), "idea_count": len(ideas)},
@@ -281,11 +293,11 @@ class DeepResearcherAgent(BaseWorkerAgent):
 
         duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
         structured_data = {
-            "topic": topic,
-            "channels": channels,
-            "videos": verified_videos,
-            "ideas": ideas,
-            "web_findings": web_findings,
+            "topic": mask_secrets(topic, extra_secrets=extra_secrets),
+            "channels": mask_secrets(channels, extra_secrets=extra_secrets),
+            "videos": mask_secrets(verified_videos, extra_secrets=extra_secrets),
+            "ideas": mask_secrets(ideas, extra_secrets=extra_secrets),
+            "web_findings": mask_secrets(web_findings, extra_secrets=extra_secrets),
             "total_videos": len(verified_videos),
         }
 
@@ -298,7 +310,12 @@ class DeepResearcherAgent(BaseWorkerAgent):
                 "ideas_count": len(ideas),
                 "html_file": html_artifact.filename,
             },
-            content=f"Đã hoàn thành nghiên cứu cho chủ đề '{topic}': phân tích {len(verified_videos)} video đã xác thực và sinh 5 ý tưởng nội dung Việt hóa.",
+            content=str(
+                mask_secrets(
+                    f"Đã hoàn thành nghiên cứu cho chủ đề '{topic}': phân tích {len(verified_videos)} video đã xác thực và sinh 5 ý tưởng nội dung Việt hóa.",
+                    extra_secrets=extra_secrets,
+                )
+            ),
             structured_data=structured_data,
             artifacts=[html_artifact],
             duration_ms=duration_ms,
@@ -418,8 +435,9 @@ class DeepResearcherAgent(BaseWorkerAgent):
         for v in videos:
             safe_id = _safe_text(v.get("video_id", ""))
             safe_title = _safe_text(v.get("title", "Không có tiêu đề"))
-            safe_channel = _safe_text(v.get("channel_title", "Kênh"))
-            unique_channels.add(safe_channel)
+            raw_channel = str(v.get("channel_title") or "Kênh")
+            unique_channels.add(raw_channel)
+            safe_channel = _safe_text(raw_channel)
             safe_url = _sanitize_href(v.get("url", ""))
             view_cnt = int(v.get("view_count", 0))
             is_avail = bool(v.get("transcript_available", False))
@@ -453,7 +471,7 @@ class DeepResearcherAgent(BaseWorkerAgent):
             )
 
         channel_buttons = "".join(
-            f'<button class="filter-btn" onclick="filterChannel(\'{ch}\')">{ch}</button>'
+            f'<button class="filter-btn" data-channel="{_safe_text(ch)}" onclick="filterChannel(this.getAttribute(\'data-channel\'))">{_safe_text(ch)}</button>'
             for ch in sorted(unique_channels)
         )
 
@@ -674,7 +692,7 @@ class DeepResearcherAgent(BaseWorkerAgent):
 
         <div class="controls">
             <input type="text" id="searchInput" class="search-input" placeholder="Tìm kiếm video theo tiêu đề hoặc kênh..." oninput="filterCards()" />
-            <button class="filter-btn active" onclick="filterChannel('all')">Tất cả kênh</button>
+            <button class="filter-btn active" data-channel="all" onclick="filterChannel(this.getAttribute('data-channel'))">Tất cả kênh</button>
             {channel_buttons}
         </div>
 
@@ -706,10 +724,11 @@ class DeepResearcherAgent(BaseWorkerAgent):
         }}
 
         function filterChannel(channel) {{
-            currentChannel = channel;
+            currentChannel = channel || 'all';
             var buttons = document.querySelectorAll('.filter-btn');
             buttons.forEach(function(btn) {{
-                if (btn.innerText === channel || (channel === 'all' && btn.innerText === 'Tất cả kênh')) {{
+                var btnCh = btn.getAttribute('data-channel');
+                if (btnCh === currentChannel) {{
                     btn.classList.add('active');
                 }} else {{
                     btn.classList.remove('active');
