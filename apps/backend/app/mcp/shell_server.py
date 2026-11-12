@@ -285,7 +285,13 @@ _FFMPEG_SAFE_FLAGS: frozenset[str] = frozenset(
     }
 )
 _FFMPEG_COLON_FLAG_RE = re.compile(
-    r"^-(c|b|r|s|codec|profile|level|filter|filter_script|metadata)(:[A-Za-z0-9_]+)+$"
+    r"^-(c|b|r|s|codec|profile|level|metadata)(:[A-Za-z0-9_]+)+$"
+)
+_FFMPEG_FILTER_SCRIPT_COLON_RE = re.compile(
+    r"^-filter[_-]script(:[A-Za-z0-9_]+)+$"
+)
+_FFMPEG_FILTER_COLON_RE = re.compile(
+    r"^-filter(:[A-Za-z0-9_]+)+$"
 )
 _FFMPEG_TIMESTAMP_RE = re.compile(r"^\d+(:\d{1,2}){0,2}(\.\d+)?$")
 _FFMPEG_STREAM_SPEC_RE = re.compile(r"^-?\[?[A-Za-z0-9_]+(:[A-Za-z0-9_]+)*\??\]?$")
@@ -510,6 +516,35 @@ class ShellExecutor:
                 f"Protocol specifier forbidden in scalar value {value!r}"
             )
 
+    @staticmethod
+    def _split_filter_colons(token: str) -> list[str]:
+        raw_parts = [p for p in token.split(":") if p]
+        merged: list[str] = []
+        i = 0
+        while i < len(raw_parts):
+            cur = raw_parts[i]
+            if i + 1 < len(raw_parts):
+                nxt = raw_parts[i + 1]
+                eq_chunks = cur.rstrip("'\"").split("=")
+                tail_candidate = eq_chunks[-1].strip().lstrip("'\"")
+                prev_key = eq_chunks[-2].strip().lower() if len(eq_chunks) >= 2 else ""
+                is_single_drive_letter = (
+                    len(tail_candidate) == 1
+                    and tail_candidate.isascii()
+                    and tail_candidate.isalpha()
+                )
+                if is_single_drive_letter and (
+                    "=" not in nxt
+                    or prev_key in _FFMPEG_FILE_FILTER_KEYS
+                    or len(eq_chunks) == 1
+                ):
+                    merged.append(f"{cur}:{nxt}")
+                    i += 2
+                    continue
+            merged.append(cur)
+            i += 1
+        return merged
+
     def _validate_ffmpeg_filter_graph(
         self,
         expr: str,
@@ -531,15 +566,7 @@ class ShellExecutor:
             if not token:
                 continue
 
-            # Split filter options on ':' (preserving Windows drive prefixes only for workspace validation)
-            colon_parts = [p for p in re.split(r"(?<!^[A-Za-z]):(?![/\\])", token) if p]
-            # Fallback simple split on ':' for multi-option chains like text=Hello:fontsize=24:textfile=/etc/passwd
-            sub_tokens: list[str] = []
-            for part in colon_parts:
-                if ":" in part and not _WINDOWS_DRIVE_ABS_RE.match(part.split("=")[-1].strip().strip("'\"")):
-                    sub_tokens.extend(p for p in part.split(":") if p)
-                else:
-                    sub_tokens.append(part)
+            sub_tokens = self._split_filter_colons(token)
 
             for sub in sub_tokens:
                 eq_parts = [p.strip().strip("'\"") for p in sub.split("=")]
@@ -745,9 +772,17 @@ class ShellExecutor:
         raise self._policy_error(f"Unhandled option kind {kind!r}")
 
     def _ffmpeg_flag_expect_kind(self, flag_l: str) -> Optional[str]:
-        if flag_l in _FFMPEG_PATH_FLAGS or flag_l.startswith("--filter_script"):
+        if (
+            flag_l in _FFMPEG_PATH_FLAGS
+            or (flag_l.startswith("--filter") and "script" in flag_l)
+            or _FFMPEG_FILTER_SCRIPT_COLON_RE.match(flag_l)
+        ):
             return "path"
-        if flag_l in _FFMPEG_FILTER_FLAGS or flag_l.startswith("--filter"):
+        if (
+            flag_l in _FFMPEG_FILTER_FLAGS
+            or flag_l.startswith("--filter")
+            or _FFMPEG_FILTER_COLON_RE.match(flag_l)
+        ):
             return "filter"
         if flag_l in _FFMPEG_TIMESTAMP_FLAGS:
             return "timestamp"

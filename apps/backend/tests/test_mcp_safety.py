@@ -1407,3 +1407,87 @@ async def test_minor_round2_nan_inf_timeout_gateway_none_dims_and_fill_route(
         )
         assert out["status"] == "OK"
         assert (task_dir / "card.png").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("executable", "args"),
+    [
+        ("ffmpeg", ["-i", "in.mp4", "-filter:v:0", "movie=/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-filter:v:0=movie=/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-filter_script:v:0", "../../outside.txt", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "--filter-script", "../../outside.txt", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "movie=D:outside.mp4", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "drawtext=textfile=D:outside.txt", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "drawtext=textfile=D:\\outside.txt", "out.mp4"]),
+    ],
+)
+async def test_round3_ffmpeg_colon_filter_script_and_drive_letter_bypasses(
+    tmp_path: Path, executable: str, args: list[str]
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-r3"
+    task_dir.mkdir()
+    (task_dir / "in.mp4").write_bytes(b"mp4")
+
+    executor = ShellExecutor(workspace_root=ws_root, dns_resolver=_public_dns)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run(executable, args, task_workspace=task_dir)
+
+
+@pytest.mark.asyncio
+async def test_round3_ffmpeg_filter_script_colon_blocks_symlink_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-r3-sym"
+    task_dir.mkdir()
+    (task_dir / "in.mp4").write_bytes(b"mp4")
+    (task_dir / "rel_symlink").write_text("drawtext=text=hi", encoding="utf-8")
+    outside = tmp_path / "outside_filter.txt"
+    outside.write_text("movie=/etc/passwd", encoding="utf-8")
+
+    orig_resolve = Path.resolve
+
+    def fake_resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "rel_symlink":
+            return outside
+        return orig_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    executor = ShellExecutor(workspace_root=ws_root, dns_resolver=_public_dns)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run(
+            "ffmpeg",
+            ["-i", "in.mp4", "-filter_script:v:0", "rel_symlink", "out.mp4"],
+            task_workspace=task_dir,
+        )
+
+
+@pytest.mark.asyncio
+async def test_round3_browser_fill_triggers_blocked_route_policy_error(tmp_path: Path):
+    class RouteTriggerFillPage(FakePage):
+        async def fill(self, selector: str, value: str, **kwargs: Any) -> None:
+            await super().fill(selector, value, **kwargs)
+            if self._context is not None and self._context.route_handlers:
+                route = FakeRoute("http://169.254.169.254/leak")
+                for handler in self._context.route_handlers:
+                    await handler(route)
+                if route.aborted:
+                    raise RuntimeError("net::ERR_ABORTED")
+
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-fill"
+    task_dir.mkdir()
+
+    fake_browser = FakeBrowser(RouteTriggerFillPage())
+    async with BrowserController(
+        workspace_root=ws_root, browser=fake_browser, dns_resolver=_public_dns
+    ) as ctrl:
+        await ctrl.navigate("https://example.com", task_workspace=task_dir)
+        with pytest.raises(BrowserPolicyError, match="169.254.169.254"):
+            await ctrl.fill("#input", "hello", task_workspace=task_dir)
