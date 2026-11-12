@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -7,23 +9,42 @@ from app.api.artifacts import router as artifacts_router
 from app.api.tasks import router as tasks_router
 from app.config import AppSettings, get_settings
 from app.db.session import init_db, seed_defaults
+from app.orchestrator.graph import recover_interrupted_tasks
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
     """Create and configure FastAPI application instance with security middleware."""
     resolved_settings = settings or get_settings()
 
+    # Initialize SQLite database and seed defaults synchronously so non-lifespan
+    # callers (e.g. TestClient without context manager) remain fully operational.
+    factory = init_db(resolved_settings.resolved_db_path)
+    with factory() as db_session:
+        seed_defaults(db_session)
+
+    @asynccontextmanager
+    async def lifespan(app_instance: FastAPI):
+        # Crash recovery on startup: move orphaned RUNNING tasks to PAUSED
+        with factory() as startup_session:
+            recovered_count = recover_interrupted_tasks(startup_session)
+        app_instance.state.recovered_tasks_count = recovered_count
+        app_instance.state.checkpoint_db_path = (
+            resolved_settings.workspace_dir / "checkpoints.db"
+        ).resolve()
+        yield
+        # Dispose SQLAlchemy engine connections cleanly on shutdown
+        engine = factory.kw.get("bind")
+        if engine is not None:
+            engine.dispose()
+
     app = FastAPI(
         title="AI Agent Workspace Backend",
         version="0.1.0",
         description="FastAPI sidecar daemon for AI Agent Workspace (Văn Phòng AI)",
+        lifespan=lifespan,
     )
     app.state.settings = resolved_settings
-
-    # Initialize SQLite database and seed defaults for the active settings
-    factory = init_db(resolved_settings.resolved_db_path)
-    with factory() as db_session:
-        seed_defaults(db_session)
+    app.state.recovered_tasks_count = 0
 
     # Mount API routers
     app.include_router(tasks_router)
