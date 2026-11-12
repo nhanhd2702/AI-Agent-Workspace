@@ -142,6 +142,29 @@ def validate_safe_http_url(
     if scheme not in {"http", "https"}:
         raise error_cls(f"Unsupported or unsafe URL scheme: {scheme!r}")
 
+    if "://" not in stripped:
+        raise error_cls("HTTP(S) URL must contain '://'")
+    after_scheme = stripped.split("://", 1)[1]
+    raw_authority = re.split(r"[/?#]", after_scheme, maxsplit=1)[0]
+    if "\\" in raw_authority or "\\" in parsed.netloc:
+        raise error_cls(
+            mask_policy_text(
+                f"SSRF protection blocked backslash in URL authority: {stripped!r}",
+                extra_secrets,
+            )
+        )
+    if (
+        "@" in raw_authority
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise error_cls(
+            mask_policy_text(
+                f"SSRF protection blocked userinfo '@' in URL authority: {stripped!r}",
+                extra_secrets,
+            )
+        )
+
     hostname = parsed.hostname
     if not hostname:
         raise error_cls(

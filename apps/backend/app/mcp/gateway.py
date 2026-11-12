@@ -196,11 +196,17 @@ class McpGateway:
         if name == "browser.render_html_to_png":
             html = self._require_param(args, "html", name)
             output_path = self._require_param(args, "output_path", name)
+            raw_w = args.get("width")
+            raw_h = args.get("height")
+            if isinstance(raw_w, bool) or isinstance(raw_h, bool):
+                raise ValueError("width and height must be integers")
+            width = 1280 if raw_w is None else int(raw_w)
+            height = 720 if raw_h is None else int(raw_h)
             result = await self.browser.render_html_to_png(
                 html=html,
                 output_path=output_path,
-                width=int(args.get("width", 1280)),
-                height=int(args.get("height", 720)),
+                width=width,
+                height=height,
                 full_page=bool(args.get("full_page", False)),
                 task_workspace=ws,
             )

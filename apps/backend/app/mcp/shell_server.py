@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
@@ -198,15 +199,14 @@ _FFMPEG_PATH_FLAGS: frozenset[str] = frozenset(
 _FFMPEG_FILTER_FLAGS: frozenset[str] = frozenset(
     {"-vf", "-af", "-filter_complex", "-lavfi", "-filter", "-filter:v", "-filter:a"}
 )
-_FFMPEG_SAFE_FLAGS: frozenset[str] = frozenset(
+_FFMPEG_TIMESTAMP_FLAGS: frozenset[str] = frozenset(
+    {"-ss", "-to", "-t", "-itsoffset"}
+)
+_FFMPEG_STREAM_SPEC_FLAGS: frozenset[str] = frozenset(
+    {"-map", "-select_streams"}
+)
+_FFMPEG_SCALAR_VALUE_FLAGS: frozenset[str] = frozenset(
     {
-        *_FFMPEG_PATH_FLAGS,
-        *_FFMPEG_FILTER_FLAGS,
-        "-vn",
-        "-an",
-        "-sn",
-        "-dn",
-        "-map",
         "-crf",
         "-preset",
         "-tune",
@@ -214,21 +214,7 @@ _FFMPEG_SAFE_FLAGS: frozenset[str] = frozenset(
         "-movflags",
         "-threads",
         "-loglevel",
-        "-hide_banner",
-        "-version",
-        "--version",
-        "-formats",
-        "-codecs",
-        "-filters",
-        "-shortest",
-        "-re",
-        "-loop",
         "-stream_loop",
-        "-ss",
-        "-to",
-        "-itsoffset",
-        "-copyts",
-        "-avoid_negative_ts",
         "-fflags",
         "-flags",
         "-strict",
@@ -243,15 +229,49 @@ _FFMPEG_SAFE_FLAGS: frozenset[str] = frozenset(
         "-sc_threshold",
         "-rc_override",
         "-metadata",
-        "-show_format",
-        "-show_streams",
         "-show_entries",
-        "-select_streams",
         "-print_format",
         "-of",
         "-v",
         "-f",
-        "-t",
+        "-aspect",
+        "-s",
+        "-r",
+        "-b:v",
+        "-b:a",
+        "-c:v",
+        "-c:a",
+        "-codec:v",
+        "-codec:a",
+        "-profile:v",
+        "-level:v",
+        "-avoid_negative_ts",
+        "-read_intervals",
+    }
+)
+_FFMPEG_SAFE_FLAGS: frozenset[str] = frozenset(
+    {
+        *_FFMPEG_PATH_FLAGS,
+        *_FFMPEG_FILTER_FLAGS,
+        *_FFMPEG_TIMESTAMP_FLAGS,
+        *_FFMPEG_STREAM_SPEC_FLAGS,
+        *_FFMPEG_SCALAR_VALUE_FLAGS,
+        "-vn",
+        "-an",
+        "-sn",
+        "-dn",
+        "-hide_banner",
+        "-version",
+        "--version",
+        "-formats",
+        "-codecs",
+        "-filters",
+        "-shortest",
+        "-re",
+        "-loop",
+        "-copyts",
+        "-show_format",
+        "-show_streams",
         "-y",
         "-n",
         "-q",
@@ -262,11 +282,16 @@ _FFMPEG_SAFE_FLAGS: frozenset[str] = frozenset(
         "-show_frames",
         "-count_frames",
         "-count_packets",
-        "-read_intervals",
     }
 )
 _FFMPEG_COLON_FLAG_RE = re.compile(
     r"^-(c|b|r|s|codec|profile|level|filter|filter_script|metadata)(:[A-Za-z0-9_]+)+$"
+)
+_FFMPEG_TIMESTAMP_RE = re.compile(r"^\d+(:\d{1,2}){0,2}(\.\d+)?$")
+_FFMPEG_STREAM_SPEC_RE = re.compile(r"^-?\[?[A-Za-z0-9_]+(:[A-Za-z0-9_]+)*\??\]?$")
+_DANGEROUS_PROTO_RE = re.compile(
+    r"(?:^|[\s,=;:'\"])(file|concat|subfile|pipe|tcp|udp|http|https|data|rtmp|rtsp|rtp|ftp|ftps|sftp|smb|crypto|cache|async|fd|mmsh|mmst|hls|tee|icecast|gopher|exec)\s*:",
+    re.IGNORECASE,
 )
 _FFMPEG_FILE_FILTER_KEYS: frozenset[str] = frozenset(
     {
@@ -303,8 +328,9 @@ class ShellExecutor:
         allow_private_network: bool = False,
         dns_resolver: Optional[Callable[[str], Iterable[str]]] = None,
     ) -> None:
-        if default_timeout_s <= 0:
-            raise ValueError("default_timeout_s must be > 0")
+        timeout_val = float(default_timeout_s)
+        if not math.isfinite(timeout_val) or timeout_val <= 0:
+            raise ValueError("default_timeout_s must be a finite number > 0")
         if max_output_bytes <= 0:
             raise ValueError("max_output_bytes must be > 0")
 
@@ -466,6 +492,24 @@ class ShellExecutor:
                 f"Path argument {value!r} resolves to '{resolved}' outside task_workspace '{task_workspace_resolved}'"
             )
 
+    def _validate_scalar_value(self, value: str, *, flag_name: str = "") -> None:
+        if not value:
+            raise self._policy_error(f"Empty scalar value forbidden for {flag_name or 'option'}")
+        if (
+            ".." in value
+            or "\\" in value
+            or value.startswith(("/", "~"))
+            or "//" in value
+            or _WINDOWS_DRIVE_ABS_RE.match(value)
+        ):
+            raise self._policy_error(
+                f"Path-like or traversal token forbidden in scalar value {value!r}"
+            )
+        if _DANGEROUS_PROTO_RE.search(value):
+            raise self._policy_error(
+                f"Protocol specifier forbidden in scalar value {value!r}"
+            )
+
     def _validate_ffmpeg_filter_graph(
         self,
         expr: str,
@@ -473,43 +517,50 @@ class ShellExecutor:
     ) -> None:
         if not expr:
             raise self._policy_error("Empty ffmpeg filter expression is forbidden")
+        if _DANGEROUS_PROTO_RE.search(expr):
+            raise self._policy_error(
+                f"Protocol specifier forbidden in ffmpeg filter graph: {expr!r}"
+            )
+        if "\\\\" in expr or "~/" in expr or "~\\" in expr:
+            raise self._policy_error(
+                f"Unsafe path prefix forbidden in ffmpeg filter graph: {expr!r}"
+            )
 
         for item in re.split(r"[,;]", expr):
             token = item.strip()
             if not token:
                 continue
 
-            # Reject colons in filter expressions (avio/options) unless valid Windows drive path inside workspace
-            if ":" in token:
-                parts_eq = token.split("=")
-                last_val = parts_eq[-1].strip().strip("'\"")
-                if not (
-                    sys.platform == "win32" and _WINDOWS_DRIVE_ABS_RE.match(last_val)
-                ):
-                    raise self._policy_error(
-                        f"Colon specifier forbidden in ffmpeg filter graph: {expr!r}"
-                    )
+            # Split filter options on ':' (preserving Windows drive prefixes only for workspace validation)
+            colon_parts = [p for p in re.split(r"(?<!^[A-Za-z]):(?![/\\])", token) if p]
+            # Fallback simple split on ':' for multi-option chains like text=Hello:fontsize=24:textfile=/etc/passwd
+            sub_tokens: list[str] = []
+            for part in colon_parts:
+                if ":" in part and not _WINDOWS_DRIVE_ABS_RE.match(part.split("=")[-1].strip().strip("'\"")):
+                    sub_tokens.extend(p for p in part.split(":") if p)
+                else:
+                    sub_tokens.append(part)
 
-            # Handle nested `filter=key=val` chains (e.g., drawtext=textfile=/etc/passwd)
-            eq_parts = [p.strip().strip("'\"") for p in token.split("=")]
-            for idx, part in enumerate(eq_parts):
-                prev_key = eq_parts[idx - 1].lower() if idx > 0 else ""
-                is_file_key = prev_key in _FFMPEG_FILE_FILTER_KEYS
-                if (
-                    is_file_key
-                    or "/" in part
-                    or "\\" in part
-                    or ".." in part
-                    or part.startswith("~")
-                    or _WINDOWS_DRIVE_ABS_RE.match(part)
-                    or _WINDOWS_DRIVE_REL_RE.match(part)
-                ):
-                    self._validate_path_value(
-                        part,
-                        task_workspace_resolved,
-                        is_flag_context=is_file_key,
-                        allow_http_url=False,
-                    )
+            for sub in sub_tokens:
+                eq_parts = [p.strip().strip("'\"") for p in sub.split("=")]
+                for idx, part in enumerate(eq_parts):
+                    prev_key = eq_parts[idx - 1].lower() if idx > 0 else ""
+                    is_file_key = prev_key in _FFMPEG_FILE_FILTER_KEYS
+                    if (
+                        is_file_key
+                        or "/" in part
+                        or "\\" in part
+                        or ".." in part
+                        or part.startswith("~")
+                        or _WINDOWS_DRIVE_ABS_RE.match(part)
+                        or _WINDOWS_DRIVE_REL_RE.match(part)
+                    ):
+                        self._validate_path_value(
+                            part,
+                            task_workspace_resolved,
+                            is_flag_context=is_file_key,
+                            allow_http_url=False,
+                        )
 
     def _validate_python_args(
         self, args: Sequence[str], task_workspace_resolved: Path
@@ -527,12 +578,13 @@ class ShellExecutor:
                     f"Flag {arg!r} is not permitted for 'python'"
                 )
             seen_script = True
-            if "=" in arg:
+            if arg.startswith("-") and "=" in arg:
                 _, val = arg.split("=", 1)
                 self._validate_path_value(
                     val, task_workspace_resolved, allow_http_url=False
                 )
-            else:
+            elif not arg.startswith("-"):
+                # Positional argument (script path or script arg): NEVER split on '='
                 self._validate_path_value(
                     arg, task_workspace_resolved, allow_http_url=False
                 )
@@ -553,12 +605,13 @@ class ShellExecutor:
                     continue
                 raise self._policy_error(f"Flag {arg!r} is not permitted for 'node'")
             seen_script = True
-            if "=" in arg:
+            if arg.startswith("-") and "=" in arg:
                 _, val = arg.split("=", 1)
                 self._validate_path_value(
                     val, task_workspace_resolved, allow_http_url=False
                 )
-            else:
+            elif not arg.startswith("-"):
+                # Positional argument (script path or script arg): NEVER split on '='
                 self._validate_path_value(
                     arg, task_workspace_resolved, allow_http_url=False
                 )
@@ -590,9 +643,7 @@ class ShellExecutor:
             if expect_scalar:
                 if arg.startswith("-"):
                     raise self._policy_error(f"Expected scalar value, got flag {arg!r}")
-                self._validate_path_value(
-                    arg, task_workspace_resolved, allow_http_url=False
-                )
+                self._validate_scalar_value(arg, flag_name="yt-dlp")
                 expect_scalar = False
                 validated.append(arg)
                 continue
@@ -614,9 +665,7 @@ class ShellExecutor:
                         validated.append(arg)
                         continue
                     if flag_part in _YTDLP_SCALAR_FLAGS:
-                        self._validate_path_value(
-                            val_part, task_workspace_resolved, allow_http_url=False
-                        )
+                        self._validate_scalar_value(val_part, flag_name=flag_part)
                         validated.append(arg)
                         continue
                     raise self._policy_error(
@@ -651,9 +700,7 @@ class ShellExecutor:
                         validated.append(arg)
                         continue
                     if prefix in _YTDLP_SCALAR_FLAGS:
-                        self._validate_path_value(
-                            suffix, task_workspace_resolved, allow_http_url=False
-                        )
+                        self._validate_scalar_value(suffix, flag_name=prefix)
                         validated.append(arg)
                         continue
 
@@ -666,28 +713,64 @@ class ShellExecutor:
             raise self._policy_error(f"Flag {validated[-1]!r} requires a value")
         return validated
 
+    def _validate_ffmpeg_option_value(
+        self, kind: str, val: str, task_workspace_resolved: Path, flag_name: str
+    ) -> None:
+        if kind == "path":
+            self._validate_path_value(
+                val,
+                task_workspace_resolved,
+                is_flag_context=True,
+                allow_http_url=True,
+            )
+            return
+        if kind == "filter":
+            self._validate_ffmpeg_filter_graph(val, task_workspace_resolved)
+            return
+        if kind == "timestamp":
+            if not _FFMPEG_TIMESTAMP_RE.fullmatch(val):
+                raise self._policy_error(
+                    f"Invalid timestamp {val!r} for flag {flag_name!r}"
+                )
+            return
+        if kind == "stream_spec":
+            if _DANGEROUS_PROTO_RE.search(val) or not _FFMPEG_STREAM_SPEC_RE.fullmatch(val):
+                raise self._policy_error(
+                    f"Invalid stream specifier {val!r} for flag {flag_name!r}"
+                )
+            return
+        if kind == "scalar":
+            self._validate_scalar_value(val, flag_name=flag_name)
+            return
+        raise self._policy_error(f"Unhandled option kind {kind!r}")
+
+    def _ffmpeg_flag_expect_kind(self, flag_l: str) -> Optional[str]:
+        if flag_l in _FFMPEG_PATH_FLAGS or flag_l.startswith("--filter_script"):
+            return "path"
+        if flag_l in _FFMPEG_FILTER_FLAGS or flag_l.startswith("--filter"):
+            return "filter"
+        if flag_l in _FFMPEG_TIMESTAMP_FLAGS:
+            return "timestamp"
+        if flag_l in _FFMPEG_STREAM_SPEC_FLAGS:
+            return "stream_spec"
+        if flag_l in _FFMPEG_SCALAR_VALUE_FLAGS or _FFMPEG_COLON_FLAG_RE.match(flag_l):
+            return "scalar"
+        return None
+
     def _validate_ffmpeg_args(
         self, executable: str, args: Sequence[str], task_workspace_resolved: Path
     ) -> list[str]:
         validated: list[str] = []
-        expect_path = False
-        expect_filter = False
+        expect_kind: Optional[str] = None
+        expect_flag: str = ""
 
         for arg in args:
-            if expect_path:
-                self._validate_path_value(
-                    arg,
-                    task_workspace_resolved,
-                    is_flag_context=True,
-                    allow_http_url=True,
+            if expect_kind is not None:
+                self._validate_ffmpeg_option_value(
+                    expect_kind, arg, task_workspace_resolved, expect_flag
                 )
-                expect_path = False
-                validated.append(arg)
-                continue
-
-            if expect_filter:
-                self._validate_ffmpeg_filter_graph(arg, task_workspace_resolved)
-                expect_filter = False
+                expect_kind = None
+                expect_flag = ""
                 validated.append(arg)
                 continue
 
@@ -698,27 +781,15 @@ class ShellExecutor:
                 if "=" in arg:
                     flag_part, val_part = arg.split("=", 1)
                     flag_l = flag_part.lower()
-                    if flag_l in _FFMPEG_PATH_FLAGS:
-                        self._validate_path_value(
-                            val_part,
-                            task_workspace_resolved,
-                            is_flag_context=True,
-                            allow_http_url=True,
+                    kind = self._ffmpeg_flag_expect_kind(flag_l)
+                    if kind is not None:
+                        self._validate_ffmpeg_option_value(
+                            kind, val_part, task_workspace_resolved, flag_part
                         )
                         validated.append(arg)
                         continue
-                    if flag_l in _FFMPEG_FILTER_FLAGS:
-                        self._validate_ffmpeg_filter_graph(
-                            val_part, task_workspace_resolved
-                        )
-                        validated.append(arg)
-                        continue
-                    if flag_l in _FFMPEG_SAFE_FLAGS or _FFMPEG_COLON_FLAG_RE.match(
-                        flag_part
-                    ):
-                        self._validate_path_value(
-                            val_part, task_workspace_resolved, allow_http_url=False
-                        )
+                    if flag_l in _FFMPEG_SAFE_FLAGS:
+                        self._validate_scalar_value(val_part, flag_name=flag_part)
                         validated.append(arg)
                         continue
                     raise self._policy_error(
@@ -726,15 +797,13 @@ class ShellExecutor:
                     )
 
                 arg_l = arg.lower()
-                if arg_l in _FFMPEG_PATH_FLAGS:
-                    expect_path = True
+                kind = self._ffmpeg_flag_expect_kind(arg_l)
+                if kind is not None:
+                    expect_kind = kind
+                    expect_flag = arg
                     validated.append(arg)
                     continue
-                if arg_l in _FFMPEG_FILTER_FLAGS:
-                    expect_filter = True
-                    validated.append(arg)
-                    continue
-                if arg_l in _FFMPEG_SAFE_FLAGS or _FFMPEG_COLON_FLAG_RE.match(arg):
+                if arg_l in _FFMPEG_SAFE_FLAGS:
                     validated.append(arg)
                     continue
 
@@ -742,16 +811,11 @@ class ShellExecutor:
                     f"Flag {arg!r} is not permitted for '{executable}'"
                 )
 
-            # Positional argument or scalar option value
-            if "=" in arg and not arg.lower().startswith(("http://", "https://")):
-                self._validate_ffmpeg_filter_graph(arg, task_workspace_resolved)
-            else:
-                self._validate_path_value(
-                    arg, task_workspace_resolved, allow_http_url=True
-                )
+            # Positional argument: NEVER parse as filter graph; ALWAYS validate as workspace path or SSRF-safe URL
+            self._validate_path_value(arg, task_workspace_resolved, allow_http_url=True)
             validated.append(arg)
 
-        if expect_path or expect_filter:
+        if expect_kind is not None:
             raise self._policy_error(f"Flag {validated[-1]!r} requires an argument")
         return validated
 
@@ -942,8 +1006,8 @@ class ShellExecutor:
         effective_timeout = (
             float(timeout_s) if timeout_s is not None else self.default_timeout_s
         )
-        if effective_timeout <= 0:
-            raise ValueError("timeout_s must be > 0")
+        if not math.isfinite(effective_timeout) or effective_timeout <= 0:
+            raise ValueError("timeout_s must be a finite number > 0")
 
         binary = self._resolve_binary(norm_exec)
         env = self._build_sanitized_env(ws_resolved)

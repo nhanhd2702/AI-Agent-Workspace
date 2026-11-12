@@ -555,13 +555,23 @@ class BrowserController:
         task_workspace: Optional[Path] = None,
     ) -> BrowserActionResult:
         t0 = time.perf_counter()
-        self._validate_task_workspace(task_workspace, required=False)
+        ws = self._validate_task_workspace(task_workspace, required=False)
+        self._active_task_workspace = ws
+        self._blocked_request_error = None
         page = await self._ensure_page()
         gate_before = await self._check_gate_result(page, "fill", t0)
         if gate_before is not None:
             return gate_before
 
-        await page.fill(selector, value, timeout=self.action_timeout_ms)
+        try:
+            await page.fill(selector, value, timeout=self.action_timeout_ms)
+        except Exception as exc:
+            if self._blocked_request_error:
+                raise self._policy_error(self._blocked_request_error) from exc
+            raise
+
+        if self._blocked_request_error:
+            raise self._policy_error(self._blocked_request_error)
 
         gate_after = await self._check_gate_result(page, "fill", t0)
         if gate_after is not None:

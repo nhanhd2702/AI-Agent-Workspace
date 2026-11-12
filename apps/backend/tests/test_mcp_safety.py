@@ -1198,3 +1198,212 @@ async def test_shell_executor_fails_closed_when_binary_missing_and_cleans_up_on_
                 break
         await asyncio.sleep(0.05)
     assert alive is False
+
+
+
+# ============================================================================
+# Fix Round 2 Regression Tests (Exploit PoCs + Legitimate Media Commands)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("executable", "args"),
+    [
+        # Critical 1: Positional '=' traversal / symlink escape
+        ("python", ["../../outside/evil=1.py"]),
+        ("python", ["script.py", "../../outside/secret=1.txt"]),
+        ("node", ["../../outside/evil=1.js"]),
+        ("node", ["app.js", "../../outside/secret=1.txt"]),
+        ("ffmpeg", ["-i", "../../outside/evil=1.mp4", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "../../outside/evil=1.mp4"]),
+        ("ffmpeg", ["-i", "v:0", "../../outside.mp4"]),
+        ("ffmpeg", ["v:0", "out.mp4"]),
+        ("yt-dlp", ["-f", "../../etc/passwd", "https://example.com/v"]),
+        ("yt-dlp", ["-S", "file:/etc/passwd", "https://example.com/v"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "drawtext=text=hi:textfile=/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "movie=file:/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "movie=http://169.254.169.254/x", "out.mp4"]),
+    ],
+)
+async def test_shell_executor_blocks_positional_equals_and_colon_bypasses(
+    tmp_path: Path, executable: str, args: list[str]
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-r2"
+    task_dir.mkdir()
+    (task_dir / "script.py").write_text("print(1)", encoding="utf-8")
+    (task_dir / "app.js").write_text("console.log(1)", encoding="utf-8")
+
+    executor = ShellExecutor(workspace_root=ws_root, dns_resolver=_public_dns)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run(executable, args, task_workspace=task_dir)
+
+
+@pytest.mark.asyncio
+async def test_shell_executor_blocks_positional_equals_symlink_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-sym-eq"
+    task_dir.mkdir()
+    outside_file = tmp_path / "outside_secret.mp4"
+    outside_file.write_text("secret", encoding="utf-8")
+
+    sym_target = task_dir / "symlink_with_equals=1.mp4"
+    sym_target.write_text("placeholder", encoding="utf-8")
+    real_resolve = Path.resolve
+
+    def fake_resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "symlink_with_equals=1.mp4":
+            return real_resolve(outside_file, strict=strict)
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    executor = ShellExecutor(workspace_root=ws_root)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run(
+            "ffmpeg",
+            ["-i", "in.mp4", "symlink_with_equals=1.mp4"],
+            task_workspace=task_dir,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("executable", "args"),
+    [
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "scale=1280:720", "out.mp4"]),
+        (
+            "ffmpeg",
+            ["-i", "in.mp4", "-vf", "drawtext=text=Hello:fontsize=24:x=10:y=10", "out.mp4"],
+        ),
+        ("ffmpeg", ["-i", "in.mp4", "-ss", "00:01:30", "-t", "00:00:10", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-map", "0:v:0", "-map", "0:a:0", "out.mp4"]),
+        (
+            "ffprobe",
+            [
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                "in.mp4",
+            ],
+        ),
+        ("yt-dlp", ["-S", "res:1080", "https://example.com/v"]),
+        ("yt-dlp", ["-f", "bestvideo+bestaudio/best", "https://example.com/v"]),
+    ],
+)
+async def test_shell_executor_allows_legitimate_media_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    executable: str,
+    args: list[str],
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-media"
+    task_dir.mkdir()
+
+    class DummyStream:
+        async def read(self, _n: int = -1) -> bytes:
+            return b""
+
+    class DummyProc:
+        pid = 99999
+        returncode = 0
+        stdout = DummyStream()
+        stderr = DummyStream()
+
+        async def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    async def fake_exec(*_args: Any, **_kwargs: Any) -> DummyProc:
+        return DummyProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    executor = ShellExecutor(workspace_root=ws_root, dns_resolver=_public_dns)
+    res = await executor.run(executable, args, task_workspace=task_dir)
+    assert res.returncode == 0
+    assert res.executable == executable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_auth_url",
+    [
+        "http://169.254.169.254\\@example.com/",
+        "http://127.0.0.1\\@example.com/",
+        "https://user:pass@example.com/",
+        "http://evil@127.0.0.1/",
+    ],
+)
+async def test_ssrf_blocks_backslash_and_userinfo_authority_differentials(
+    tmp_path: Path, bad_auth_url: str
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-auth"
+    task_dir.mkdir()
+
+    async with BrowserController(
+        workspace_root=ws_root, browser=FakeBrowser(), dns_resolver=_public_dns
+    ) as ctrl:
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.navigate(bad_auth_url, task_workspace=task_dir)
+
+    executor = ShellExecutor(workspace_root=ws_root, dns_resolver=_public_dns)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run("yt-dlp", [bad_auth_url], task_workspace=task_dir)
+
+
+@pytest.mark.asyncio
+async def test_minor_round2_nan_inf_timeout_gateway_none_dims_and_fill_route(
+    tmp_path: Path,
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-m2"
+    task_dir.mkdir()
+    script = task_dir / "ok.py"
+    script.write_text("print('ok')", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        ShellExecutor(workspace_root=ws_root, default_timeout_s=float("nan"))
+
+    executor = ShellExecutor(workspace_root=ws_root)
+    with pytest.raises(ValueError):
+        await executor.run("python", ["ok.py"], task_workspace=task_dir, timeout_s=float("inf"))
+    with pytest.raises(ValueError):
+        await executor.run("python", ["ok.py"], task_workspace=task_dir, timeout_s=float("nan"))
+
+    settings = AppSettings(workspace_dir=ws_root)
+    fake_browser = FakeBrowser(FakePage())
+    async with McpGateway(
+        settings=settings,
+        browser_controller=BrowserController(
+            workspace_root=ws_root, browser=fake_browser, dns_resolver=_public_dns
+        ),
+    ) as gateway:
+        out = await gateway.call_tool(
+            "browser.render_html_to_png",
+            {
+                "html": "<h1>Default dims</h1>",
+                "output_path": "card.png",
+                "width": None,
+                "height": None,
+            },
+            task_workspace=task_dir,
+        )
+        assert out["status"] == "OK"
+        assert (task_dir / "card.png").exists()
