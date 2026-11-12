@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api.agents import agents_router, departments_router
 from app.api.artifacts import router as artifacts_router
 from app.api.monitoring import router as monitoring_router
+from app.api.projects import router as projects_router
 from app.api.reviews import router as reviews_router
 from app.api.tasks import router as tasks_router
 from app.api.ws import TaskWebSocketManager, router as ws_router
@@ -58,6 +59,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.recovered_tasks_count = 0
 
     # Mount API & WebSocket routers
+    app.include_router(projects_router)
     app.include_router(tasks_router)
     app.include_router(agents_router)
     app.include_router(departments_router)

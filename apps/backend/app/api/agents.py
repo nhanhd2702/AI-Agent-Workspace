@@ -159,7 +159,7 @@ def _serialize_agent(agent: Agent, db: Session) -> dict[str, Any]:
 
 
 def _serialize_department(dept: Department, db: Session) -> dict[str, Any]:
-    agent_count = db.query(Agent).filter_by(department_id=dept.id).count()
+    dept_agents = db.query(Agent).filter_by(department_id=dept.id).all()
     return {
         "id": dept.id,
         "name": dept.name,
@@ -167,7 +167,8 @@ def _serialize_department(dept: Department, db: Session) -> dict[str, Any]:
         "icon": dept.icon,
         "color": dept.color,
         "status": dept.status,
-        "agents_count": agent_count,
+        "agents_count": len(dept_agents),
+        "agents": [_serialize_agent(agent, db) for agent in dept_agents],
         "created_at": dept.created_at.isoformat() if dept.created_at else None,
         "updated_at": dept.updated_at.isoformat() if dept.updated_at else None,
     }

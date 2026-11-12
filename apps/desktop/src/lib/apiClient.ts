@@ -2,11 +2,15 @@ import {
   Agent,
   ApiError,
   ApiResponse,
+  BoardTask,
+  Department,
   ExecutionMode,
   ParsedTask,
+  Project,
   ReviewDecidePayload,
   ReviewDecision,
   ReviewGate,
+  TaskLogEntry,
 } from "./types";
 
 export interface ApiClientConfig {
@@ -126,6 +130,211 @@ export class ApiClient {
   }
 
   /**
+   * Create a new agent in the workspace.
+   */
+  async createAgent(payload: {
+    name: string;
+    displayName: string;
+    role: string;
+    departmentId?: string | null;
+    description?: string;
+    defaultModel?: string;
+  }): Promise<Agent> {
+    const raw = await this.request<any>("/api/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        name: payload.name,
+        displayName: payload.displayName,
+        role: payload.role,
+        departmentId: payload.departmentId ?? null,
+        description: payload.description,
+        defaultModel: payload.defaultModel || "gemini-2.5-flash",
+      }),
+    });
+    return this.normalizeAgent(raw);
+  }
+
+  /**
+   * Update an existing agent (e.g. assign or move department).
+   */
+  async updateAgent(
+    agentId: string,
+    payload: {
+      displayName?: string;
+      role?: string;
+      description?: string;
+      departmentId?: string | null;
+      status?: string;
+      defaultModel?: string;
+    }
+  ): Promise<Agent> {
+    const raw = await this.request<any>(
+      `/api/v1/agents/${encodeURIComponent(agentId)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          ...(payload.displayName !== undefined
+            ? { displayName: payload.displayName }
+            : {}),
+          ...(payload.role !== undefined ? { role: payload.role } : {}),
+          ...(payload.description !== undefined
+            ? { description: payload.description }
+            : {}),
+          ...(payload.departmentId !== undefined
+            ? { departmentId: payload.departmentId ?? "" }
+            : {}),
+          ...(payload.status !== undefined ? { status: payload.status } : {}),
+          ...(payload.defaultModel !== undefined
+            ? { defaultModel: payload.defaultModel }
+            : {}),
+        }),
+      }
+    );
+    return this.normalizeAgent(raw);
+  }
+
+  /**
+   * List all functional departments along with assigned agents and skill counts.
+   */
+  async listDepartments(): Promise<Department[]> {
+    const rawDepartments = await this.request<any[]>("/api/v1/departments");
+    return (rawDepartments || []).map((raw) => ({
+      id: raw.id,
+      name: raw.name,
+      description: raw.description ?? null,
+      icon: raw.icon ?? null,
+      color: raw.color ?? null,
+      status: raw.status || "active",
+      agentsCount: raw.agentsCount ?? raw.agents_count ?? raw.agents?.length ?? 0,
+      agents_count: raw.agents_count ?? raw.agentsCount ?? raw.agents?.length ?? 0,
+      agents: Array.isArray(raw.agents)
+        ? raw.agents.map((a: any) => this.normalizeAgent(a))
+        : undefined,
+      createdAt: raw.createdAt ?? raw.created_at ?? null,
+      created_at: raw.created_at ?? raw.createdAt ?? null,
+      updatedAt: raw.updatedAt ?? raw.updated_at ?? null,
+      updated_at: raw.updated_at ?? raw.updatedAt ?? null,
+    }));
+  }
+
+  /**
+   * List workspace projects with task counts and status summaries.
+   */
+  async listProjects(): Promise<Project[]> {
+    const rawProjects = await this.request<any[]>("/api/v1/projects");
+    return (rawProjects || []).map((raw) => ({
+      id: raw.id,
+      name: raw.name,
+      description: raw.description ?? null,
+      tags: raw.tags || [],
+      defaultDepartmentId:
+        raw.defaultDepartmentId ?? raw.default_department_id ?? null,
+      default_department_id:
+        raw.default_department_id ?? raw.defaultDepartmentId ?? null,
+      taskCount: raw.taskCount ?? raw.task_count ?? 0,
+      task_count: raw.task_count ?? raw.taskCount ?? 0,
+      statusSummary: raw.statusSummary ?? raw.status_summary ?? {},
+      status_summary: raw.status_summary ?? raw.statusSummary ?? {},
+      createdAt: raw.createdAt ?? raw.created_at ?? null,
+      created_at: raw.created_at ?? raw.createdAt ?? null,
+      updatedAt: raw.updatedAt ?? raw.updated_at ?? null,
+      updated_at: raw.updated_at ?? raw.updatedAt ?? null,
+    }));
+  }
+
+  /**
+   * Create a new workspace project.
+   */
+  async createProject(payload: {
+    name: string;
+    description?: string;
+    tags?: string[];
+    defaultDepartmentId?: string;
+  }): Promise<Project> {
+    const raw = await this.request<any>("/api/v1/projects", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return {
+      id: raw.id,
+      name: raw.name,
+      description: raw.description ?? null,
+      tags: raw.tags || [],
+      defaultDepartmentId:
+        raw.defaultDepartmentId ?? raw.default_department_id ?? null,
+      taskCount: raw.taskCount ?? raw.task_count ?? 0,
+      statusSummary: raw.statusSummary ?? raw.status_summary ?? {},
+      createdAt: raw.createdAt ?? raw.created_at ?? null,
+      updatedAt: raw.updatedAt ?? raw.updated_at ?? null,
+    };
+  }
+
+  /**
+   * List tasks for the Kanban/List board with optional filtering.
+   */
+  async listTasks(filters?: {
+    projectId?: string;
+    status?: string;
+    assignedAgentId?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<BoardTask[]> {
+    const params = new URLSearchParams();
+    if (filters?.projectId) params.append("project_id", filters.projectId);
+    if (filters?.status) params.append("status", filters.status);
+    if (filters?.assignedAgentId)
+      params.append("assigned_agent_id", filters.assignedAgentId);
+    if (filters?.limit !== undefined) params.append("limit", String(filters.limit));
+    if (filters?.offset !== undefined)
+      params.append("offset", String(filters.offset));
+
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const rawTasks = await this.request<any[]>(`/api/v1/tasks${qs}`);
+    return (rawTasks || []).map((raw) => this.normalizeTask(raw));
+  }
+
+  /**
+   * Transition a task's FSM state via PATCH /api/v1/tasks/{taskId}/state.
+   */
+  async transitionTaskState(
+    taskId: string,
+    targetState: string,
+    options?: { actor?: string; reason?: string }
+  ): Promise<BoardTask> {
+    const raw = await this.request<any>(
+      `/api/v1/tasks/${encodeURIComponent(taskId)}/state`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          target_state: targetState,
+          actor: options?.actor || "user",
+          reason: options?.reason,
+        }),
+      }
+    );
+    return this.normalizeTask(raw);
+  }
+
+  /**
+   * Fetch chronological TurnLog & TaskAuditLog timeline for a task.
+   */
+  async getTaskLogs(taskId: string): Promise<TaskLogEntry[]> {
+    const rawLogs = await this.request<any[]>(
+      `/api/v1/tasks/${encodeURIComponent(taskId)}/logs`
+    );
+    return (rawLogs || []).map((raw) => this.normalizeTaskLog(raw));
+  }
+
+  /**
+   * Build authenticated WebSocket URL for live task events (/ws/tasks/{taskId}).
+   */
+  getTaskWebSocketUrl(taskId: string): string {
+    const wsBase = this.baseUrl.replace(/^http/i, "ws");
+    const token = encodeURIComponent(this.resolveToken());
+    return `${wsBase}/ws/tasks/${encodeURIComponent(taskId)}?token=${token}`;
+  }
+
+  /**
    * Parse a natural language prompt, extracting mentions, entities, and creating a pending task.
    */
   async parseTask(
@@ -242,6 +451,76 @@ export class ApiClient {
       }
     );
     return this.normalizeReview(raw);
+  }
+
+  private normalizeTask(raw: any): BoardTask {
+    return {
+      id: raw.id,
+      projectId: raw.projectId || raw.project_id || "proj-default",
+      project_id: raw.project_id || raw.projectId || "proj-default",
+      title: raw.title,
+      description: raw.description ?? null,
+      status: raw.status || "pending",
+      priority: raw.priority || "normal",
+      assignedAgentId: raw.assignedAgentId ?? raw.assigned_agent_id ?? null,
+      assigned_agent_id: raw.assigned_agent_id ?? raw.assignedAgentId ?? null,
+      agentName: raw.agentName ?? raw.agent_name ?? null,
+      agent_name: raw.agent_name ?? raw.agentName ?? null,
+      agentDisplayName: raw.agentDisplayName ?? raw.agent_display_name ?? null,
+      agent_display_name: raw.agent_display_name ?? raw.agentDisplayName ?? null,
+      turnCount: raw.turnCount ?? raw.turn_count ?? 0,
+      turn_count: raw.turn_count ?? raw.turnCount ?? 0,
+      metadata: raw.metadata ?? null,
+      startedAt: raw.startedAt ?? raw.started_at ?? null,
+      started_at: raw.started_at ?? raw.startedAt ?? null,
+      completedAt: raw.completedAt ?? raw.completed_at ?? null,
+      completed_at: raw.completed_at ?? raw.completedAt ?? null,
+      createdAt: raw.createdAt ?? raw.created_at ?? null,
+      created_at: raw.created_at ?? raw.createdAt ?? null,
+      updatedAt: raw.updatedAt ?? raw.updated_at ?? null,
+      updated_at: raw.updated_at ?? raw.updatedAt ?? null,
+    };
+  }
+
+  private normalizeTaskLog(raw: any): TaskLogEntry {
+    return {
+      id: raw.id,
+      logType: raw.logType ?? raw.log_type ?? "turn",
+      log_type: raw.log_type ?? raw.logType ?? "turn",
+      taskId: raw.taskId ?? raw.task_id,
+      task_id: raw.task_id ?? raw.taskId,
+      subtaskId: raw.subtaskId ?? raw.subtask_id ?? null,
+      subtask_id: raw.subtask_id ?? raw.subtaskId ?? null,
+      agentId: raw.agentId ?? raw.agent_id ?? null,
+      agent_id: raw.agent_id ?? raw.agentId ?? null,
+      agentName: raw.agentName ?? raw.agent_name ?? null,
+      agent_name: raw.agent_name ?? raw.agentName ?? null,
+      agentDisplayName: raw.agentDisplayName ?? raw.agent_display_name ?? null,
+      agent_display_name: raw.agent_display_name ?? raw.agentDisplayName ?? null,
+      turnNumber: raw.turnNumber ?? raw.turn_number ?? null,
+      turn_number: raw.turn_number ?? raw.turnNumber ?? null,
+      action: raw.action ?? null,
+      tool: raw.tool ?? null,
+      inputPayload: raw.inputPayload ?? raw.input_payload,
+      input_payload: raw.input_payload ?? raw.inputPayload,
+      outputPayload: raw.outputPayload ?? raw.output_payload,
+      output_payload: raw.output_payload ?? raw.outputPayload,
+      steps: Array.isArray(raw.steps) ? raw.steps : [],
+      durationMs: raw.durationMs ?? raw.duration_ms ?? null,
+      duration_ms: raw.duration_ms ?? raw.durationMs ?? null,
+      tokens: raw.tokens ?? null,
+      status: raw.status ?? null,
+      errorMessage: raw.errorMessage ?? raw.error_message ?? null,
+      error_message: raw.error_message ?? raw.errorMessage ?? null,
+      fromStatus: raw.fromStatus ?? raw.from_status ?? null,
+      from_status: raw.from_status ?? raw.fromStatus ?? null,
+      toStatus: raw.toStatus ?? raw.to_status ?? null,
+      to_status: raw.to_status ?? raw.toStatus ?? null,
+      actor: raw.actor ?? null,
+      reason: raw.reason ?? null,
+      createdAt: raw.createdAt ?? raw.created_at ?? null,
+      created_at: raw.created_at ?? raw.createdAt ?? null,
+    };
   }
 
   private normalizeReview(raw: any): ReviewGate {

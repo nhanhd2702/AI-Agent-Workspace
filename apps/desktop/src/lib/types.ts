@@ -50,10 +50,117 @@ export interface Department {
   status: "active" | "inactive" | string;
   agentsCount?: number;
   agents_count?: number;
+  agents?: Agent[];
   createdAt?: string | null;
   created_at?: string | null;
   updatedAt?: string | null;
   updated_at?: string | null;
+}
+
+export type TaskStatus =
+  | "pending"
+  | "running"
+  | "waiting_review"
+  | "approved"
+  | "rejected"
+  | "delivered"
+  | "completed"
+  | "paused"
+  | "failed"
+  | "cancelled";
+
+export interface Project {
+  id: string;
+  name: string;
+  description?: string | null;
+  tags?: string[];
+  defaultDepartmentId?: string | null;
+  default_department_id?: string | null;
+  taskCount?: number;
+  task_count?: number;
+  statusSummary?: Record<string, number>;
+  status_summary?: Record<string, number>;
+  createdAt?: string | null;
+  created_at?: string | null;
+  updatedAt?: string | null;
+  updated_at?: string | null;
+}
+
+export interface BoardTask {
+  id: string;
+  projectId?: string;
+  project_id?: string;
+  title: string;
+  description?: string | null;
+  status: TaskStatus | string;
+  priority?: string;
+  assignedAgentId?: string | null;
+  assigned_agent_id?: string | null;
+  agentName?: string | null;
+  agent_name?: string | null;
+  agentDisplayName?: string | null;
+  agent_display_name?: string | null;
+  turnCount?: number;
+  turn_count?: number;
+  metadata?: Record<string, unknown> | null;
+  startedAt?: string | null;
+  started_at?: string | null;
+  completedAt?: string | null;
+  completed_at?: string | null;
+  createdAt?: string | null;
+  created_at?: string | null;
+  updatedAt?: string | null;
+  updated_at?: string | null;
+}
+
+export interface TaskLogStep {
+  id?: string;
+  name?: string;
+  tool?: string;
+  status?: string;
+  durationMs?: number;
+  duration_ms?: number;
+  detail?: string;
+  output?: unknown;
+}
+
+export interface TaskLogEntry {
+  id: string;
+  logType?: "turn" | "audit" | string;
+  log_type?: "turn" | "audit" | string;
+  taskId?: string;
+  task_id?: string;
+  subtaskId?: string | null;
+  subtask_id?: string | null;
+  agentId?: string | null;
+  agent_id?: string | null;
+  agentName?: string | null;
+  agent_name?: string | null;
+  agentDisplayName?: string | null;
+  agent_display_name?: string | null;
+  turnNumber?: number | null;
+  turn_number?: number | null;
+  action?: string | null;
+  tool?: string | null;
+  inputPayload?: unknown;
+  input_payload?: unknown;
+  outputPayload?: unknown;
+  output_payload?: unknown;
+  steps?: TaskLogStep[];
+  durationMs?: number | null;
+  duration_ms?: number | null;
+  tokens?: number | null;
+  status?: string | null;
+  errorMessage?: string | null;
+  error_message?: string | null;
+  fromStatus?: string | null;
+  from_status?: string | null;
+  toStatus?: string | null;
+  to_status?: string | null;
+  actor?: string | null;
+  reason?: string | null;
+  createdAt?: string | null;
+  created_at?: string | null;
 }
 
 export interface AttachmentItem {

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import AppSettings, get_settings
-from app.db.models import Agent, Project, SubTask, Task, TaskStatus, TurnLog
+from app.db.models import Agent, Project, SubTask, Task, TaskAuditLog, TaskStatus, TurnLog
 from app.db.session import DEFAULT_AGENTS, get_db, init_db
+from app.db.state_machine import InvalidStateTransitionError, TaskStateMachine
 from app.llm.router import LlmRouter
 from app.orchestrator.dispatcher import (
     AgentDispatcher,
@@ -79,6 +82,30 @@ class TaskHandoffRequest(BaseModel):
     artifact_ids: list[str] = Field(default_factory=list, alias="artifactIds")
 
 
+class TaskStateTransitionRequest(BaseModel):
+    """Payload to transition a Task via TaskStateMachine."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    target_state: Optional[str] = Field(default=None, alias="targetState")
+    status: Optional[str] = None
+    state: Optional[str] = None
+    actor: str = Field(default="user", min_length=1, max_length=64)
+    reason: Optional[str] = None
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    return _ensure_utc(dt).isoformat()
+
+
 def _get_history_file(request: Request) -> Path:
     """Resolves prompt history file path from app settings."""
     settings: AppSettings = getattr(request.app.state, "settings", None) or get_settings()
@@ -102,23 +129,82 @@ def _get_extra_secrets(request: Request) -> list[str]:
 def _serialize_turn(
     turn: TurnLog,
     extra_secrets: Optional[list[str]] = None,
+    agent_map: Optional[dict[str, Agent]] = None,
 ) -> dict[str, Any]:
+    agent = agent_map.get(turn.agent_id) if (agent_map and turn.agent_id) else None
+    steps: list[dict[str, Any]] = []
+    if isinstance(turn.output_payload, dict) and isinstance(
+        turn.output_payload.get("steps"), list
+    ):
+        steps = list(turn.output_payload["steps"])
+
     return mask_secrets(
         {
             "id": turn.id,
+            "log_type": "turn",
             "task_id": turn.task_id,
             "subtask_id": turn.subtask_id,
             "agent_id": turn.agent_id,
+            "agent_name": agent.name if agent else None,
+            "agent_display_name": agent.display_name if agent else None,
             "turn_number": turn.turn_number,
             "action": turn.action,
             "tool": turn.tool,
             "input_payload": turn.input_payload,
             "output_payload": turn.output_payload,
+            "steps": steps,
             "duration_ms": turn.duration_ms,
             "tokens": turn.tokens,
             "status": turn.status,
             "error_message": turn.error_message,
-            "created_at": turn.created_at.isoformat() if turn.created_at else None,
+            "created_at": _format_utc_iso(turn.created_at),
+        },
+        extra_secrets=extra_secrets,
+    )
+
+
+def _serialize_task(
+    task: Task,
+    db: Session,
+    extra_secrets: Optional[list[str]] = None,
+    agent_map: Optional[dict[str, Agent]] = None,
+    turn_counts: Optional[dict[str, int]] = None,
+) -> dict[str, Any]:
+    agent: Optional[Agent] = None
+    if task.assigned_agent_id:
+        if agent_map is not None:
+            agent = agent_map.get(task.assigned_agent_id)
+        else:
+            agent = db.get(Agent, task.assigned_agent_id)
+
+    if turn_counts is not None:
+        turn_count = turn_counts.get(task.id, 0)
+    else:
+        turn_count = db.query(TurnLog).filter(TurnLog.task_id == task.id).count()
+    status_val = (
+        task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+    )
+    agent_name = agent.name if agent else None
+    agent_display_name = agent.display_name if agent else None
+
+    return mask_secrets(
+        {
+            "id": task.id,
+            "project_id": task.project_id,
+            "title": task.title,
+            "description": task.description,
+            "status": status_val,
+            "priority": task.priority,
+            "assigned_agent_id": task.assigned_agent_id,
+            "agent_name": agent_name,
+            "agentName": agent_name,
+            "agent_display_name": agent_display_name,
+            "metadata": task.task_metadata,
+            "turn_count": turn_count,
+            "started_at": _format_utc_iso(task.started_at),
+            "completed_at": _format_utc_iso(task.completed_at),
+            "created_at": _format_utc_iso(task.created_at),
+            "updated_at": _format_utc_iso(task.updated_at),
         },
         extra_secrets=extra_secrets,
     )
@@ -312,6 +398,72 @@ def parse_task(
     }
 
 
+@router.get("", status_code=status.HTTP_200_OK)
+def list_tasks(
+    request: Request,
+    project_id: Optional[str] = Query(default=None),
+    projectId: Optional[str] = Query(default=None),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    assigned_agent_id: Optional[str] = Query(default=None),
+    assignedAgentId: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """List tasks with optional project, status, and agent filters for Kanban/List board."""
+    resolved_project_id = project_id or projectId
+    resolved_agent_id = assigned_agent_id or assignedAgentId
+
+    query = db.query(Task)
+    if resolved_project_id:
+        query = query.filter(Task.project_id == resolved_project_id)
+    if status_filter:
+        try:
+            status_enum = TaskStatus(status_filter.strip().lower())
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"Invalid task status '{status_filter}'",
+            ) from exc
+        query = query.filter(Task.status == status_enum)
+    if resolved_agent_id:
+        query = query.filter(Task.assigned_agent_id == resolved_agent_id)
+
+    tasks = (
+        query.order_by(Task.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    agents = db.query(Agent).all()
+    agent_map = {a.id: a for a in agents}
+    task_ids = [t.id for t in tasks]
+    turn_counts: dict[str, int] = {}
+    if task_ids:
+        rows = (
+            db.query(TurnLog.task_id, func.count(TurnLog.id))
+            .filter(TurnLog.task_id.in_(task_ids))
+            .group_by(TurnLog.task_id)
+            .all()
+        )
+        turn_counts = {tid: int(cnt) for tid, cnt in rows}
+    extra_secrets = _get_extra_secrets(request)
+
+    return {
+        "status": "success",
+        "data": [
+            _serialize_task(
+                t,
+                db,
+                extra_secrets=extra_secrets,
+                agent_map=agent_map,
+                turn_counts=turn_counts,
+            )
+            for t in tasks
+        ],
+    }
+
+
 @router.get("/history", status_code=status.HTTP_200_OK)
 def get_task_history(
     request: Request,
@@ -348,25 +500,12 @@ def get_task(
         .order_by(SubTask.order_index.asc())
         .all()
     )
-    turn_count = db.query(TurnLog).filter(TurnLog.task_id == task_id).count()
     extra_secrets = _get_extra_secrets(request)
 
     return {
         "status": "success",
         "data": {
-            "id": task.id,
-            "project_id": task.project_id,
-            "title": task.title,
-            "description": task.description,
-            "status": task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
-            "priority": task.priority,
-            "assigned_agent_id": task.assigned_agent_id,
-            "metadata": task.task_metadata,
-            "started_at": task.started_at.isoformat() if task.started_at else None,
-            "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-            "created_at": task.created_at.isoformat() if task.created_at else None,
-            "updated_at": task.updated_at.isoformat() if task.updated_at else None,
-            "turn_count": turn_count,
+            **_serialize_task(task, db, extra_secrets=extra_secrets),
             "subtasks": [
                 {
                     "id": st.id,
@@ -381,6 +520,172 @@ def get_task(
                 for st in subtasks
             ],
         },
+    }
+
+
+@router.patch("/{task_id}/state", status_code=status.HTTP_200_OK)
+async def transition_task_state(
+    task_id: str,
+    payload: TaskStateTransitionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Transition a Task via TaskStateMachine, returning 409 on invalid FSM transitions."""
+    raw_target = payload.target_state or payload.status or payload.state
+    if not raw_target or not raw_target.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="target_state is required",
+        )
+
+    try:
+        target_status = TaskStatus(raw_target.strip().lower())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Invalid target_state '{raw_target}'",
+        ) from exc
+
+    existing = db.get(Task, task_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task '{task_id}' not found",
+        )
+
+    previous_status = (
+        existing.status.value
+        if isinstance(existing.status, TaskStatus)
+        else str(existing.status)
+    )
+    extra_secrets = _get_extra_secrets(request)
+    masked_actor = str(
+        mask_secrets((payload.actor or "user").strip() or "user", extra_secrets=extra_secrets)
+    )[:64]
+    masked_reason = (
+        str(mask_secrets(payload.reason.strip(), extra_secrets=extra_secrets))
+        if payload.reason and payload.reason.strip()
+        else None
+    )
+
+    try:
+        updated_task = TaskStateMachine.transition(
+            session=db,
+            task_id=task_id,
+            target_state=target_status,
+            actor=masked_actor,
+            reason=masked_reason,
+            commit=False,
+        )
+        db.commit()
+        db.refresh(updated_task)
+    except InvalidStateTransitionError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    serialized = _serialize_task(updated_task, db, extra_secrets=extra_secrets)
+
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if ws_manager is not None:
+        try:
+            await ws_manager.broadcast(
+                task_id=task_id,
+                event={
+                    "event": "task_status",
+                    "type": "task_status",
+                    "task_id": task_id,
+                    "from_status": previous_status,
+                    "status": serialized["status"],
+                    "actor": masked_actor,
+                    "reason": masked_reason,
+                    "data": serialized,
+                },
+            )
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "data": serialized,
+    }
+
+
+@router.get("/{task_id}/logs", status_code=status.HTTP_200_OK)
+def get_task_logs(
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return chronological secret-masked TurnLog & TaskAuditLog timeline for task_id."""
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task '{task_id}' not found",
+        )
+
+    extra_secrets = _get_extra_secrets(request)
+    agents = db.query(Agent).all()
+    agent_map = {a.id: a for a in agents}
+
+    turns = (
+        db.query(TurnLog)
+        .filter(TurnLog.task_id == task_id)
+        .order_by(TurnLog.turn_number.asc(), TurnLog.created_at.asc())
+        .all()
+    )
+    audits = (
+        db.query(TaskAuditLog)
+        .filter(TaskAuditLog.task_id == task_id)
+        .order_by(TaskAuditLog.created_at.asc())
+        .all()
+    )
+
+    timeline: list[tuple[datetime, int, int, dict[str, Any]]] = []
+
+    for idx, audit in enumerate(audits):
+        dt = _ensure_utc(audit.created_at) if audit.created_at else datetime.now(timezone.utc)
+        entry = mask_secrets(
+            {
+                "id": audit.id,
+                "log_type": "audit",
+                "task_id": audit.task_id,
+                "subtask_id": None,
+                "agent_id": None,
+                "agent_name": None,
+                "turn_number": None,
+                "action": "state_transition",
+                "tool": "fsm",
+                "from_status": audit.from_status,
+                "to_status": audit.to_status,
+                "actor": audit.actor,
+                "reason": audit.reason,
+                "status": audit.to_status,
+                "steps": [],
+                "duration_ms": None,
+                "tokens": None,
+                "created_at": dt.isoformat(),
+            },
+            extra_secrets=extra_secrets,
+        )
+        timeline.append((dt, 0, idx, entry))
+
+    for turn in turns:
+        dt = _ensure_utc(turn.created_at) if turn.created_at else datetime.now(timezone.utc)
+        entry = _serialize_turn(turn, extra_secrets=extra_secrets, agent_map=agent_map)
+        timeline.append((dt, 1, int(turn.turn_number or 0), entry))
+
+    timeline.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    return {
+        "status": "success",
+        "data": [item[3] for item in timeline],
     }
 
 
