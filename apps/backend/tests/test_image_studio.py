@@ -19,7 +19,7 @@ import pytest
 from app.agents.base import WorkerResult
 from app.agents.content import ImageStudioAgent
 from app.db.models import BrandProfile
-from app.mcp.browser_server import BrowserActionResult, BrowserGateStatus
+from app.mcp.browser_server import BrowserActionResult, BrowserController, BrowserGateStatus
 
 
 class MockBrowser:
@@ -415,3 +415,142 @@ async def test_image_studio_masks_secrets_in_rendered_output_and_artifacts(
     assert secret_val not in res.content
     for art in res.artifacts:
         assert secret_val not in art.content
+
+
+@pytest.mark.asyncio
+async def test_image_studio_masks_brand_name_in_structured_data(
+    mock_browser: MockBrowser, tmp_path: Path
+) -> None:
+    secret_brand = "SECRET_BRAND_TOKEN_888"
+    agent = ImageStudioAgent(browser=mock_browser)
+    res = await agent.run(
+        {
+            "headline": "Tiêu đề chuẩn mực",
+            "brand_profile": {"brand_name": secret_brand},
+            "output_dir": tmp_path,
+            "extra_secrets": [secret_brand],
+        }
+    )
+    assert res.status == "completed"
+    assert secret_brand not in res.structured_data["brand_name"]
+    assert "***REDACTED***" in res.structured_data["brand_name"]
+
+
+# ============================================================================
+# Review Round 1 Regression Tests (P1 Injection & P2 Browser Hierarchy)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_image_studio_malicious_color_and_font_injection_sanitization(
+    mock_browser: MockBrowser, tmp_path: Path
+) -> None:
+    """Verify that malicious color or font strings are rejected and sanitized."""
+    malicious_brand = {
+        "brand_name": "Secure Brand",
+        "primary_color": '"><script>alert("injected_color")</script><style>',
+        "secondary_color": "rgba(255, 0, 0, 0.8); background: red;",
+        "accent_color": "#ff0000; font-size: 50px;",
+        "background_color": "<svg/onload=alert(1)>",
+        "brand_colors": [
+            "blue; display: none;",
+            "<img src=x onerror=alert('xss')>",
+        ],
+        "font_family": '"><script>alert("font_xss")</script>Roboto; color: red;',
+    }
+    agent = ImageStudioAgent(browser=mock_browser)
+    res = await agent.run(
+        {
+            "headline": "Kiểm tra an toàn bảo mật injection",
+            "brand_profile": malicious_brand,
+            "output_dir": tmp_path,
+        }
+    )
+    assert res.status == "completed"
+    rendered = mock_browser.last_rendered_html or ""
+
+    # Must NOT contain injected script tags or event handlers
+    assert "<script>" not in rendered
+    assert "</script>" not in rendered
+    assert "injected_color" not in rendered
+    assert "font_xss" not in rendered
+    assert "<svg/onload" not in rendered
+    assert "<img" not in rendered
+    assert "onerror=" not in rendered
+
+    # Default fallback color should be used when malicious color is discarded
+    assert "#1e40af" in rendered
+
+
+@pytest.mark.asyncio
+async def test_image_studio_fallback_browser_workspace_hierarchy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify that ImageStudioAgent(browser=None) uses output_dir.parent as workspace_root."""
+    created_controllers: list[BrowserController] = []
+    orig_init = BrowserController.__init__
+
+    def tracking_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        orig_init(self, *args, **kwargs)
+        created_controllers.append(self)
+
+    monkeypatch.setattr(BrowserController, "__init__", tracking_init)
+
+    async def fake_render(
+        self: Any,
+        html: str,
+        output_path: Path | str,
+        *,
+        width: int = 1280,
+        height: int = 720,
+        full_page: bool = False,
+        task_workspace: Optional[Path] = None,
+    ) -> BrowserActionResult:
+        p = Path(output_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        return BrowserActionResult(
+            status=BrowserGateStatus.OK.value,
+            action="render_html_to_png",
+            screenshot_path=str(p),
+            duration_ms=25,
+        )
+
+    monkeypatch.setattr(BrowserController, "render_html_to_png", fake_render)
+
+    task_workspace_dir = tmp_path / "workspace_parent" / "target_output_dir"
+    agent = ImageStudioAgent(browser=None)
+    res = await agent.run(
+        {
+            "headline": "Kiểm tra cấu trúc thư mục fallback",
+            "output_dir": task_workspace_dir,
+        }
+    )
+
+    assert res.status == "completed"
+    assert len(created_controllers) >= 1
+    # Check that workspace_root was output_dir.resolve().parent, making output_dir a valid child
+    assert any(
+        ctrl.workspace_root == task_workspace_dir.resolve().parent
+        for ctrl in created_controllers
+    )
+    assert any(a.filename.endswith(".png") for a in res.artifacts)
+
+    # Test failure case when PNG rendering fails
+    async def failing_render(*args: Any, **kwargs: Any) -> BrowserActionResult:
+        raise RuntimeError("Chromium rendering engine crashed")
+
+    monkeypatch.setattr(BrowserController, "render_html_to_png", failing_render)
+    fail_dir = tmp_path / "fail_workspace" / "out"
+    res_fail = await agent.run(
+        {
+            "headline": "Kiểm tra render lỗi",
+            "output_dir": fail_dir,
+        }
+    )
+    assert res_fail.status == "failed"
+    assert "Chromium rendering engine crashed" in (res_fail.error or "")
+    assert not any(a.filename.endswith(".png") for a in res_fail.artifacts)
+

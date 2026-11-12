@@ -1231,6 +1231,32 @@ class ContentWriterAgent(BaseWorkerAgent):
 # ============================================================================
 
 
+_SAFE_COLOR_HEX = re.compile(r"^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+_SAFE_COLOR_RGB_HSL = re.compile(
+    r"^(?:rgb|rgba|hsl|hsla)\(\s*[\d\s.,%/-]+\)$", re.IGNORECASE
+)
+_SAFE_COLOR_NAME = re.compile(r"^[a-zA-Z]+$")
+
+
+def _is_safe_color(color: Any) -> bool:
+    """Validate color string against strict CSS color syntax, rejecting code/markup injection."""
+    if not isinstance(color, str):
+        return False
+    val = color.strip()
+    if not val or len(val) > 64:
+        return False
+    # Reject dangerous characters that could break out of CSS attributes or inject HTML/JS
+    if any(ch in val for ch in ("<", ">", '"', "'", ";", "{", "}", "\\", "\n", "\r", "\x00")):
+        return False
+    if _SAFE_COLOR_HEX.match(val):
+        return True
+    if _SAFE_COLOR_RGB_HSL.match(val):
+        return True
+    if _SAFE_COLOR_NAME.match(val):
+        return True
+    return False
+
+
 class ImageStudioAgent(BaseWorkerAgent):
     """Agent that produces marketing graphics via offline HTML/CSS/SVG templates and PNG screenshot rendering."""
 
@@ -1360,18 +1386,10 @@ class ImageStudioAgent(BaseWorkerAgent):
         html_path.write_text(sanitized_html, encoding="utf-8")
 
         # 8. PNG screenshot rendering via BrowserController
+        render_error: Optional[str] = None
         browser = task_ctx.get("browser") or self.browser
         if browser is not None:
-            await browser.render_html_to_png(
-                sanitized_html,
-                output_path=png_path,
-                width=width,
-                height=height,
-                task_workspace=output_dir,
-            )
-        else:
             try:
-                browser = BrowserController(workspace_root=output_dir)
                 await browser.render_html_to_png(
                     sanitized_html,
                     output_path=png_path,
@@ -1380,7 +1398,22 @@ class ImageStudioAgent(BaseWorkerAgent):
                     task_workspace=output_dir,
                 )
             except Exception as exc:
-                logger.warning("Browser rendering fallback failed: %s", exc)
+                render_error = f"Browser rendering failed: {exc}"
+                logger.warning(render_error, exc_info=True)
+        else:
+            try:
+                # Use output_dir.resolve().parent as workspace_root so output_dir is a valid child
+                browser = BrowserController(workspace_root=output_dir.resolve().parent)
+                await browser.render_html_to_png(
+                    sanitized_html,
+                    output_path=png_path,
+                    width=width,
+                    height=height,
+                    task_workspace=output_dir,
+                )
+            except Exception as exc:
+                render_error = f"Browser rendering fallback failed: {exc}"
+                logger.warning(render_error, exc_info=True)
 
         # 9. Artifact outputs
         html_artifact = ArtifactOutput(
@@ -1395,18 +1428,24 @@ class ImageStudioAgent(BaseWorkerAgent):
                 "path": str(html_path),
             },
         )
-        png_artifact = ArtifactOutput(
-            filename=png_filename,
-            content=str(png_path),
-            artifact_type="png",
-            title=f"Rendered Graphic ({width}x{height})",
-            metadata={
-                "width": width,
-                "height": height,
-                "template": template_name,
-                "path": str(png_path),
-            },
-        )
+        artifacts = [html_artifact]
+        if png_path.exists():
+            png_artifact = ArtifactOutput(
+                filename=png_filename,
+                content=str(png_path),
+                artifact_type="png",
+                title=f"Rendered Graphic ({width}x{height})",
+                metadata={
+                    "width": width,
+                    "height": height,
+                    "template": template_name,
+                    "path": str(png_path),
+                },
+            )
+            artifacts.append(png_artifact)
+        else:
+            if not render_error:
+                render_error = f"Rendered PNG artifact was not generated at {png_path}"
 
         duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
         structured_data = {
@@ -1416,23 +1455,34 @@ class ImageStudioAgent(BaseWorkerAgent):
             "size": f"{width}x{height}",
             "html_path": str(html_path),
             "png_path": str(png_path),
-            "brand_name": brand_data.get("brand_name"),
+            "brand_name": mask_secrets(
+                str(brand_data.get("brand_name") or ""), extra_secrets=extra_secrets
+            ),
         }
 
-        summary = (
-            f"Đã tạo đồ họa hình ảnh thành công ({template_name}, {width}x{height}px).\n"
-            f"- File HTML: {html_filename}\n"
-            f"- File PNG: {png_filename}"
-        )
+        if png_path.exists():
+            status = "completed"
+            summary = (
+                f"Đã tạo đồ họa hình ảnh thành công ({template_name}, {width}x{height}px).\n"
+                f"- File HTML: {html_filename}\n"
+                f"- File PNG: {png_filename}"
+            )
+        else:
+            status = "failed"
+            summary = (
+                f"Tạo đồ họa HTML thành công nhưng xuất PNG thất bại: {render_error}.\n"
+                f"- File HTML: {html_filename}"
+            )
         summary = mask_secrets(summary, extra_secrets=extra_secrets)
 
         return AgentResult(
             subtask_id=subtask_id,
             agent_id=self.agent.id,
-            status="completed",
+            status=status,
+            error=render_error if status == "failed" else None,
             content=summary,
             structured_data=structured_data,
-            artifacts=[html_artifact, png_artifact],
+            artifacts=artifacts,
             duration_ms=duration_ms,
         )
 
@@ -1569,34 +1619,37 @@ class ImageStudioAgent(BaseWorkerAgent):
         }
 
     def _resolve_brand_colors(self, brand_data: dict[str, Any]) -> dict[str, str]:
-        """Extract primary, secondary, accent, and background colors with fallbacks."""
-        colors = {
+        """Extract primary, secondary, accent, and background colors with fallbacks and strict validation."""
+        defaults = {
             "primary": "#1e40af",
             "secondary": "#3b82f6",
             "accent": "#f59e0b",
             "background": "#0f172a",
             "text": "#ffffff",
         }
+        colors = dict(defaults)
         raw_colors = brand_data.get("brand_colors")
         if isinstance(raw_colors, list) and raw_colors:
             c_list = [str(c).strip() for c in raw_colors if c]
-            if len(c_list) >= 1:
+            if len(c_list) >= 1 and _is_safe_color(c_list[0]):
                 colors["primary"] = c_list[0]
-            if len(c_list) >= 2:
+            if len(c_list) >= 2 and _is_safe_color(c_list[1]):
                 colors["secondary"] = c_list[1]
-            if len(c_list) >= 3:
+            if len(c_list) >= 3 and _is_safe_color(c_list[2]):
                 colors["accent"] = c_list[2]
-            if len(c_list) >= 4:
+            if len(c_list) >= 4 and _is_safe_color(c_list[3]):
                 colors["background"] = c_list[3]
         elif isinstance(raw_colors, dict):
             for k in ("primary", "secondary", "accent", "background"):
-                if raw_colors.get(k):
-                    colors[k] = str(raw_colors[k]).strip()
+                val = str(raw_colors.get(k) or "").strip()
+                if val and _is_safe_color(val):
+                    colors[k] = val
 
         for k in ("primary_color", "secondary_color", "accent_color", "background_color"):
             short = k.replace("_color", "")
-            if brand_data.get(k):
-                colors[short] = str(brand_data[k]).strip()
+            val = str(brand_data.get(k) or "").strip()
+            if val and _is_safe_color(val):
+                colors[short] = val
 
         return colors
 
@@ -1613,9 +1666,16 @@ class ImageStudioAgent(BaseWorkerAgent):
             chosen = str(brand_data["font_family"]).strip()
 
         if chosen:
-            if chosen in system_fonts:
-                return system_fonts
-            return f"{chosen}, {system_fonts}"
+            # Strip HTML tags
+            cleaned = re.sub(r"</?[a-zA-Z][^>]*>", "", chosen)
+            # Strip dangerous characters that could break out of CSS font stacks
+            cleaned = re.sub(r"[<>\";'\{\}\\]", "", cleaned).strip()
+            # Collapse whitespace
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned and cleaned not in system_fonts:
+                if re.match(r"^[a-zA-Z0-9\s\-_]+$", cleaned):
+                    safe_font = f"'{cleaned}'" if " " in cleaned else cleaned
+                    return f"{safe_font}, {system_fonts}"
         return system_fonts
 
     def _render_template(
