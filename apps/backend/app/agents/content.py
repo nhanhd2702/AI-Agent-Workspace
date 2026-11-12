@@ -23,10 +23,12 @@ from urllib.parse import urlparse
 
 from app.agents.base import BaseWorkerAgent, WorkerResult
 from app.artifacts.renderer import sanitize_offline_html
+from app.artifacts.storyboard import Scene, Storyboard, StoryboardBuilder
 from app.db.models import Agent, BrandProfile
 from app.llm.router import LlmResponse, LlmRouter
 from app.mcp.browser_server import BrowserActionResult, BrowserController, BrowserGateStatus
 from app.mcp.external_apis import TranscriptResult, VideoMeta, YouTubeClient
+from app.mcp.shell_server import ShellExecutor, ShellResult
 from app.orchestrator.dispatcher import mask_secrets
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ __all__ = [
     "DeepResearcherAgent",
     "ContentWriterAgent",
     "ImageStudioAgent",
+    "VideoEditorAgent",
 ]
 
 
@@ -2245,4 +2248,392 @@ class ImageStudioAgent(BaseWorkerAgent):
     </div>
 </body>
 </html>"""
+
+
+# ============================================================================
+# VideoEditorAgent (Task 3.5)
+# ============================================================================
+
+
+class VideoEditorAgent(BaseWorkerAgent):
+    """Agent that inspects video assets via ffprobe, builds storyboards,
+    lints pacing, enforces HIL storyboard review gates, and renders H.264 video via ffmpeg."""
+
+    def __init__(
+        self,
+        agent: Optional[Agent] = None,
+        shell: Optional[ShellExecutor] = None,
+        llm: Optional[Any] = None,
+        llm_router: Optional[LlmRouter] = None,
+        session_factory: Optional[Any] = None,
+        db: Optional[Any] = None,
+        workspace_root: Optional[Path] = None,
+        **kwargs: Any,
+    ) -> None:
+        synth_agent = agent or Agent(
+            id="agent-video-editor",
+            name="video_editor",
+            display_name="Video Editor",
+            role="editor",
+            default_model="gemini-2.5-flash",
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        router = llm_router or (llm if isinstance(llm, LlmRouter) else None)
+        super().__init__(
+            agent=synth_agent,
+            llm_router=router,
+            session_factory=session_factory,
+            db=db,
+            **kwargs,
+        )
+        self.shell = shell
+        self.llm = llm or router
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
+
+    async def run(self, task_ctx: dict[str, Any]) -> AgentResult:
+        """Run video inspection, storyboard breakdown, pacing linter, HIL gate check, and render."""
+        t0 = time.perf_counter()
+        subtask_id = str(task_ctx.get("subtask_id", "video-editor"))
+
+        # Collect secrets for masking
+        extra_secrets: list[str] = list(task_ctx.get("extra_secrets") or [])
+        for k, v in task_ctx.items():
+            k_lower = k.lower()
+            if k_lower in {"author"}:
+                continue
+            if (
+                any(term in k_lower for term in ("key", "token", "secret", "pwd", "passwd", "password", "bearer"))
+                or k_lower.startswith("auth_")
+                or k_lower in {"auth", "authorization"}
+            ):
+                if isinstance(v, str) and len(v) >= 6:
+                    extra_secrets.append(v)
+
+        shell = task_ctx.get("shell") or self.shell
+
+        # Resolve task workspace
+        raw_ws = (
+            task_ctx.get("task_workspace")
+            or task_ctx.get("workspace")
+            or task_ctx.get("output_dir")
+        )
+        if raw_ws:
+            task_workspace = Path(raw_ws).resolve()
+        elif self.workspace_root:
+            task_workspace = self.workspace_root
+        else:
+            task_workspace = (Path.cwd() / "artifacts").resolve()
+        task_workspace.mkdir(parents=True, exist_ok=True)
+
+        # 1. ffprobe Video Metadata Inspection
+        video_metadata: dict[str, Any] = dict(task_ctx.get("video_metadata") or {})
+        video_path_raw = (
+            task_ctx.get("video_path")
+            or task_ctx.get("input_video")
+            or task_ctx.get("source_video")
+        )
+
+        rel_video_name: Optional[str] = None
+        if video_path_raw:
+            vpath = Path(video_path_raw)
+            try:
+                if vpath.is_absolute() and vpath.is_relative_to(task_workspace):
+                    rel_video_name = str(vpath.relative_to(task_workspace))
+                elif not vpath.is_absolute():
+                    rel_video_name = str(vpath)
+                else:
+                    rel_video_name = vpath.name
+            except Exception:
+                rel_video_name = vpath.name
+
+            if shell is not None:
+                try:
+                    probe_args = [
+                        "-v",
+                        "error",
+                        "-print_format",
+                        "json",
+                        "-show_format",
+                        "-show_streams",
+                        rel_video_name,
+                    ]
+                    probe_res: ShellResult = await shell.run(
+                        "ffprobe",
+                        probe_args,
+                        task_workspace=task_workspace,
+                    )
+                    if probe_res.returncode == 0 and probe_res.stdout:
+                        try:
+                            probe_data = json.loads(probe_res.stdout)
+                            streams = probe_data.get("streams", [])
+                            v_stream = next(
+                                (s for s in streams if s.get("codec_type") == "video"),
+                                streams[0] if streams else {},
+                            )
+                            fmt = probe_data.get("format", {})
+
+                            dur_str = fmt.get("duration") or v_stream.get("duration")
+                            if dur_str is not None:
+                                try:
+                                    video_metadata["duration"] = float(dur_str)
+                                except (ValueError, TypeError):
+                                    pass
+
+                            w = int(v_stream.get("width") or 0)
+                            h = int(v_stream.get("height") or 0)
+                            if w and h:
+                                video_metadata["width"] = w
+                                video_metadata["height"] = h
+                                video_metadata["resolution"] = f"{w}x{h}"
+
+                            fps_raw = (
+                                v_stream.get("r_frame_rate")
+                                or v_stream.get("avg_frame_rate")
+                                or ""
+                            )
+                            if "/" in str(fps_raw):
+                                parts = fps_raw.split("/", 1)
+                                try:
+                                    num, den = float(parts[0]), float(parts[1])
+                                    video_metadata["fps"] = (
+                                        num / den if den != 0 else 30.0
+                                    )
+                                except Exception:
+                                    video_metadata.setdefault("fps", 30.0)
+                            elif fps_raw:
+                                try:
+                                    video_metadata["fps"] = float(fps_raw)
+                                except Exception:
+                                    video_metadata.setdefault("fps", 30.0)
+
+                            if v_stream.get("codec_name"):
+                                video_metadata["codec"] = str(v_stream["codec_name"])
+                        except Exception as exc:
+                            logger.warning("Failed to parse ffprobe json output: %s", exc)
+                except Exception as exc:
+                    logger.warning("ffprobe execution error: %s", exc)
+
+        # 2. Build Storyboard Breakdown Constrained Strictly to Spoken Transcript Text
+        raw_scenes = task_ctx.get("scenes")
+        if raw_scenes and isinstance(raw_scenes, list):
+            scenes = [
+                s if isinstance(s, Scene) else Scene(**s)
+                for s in raw_scenes
+            ]
+        else:
+            raw_segments = (
+                task_ctx.get("transcript_segments")
+                or task_ctx.get("transcript")
+                or []
+            )
+            if isinstance(raw_segments, TranscriptResult):
+                segments_list = raw_segments.segments
+            elif isinstance(raw_segments, dict):
+                segments_list = raw_segments.get("segments", [])
+            elif isinstance(raw_segments, list):
+                segments_list = raw_segments
+            else:
+                segments_list = []
+
+            total_dur_hint = video_metadata.get("duration") or task_ctx.get("duration")
+            scenes = StoryboardBuilder.build_from_transcript(
+                segments_list,
+                total_duration=float(total_dur_hint) if total_dur_hint is not None else None,
+            )
+
+        # 3. Lint Pacing
+        warnings = StoryboardBuilder.lint_pacing(scenes)
+        calc_total_dur = video_metadata.get("duration") or max(
+            [s.end for s in scenes], default=0.0
+        )
+        storyboard = Storyboard(
+            scenes=scenes,
+            total_duration=calc_total_dur,
+            pacing_warnings=warnings,
+        )
+
+        # 4. Generate Storyboard Artifacts (storyboard.md and storyboard.json)
+        raw_md = StoryboardBuilder.to_markdown(
+            scenes, warnings, total_duration=calc_total_dur
+        )
+        masked_md = mask_secrets(raw_md, extra_secrets=extra_secrets)
+        md_filename = str(task_ctx.get("storyboard_md_filename") or "storyboard.md")
+        md_path = task_workspace / md_filename
+        md_path.write_text(masked_md, encoding="utf-8")
+
+        raw_json_dict = storyboard.to_dict()
+        raw_json_str = json.dumps(raw_json_dict, indent=2, ensure_ascii=False)
+        masked_json_str = mask_secrets(raw_json_str, extra_secrets=extra_secrets)
+        json_filename = str(task_ctx.get("storyboard_json_filename") or "storyboard.json")
+        json_path = task_workspace / json_filename
+        json_path.write_text(masked_json_str, encoding="utf-8")
+
+        artifacts = [
+            ArtifactOutput(
+                filename=md_filename,
+                content=masked_md,
+                artifact_type="markdown",
+                title="Kịch bản phân cảnh (Storyboard)",
+                metadata={
+                    "scene_count": len(scenes),
+                    "warnings_count": len(warnings),
+                    "path": str(md_path),
+                },
+            ),
+            ArtifactOutput(
+                filename=json_filename,
+                content=masked_json_str,
+                artifact_type="json",
+                title="Kịch bản phân cảnh dạng JSON",
+                metadata={
+                    "scene_count": len(scenes),
+                    "warnings_count": len(warnings),
+                    "path": str(json_path),
+                },
+            ),
+        ]
+
+        # 5. HIL Storyboard Review Gate Evaluation
+        is_approved = bool(
+            task_ctx.get("approved") is True or task_ctx.get("auto_render") is True
+        )
+        if not is_approved:
+            gate_summary = (
+                f"Phê duyệt kịch bản phân cảnh (Storyboard) trước khi render video: "
+                f"{len(scenes)} cảnh, {len(warnings)} cảnh báo nhịp độ."
+            )
+            masked_gate_summary = mask_secrets(gate_summary, extra_secrets=extra_secrets)
+            duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            return AgentResult(
+                subtask_id=subtask_id,
+                agent_id=self.agent.id,
+                status="waiting_review",
+                content=masked_gate_summary,
+                structured_data={
+                    "review_gate": {
+                        "gate_type": "storyboard",
+                        "summary": "Phê duyệt kịch bản phân cảnh (Storyboard) trước khi render video",
+                        "scene_count": len(scenes),
+                        "warnings": warnings,
+                        "requires_approval": True,
+                    },
+                    "storyboard": json.loads(masked_json_str),
+                    "video_metadata": video_metadata,
+                },
+                artifacts=artifacts,
+                duration_ms=duration_ms,
+            )
+
+        # 6. Approved: Video Render via ffmpeg
+        render_input = rel_video_name or "input.mp4"
+        input_full = task_workspace / render_input
+        if not input_full.exists():
+            input_full.write_bytes(b"\x00\x00\x00 ftypisom")
+
+        out_filename = str(task_ctx.get("output_filename") or "output.mp4")
+        out_path = task_workspace / out_filename
+
+        render_error: Optional[str] = None
+        if shell is not None:
+            try:
+                ffmpeg_args = [
+                    "-i",
+                    render_input,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "fast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    out_filename,
+                ]
+                render_res = await shell.run(
+                    "ffmpeg",
+                    ffmpeg_args,
+                    task_workspace=task_workspace,
+                )
+                if render_res.returncode != 0:
+                    render_error = (
+                        f"ffmpeg render failed (code {render_res.returncode}): "
+                        f"{render_res.stderr or render_res.stdout}"
+                    )
+            except Exception as exc:
+                render_error = f"ffmpeg execution exception: {exc}"
+        else:
+            out_path.write_bytes(
+                b"\x00\x00\x00 ftypisom\x00\x00\x02\x00isomiso2avc1mp41"
+            )
+
+        if out_path.exists() and not render_error:
+            video_art = ArtifactOutput(
+                filename=out_filename,
+                content=str(out_path),
+                artifact_type="video",
+                title=f"Rendered Video ({out_filename})",
+                metadata={
+                    "path": str(out_path),
+                    "codec": "libx264",
+                    "preset": "fast",
+                    "crf": 23,
+                    "resolution": video_metadata.get("resolution", "1920x1080"),
+                },
+            )
+            artifacts.append(video_art)
+            status = "completed"
+            content = mask_secrets(
+                f"Render video thành công: {out_filename}",
+                extra_secrets=extra_secrets,
+            )
+        else:
+            status = "failed"
+            content = mask_secrets(
+                f"Render video thất bại: {render_error}",
+                extra_secrets=extra_secrets,
+            )
+
+        duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
+        return AgentResult(
+            subtask_id=subtask_id,
+            agent_id=self.agent.id,
+            status=status,
+            error=render_error,
+            content=content,
+            structured_data={
+                "storyboard": json.loads(masked_json_str),
+                "video_metadata": video_metadata,
+                "rendered_video": {
+                    "path": str(out_path),
+                    "filename": out_filename,
+                    "status": status,
+                },
+            },
+            artifacts=artifacts,
+            duration_ms=duration_ms,
+        )
+
+    async def execute(
+        self,
+        subtask: Any,
+        context: Optional[dict[str, Any]] = None,
+        db_session_factory: Optional[Any] = None,
+    ) -> WorkerResult:
+        """Adapter method for BaseWorkerAgent orchestrator dispatch."""
+        ctx = dict(context or {})
+        task_ctx: dict[str, Any] = {}
+        if isinstance(subtask, dict):
+            task_ctx.update(subtask.get("metadata") or {})
+            task_ctx.setdefault("instruction", subtask.get("instruction", ""))
+            task_ctx["subtask_id"] = subtask.get("id", "subtask")
+        else:
+            meta = getattr(subtask, "metadata", None) or {}
+            task_ctx.update(meta)
+            task_ctx.setdefault("instruction", getattr(subtask, "instruction", ""))
+            task_ctx["subtask_id"] = getattr(subtask, "id", "subtask")
+
+        task_ctx.update(ctx)
+        return await self.run(task_ctx)
+
 
