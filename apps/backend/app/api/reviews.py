@@ -231,6 +231,7 @@ async def create_review_gate(
     """Create a pending Human-in-the-Loop review gate for an existing Task."""
     task_lock = _get_task_review_lock(request, payload.task_id)
     async with task_lock:
+        db.rollback()
         db.expire_all()
         task = db.get(Task, payload.task_id)
         if task is None:
@@ -413,13 +414,19 @@ async def decide_review_gate(
     """Submit a human decision ('approve', 'edit', or 'reject') on a pending ReviewGate."""
     initial_review = db.get(ReviewGate, review_id)
     if initial_review is None:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"ReviewGate '{review_id}' not found",
         )
 
-    task_lock = _get_task_review_lock(request, initial_review.task_id)
+    locked_task_id = initial_review.task_id
+    # End pre-lock SQLite read transaction before awaiting task_lock so we never hold a stale snapshot
+    db.rollback()
+
+    task_lock = _get_task_review_lock(request, locked_task_id)
     async with task_lock:
+        db.rollback()
         db.expire_all()
         review = db.get(ReviewGate, review_id)
         if review is None:
@@ -501,8 +508,9 @@ async def decide_review_gate(
                 )
 
         extra_secrets = _get_extra_secrets(request)
+        raw_actor = payload.actor.strip() or "user"
         masked_actor = str(
-            mask_secrets(payload.actor.strip(), extra_secrets=extra_secrets)
+            mask_secrets(raw_actor, extra_secrets=extra_secrets)
         )[:64]
         masked_feedback = (
             mask_secrets(raw_feedback.strip(), extra_secrets=extra_secrets)
@@ -594,6 +602,7 @@ async def decide_review_gate(
                     )
 
         # Reload fresh state and perform all DB updates + FSM transitions in ONE atomic commit
+        db.rollback()
         db.expire_all()
         review = db.get(ReviewGate, review_id)
         task = db.get(Task, task_id)

@@ -759,3 +759,92 @@ async def test_concurrent_decide_requests_yield_one_200_and_one_409(tmp_path: Pa
     codes = sorted([r1.status_code, r2.status_code])
     assert codes == [200, 409]
 
+
+@pytest.mark.asyncio
+async def test_waiting_request_sees_fresh_snapshot_after_reverted_claim_and_blank_actor_defaults(
+    tmp_path: Path, monkeypatch
+):
+    """[Round 2 Fix] Request waiting on task_lock must drop stale SQLite snapshot after claim revert,
+    and whitespace-only actor must fall back to 'user'."""
+    import threading
+
+    settings = AppSettings(
+        db_path=tmp_path / "round2" / "app.db",
+        local_auth_token="test-r2-tok",
+    )
+    app = create_app(settings)
+    now = datetime.now(timezone.utc)
+    with app.state.session_factory() as db:
+        db.add(
+            Task(
+                id="task-r2-snap",
+                project_id="proj-default",
+                title="Snapshot freshness task",
+                status=TaskStatus.WAITING_REVIEW,
+            )
+        )
+        db.add(
+            ReviewGate(
+                id="rev-r2-snap",
+                task_id="task-r2-snap",
+                gate_type="hil",
+                status="pending",
+                expires_at=now + timedelta(hours=24),
+            )
+        )
+        db.commit()
+
+    resume_entered = threading.Event()
+    allow_resume_finish = threading.Event()
+    call_count = 0
+
+    def controlled_resume(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            resume_entered.set()
+            assert allow_resume_finish.wait(timeout=3.0)
+            raise RuntimeError("transient checkpoint error")
+        return None
+
+    monkeypatch.setattr("app.api.reviews._resume_graph_if_interrupted", controlled_resume)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"X-Local-Auth-Token": "test-r2-tok"},
+    ) as ac:
+        req_a = asyncio.create_task(
+            ac.patch(
+                "/api/v1/reviews/rev-r2-snap/decide",
+                json={"decision": "approve"},
+            )
+        )
+
+        # Wait until Request A holds task_lock and has committed status='processing'
+        for _ in range(100):
+            if resume_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert resume_entered.is_set()
+
+        # Start Request B while Request A holds task_lock (Request B reads initial_review='processing' and blocks on lock)
+        req_b = asyncio.create_task(
+            ac.patch(
+                "/api/v1/reviews/rev-r2-snap/decide",
+                json={"decision": "approve", "actor": "   "},
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        # Release Request A -> fails, reverts 'processing' -> 'pending', releases lock
+        allow_resume_finish.set()
+        resp_a, resp_b = await asyncio.gather(req_a, req_b)
+
+    assert resp_a.status_code == 500
+    assert resp_b.status_code == 200
+    assert resp_b.json()["data"]["status"] == "approved"
+    assert resp_b.json()["data"]["actor"] == "user"
+
+
