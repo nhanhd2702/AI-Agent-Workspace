@@ -7,6 +7,18 @@ from app.mcp.browser_server import (
     BrowserPolicyError,
     CaptchaRequiredError,
 )
+from app.mcp.external_apis import (
+    ConnectorHealthResult,
+    ExternalApiError,
+    NotionClient,
+    NotionPageResult,
+    SheetsAppendResult,
+    SheetsClient,
+    TranscriptResult,
+    VideoMeta,
+    YouTubeClient,
+    build_connector_client,
+)
 from app.mcp.gateway import McpGateway
 from app.mcp.security import (
     SecurityPolicyError,
@@ -26,12 +38,22 @@ __all__ = [
     "BrowserGateStatus",
     "BrowserPolicyError",
     "CaptchaRequiredError",
+    "ConnectorHealthResult",
     "DEFAULT_ALLOWED_EXECUTABLES",
+    "ExternalApiError",
     "McpGateway",
+    "NotionClient",
+    "NotionPageResult",
     "SecurityPolicyError",
+    "SheetsAppendResult",
+    "SheetsClient",
     "ShellExecutor",
     "ShellResult",
     "ShellTimeoutError",
+    "TranscriptResult",
+    "VideoMeta",
+    "YouTubeClient",
+    "build_connector_client",
     "validate_safe_http_url",
     "validate_task_workspace",
 ]
