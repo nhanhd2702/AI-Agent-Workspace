@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.agents import agents_router, departments_router
-from app.api.artifacts import router as artifacts_router
+from app.api.artifacts import files_router, router as artifacts_router
 from app.api.monitoring import router as monitoring_router
 from app.api.projects import router as projects_router
 from app.api.reviews import router as reviews_router
@@ -64,6 +64,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(agents_router)
     app.include_router(departments_router)
     app.include_router(artifacts_router)
+    app.include_router(files_router)
     app.include_router(monitoring_router)
     app.include_router(reviews_router)
     app.include_router(ws_router)

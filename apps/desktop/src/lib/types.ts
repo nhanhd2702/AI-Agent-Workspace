@@ -230,6 +230,35 @@ export interface ReviewDecidePayload {
   actor?: string;
 }
 
+export interface StoryboardSceneData {
+  sceneId: string;
+  scene_id?: string;
+  start?: number;
+  end?: number;
+  durationSec?: number;
+  duration?: number;
+  overlayText: string;
+  overlay_text?: string;
+  effect: string;
+  visualNotes?: string;
+  visual_notes?: string;
+  transition?: string;
+  startSec?: number;
+  endSec?: number;
+}
+
+export interface StoryboardData {
+  styleName?: string;
+  style_name?: string;
+  totalDuration?: number;
+  total_duration?: number;
+  sceneCount?: number;
+  scene_count?: number;
+  warnings?: string[];
+  pacing_warnings?: string[];
+  scenes: StoryboardSceneData[];
+}
+
 export interface ApiResponse<T> {
   status: "success" | "error";
   data: T;

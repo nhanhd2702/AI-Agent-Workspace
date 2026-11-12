@@ -10,6 +10,8 @@ import {
   ReviewDecidePayload,
   ReviewDecision,
   ReviewGate,
+  StoryboardData,
+  StoryboardSceneData,
   TaskLogEntry,
 } from "./types";
 
@@ -451,6 +453,97 @@ export class ApiClient {
       }
     );
     return this.normalizeReview(raw);
+  }
+
+  public streamMediaUrl(targetId: string, isFileRoute = false): string {
+    const route = isFileRoute ? "files" : "artifacts";
+    return `${this.baseUrl}/api/v1/${route}/${encodeURIComponent(targetId)}/stream`;
+  }
+
+  public async getArtifactStoryboard(artifactId: string): Promise<StoryboardData> {
+    const raw = await this.request<any>(
+      `/api/v1/artifacts/${encodeURIComponent(artifactId)}/storyboard`
+    );
+    return this.normalizeStoryboard(raw);
+  }
+
+  public async updateStoryboardScene(
+    artifactId: string,
+    sceneId: string,
+    payload: {
+      action?: "delete" | string;
+      deleted?: boolean;
+      overlayText?: string;
+      overlay_text?: string;
+      effect?: string;
+      visualNotes?: string;
+      visual_notes?: string;
+      durationSec?: number;
+      duration?: number;
+    }
+  ): Promise<StoryboardData> {
+    const raw = await this.request<any>(
+      `/api/v1/artifacts/${encodeURIComponent(artifactId)}/storyboard/scenes/${encodeURIComponent(sceneId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          action: payload.action,
+          deleted: payload.deleted,
+          overlay_text: payload.overlayText ?? payload.overlay_text,
+          effect: payload.effect,
+          visual_notes: payload.visualNotes ?? payload.visual_notes,
+          duration: payload.durationSec ?? payload.duration,
+        }),
+      }
+    );
+    return this.normalizeStoryboard(raw);
+  }
+
+  private normalizeStoryboard(raw: any): StoryboardData {
+    if (!raw) {
+      return {
+        styleName: "Rainmaker Style",
+        totalDuration: 0,
+        warnings: [],
+        scenes: [],
+      };
+    }
+    const rawScenes = Array.isArray(raw.scenes) ? raw.scenes : [];
+    const scenes: StoryboardSceneData[] = rawScenes.map((s: any, idx: number) => {
+      const dur = Number(s.durationSec ?? s.duration ?? (s.end && s.start ? s.end - s.start : 3.0));
+      return {
+        sceneId: String(s.sceneId || s.scene_id || s.id || `s${idx + 1}`),
+        scene_id: String(s.scene_id || s.sceneId || s.id || `s${idx + 1}`),
+        start: s.start !== undefined ? Number(s.start) : undefined,
+        end: s.end !== undefined ? Number(s.end) : undefined,
+        startSec: s.startSec !== undefined ? Number(s.startSec) : s.start !== undefined ? Number(s.start) : undefined,
+        endSec: s.endSec !== undefined ? Number(s.endSec) : s.end !== undefined ? Number(s.end) : undefined,
+        durationSec: dur,
+        duration: dur,
+        overlayText: String(s.overlayText ?? s.overlay_text ?? s.text ?? ""),
+        overlay_text: String(s.overlay_text ?? s.overlayText ?? s.text ?? ""),
+        effect: String(s.effect || "none"),
+        visualNotes: s.visualNotes ?? s.visual_notes ?? "",
+        visual_notes: s.visual_notes ?? s.visualNotes ?? "",
+        transition: s.transition ?? "cut",
+      };
+    });
+
+    const calcTotal = Number(
+      raw.totalDuration ?? raw.total_duration ?? scenes.reduce((acc, s) => acc + (s.durationSec || 0), 0)
+    );
+
+    return {
+      styleName: raw.styleName || raw.style_name || "Rainmaker Style",
+      style_name: raw.style_name || raw.styleName || "Rainmaker Style",
+      totalDuration: calcTotal,
+      total_duration: calcTotal,
+      sceneCount: scenes.length,
+      scene_count: scenes.length,
+      warnings: Array.isArray(raw.warnings) ? raw.warnings : Array.isArray(raw.pacing_warnings) ? raw.pacing_warnings : [],
+      pacing_warnings: Array.isArray(raw.pacing_warnings) ? raw.pacing_warnings : Array.isArray(raw.warnings) ? raw.warnings : [],
+      scenes,
+    };
   }
 
   private normalizeTask(raw: any): BoardTask {
