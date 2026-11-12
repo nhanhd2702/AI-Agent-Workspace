@@ -10,7 +10,11 @@ from app.config import AppSettings
 from app.db.models import Agent, SubTask, Task, TaskAuditLog, TaskStatus
 from app.db.session import init_db, seed_defaults
 from app.main import create_app
-from app.orchestrator.graph import OrchestratorGraph, recover_interrupted_tasks
+from app.orchestrator.graph import (
+    OrchestratorGraph,
+    _parse_review_decision,
+    recover_interrupted_tasks,
+)
 from app.orchestrator.parser import TASK_TYPES, TaskParser
 from app.orchestrator.planner import DagCycleError, DagPlanner, ExecutionPlan, SubTaskNode
 
@@ -394,3 +398,153 @@ def test_fastapi_lifespan_recovers_interrupted_tasks_on_startup(tmp_path: Path):
         assert audit is not None
         assert audit.actor == "system"
         assert audit.reason == "crash_recovery"
+
+
+# --- 5. Fix Round 1/5 Regression Tests ---
+
+
+def test_build_plan_preserves_evicted_template_agent_when_also_mentioned(db_session):
+    """[IMP-2] When @UIDesigner evicts DeepResearcher on nodes[0], @DeepResearcher is still included."""
+    agents = db_session.query(Agent).all()
+    parser = TaskParser()
+    intent = parser.parse(
+        "@UIDesigner @DeepResearcher viết bài phân tích trang đích",
+        known_agents=[a.name for a in agents],
+        record_history=False,
+    )
+    intent.task_type = "copywriting"
+
+    plan = DagPlanner.build_plan(intent, agents, task_id="t-evict", mode=" COPILOT ")
+    assert plan.mode == "copilot"
+    assigned_ids = {n.agent_id for n in plan.nodes}
+    assert "agent-ui-designer" in assigned_ids
+    assert "agent-deep-researcher" in assigned_ids
+    assert "agent-content-writer" in assigned_ids
+    DagPlanner.validate_dag(plan.nodes)
+
+    with pytest.raises(ValueError, match="Invalid mode"):
+        DagPlanner.build_plan(intent, agents, task_id="t-bad-mode", mode="invalid_mode")
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"decision": " reject "}, False),
+        ({"decision": "maybe"}, False),
+        ({"approved": "false"}, False),
+        ({"approved": "0"}, False),
+        ({"approved": "maybe"}, False),
+        ({"approved": 1}, False),
+        ({}, False),
+        ("maybe", False),
+        (" reject ", False),
+        (False, False),
+        (None, False),
+        ("approve", True),
+        (" YES ", True),
+        ({"decision": " approved "}, True),
+        ({"approved": "true"}, True),
+        ({"approved": True}, True),
+        (True, True),
+    ],
+)
+def test_parse_review_decision_strict_fail_closed(payload, expected: bool):
+    """[IMP-1] HIL review decision parsing fails closed on ambiguous/reject inputs."""
+    approved, record = _parse_review_decision(payload)
+    assert approved is expected
+    assert record["approved"] is expected
+
+
+def test_orchestrator_graph_resume_guards_multi_wave_hil_and_closed_check(tmp_path: Path):
+    """[IMP-3] Guard resume() on nonexistent/completed threads, handle 2+ HIL gates, and guard close()."""
+    cp_db = tmp_path / "checkpoints.db"
+    nodes = [
+        SubTaskNode(id="w1", agent_id="DeepResearcher", instruction="Research", requires_review=True),
+        SubTaskNode(id="w2", agent_id="ContentWriter", instruction="Draft", depends_on=["w1"], requires_review=True),
+        SubTaskNode(id="w3", agent_id="ReportAgent", instruction="Deliver", depends_on=["w2"], requires_review=False),
+    ]
+    ordered = DagPlanner.validate_dag(nodes)
+    plan = ExecutionPlan(
+        task_id="task-multi-hil",
+        task_type="content_research",
+        nodes=ordered,
+        waves=DagPlanner.compute_waves(ordered),
+        mode="copilot",
+    )
+
+    executed: list[str] = []
+    graph = OrchestratorGraph(
+        checkpoint_db_path=cp_db,
+        node_executor=lambda n, s: executed.append(n["id"]) or {"ok": n["id"]},
+    )
+
+    # Nonexistent thread raises ValueError
+    with pytest.raises(ValueError, match="not currently interrupted"):
+        graph.resume("nonexistent-thread", True)
+
+    # Wave 1 hits first HIL gate
+    p1 = graph.run(plan, thread_id="thread-multi-1")
+    assert "__interrupt__" in p1
+    assert executed == ["w1"]
+    assert graph.is_interrupted("thread-multi-1") is True
+
+    # Resume wave 1 -> runs wave 2 -> hits second HIL gate
+    p2 = graph.resume("thread-multi-1", {"approved": True, "note": "w1 ok"})
+    assert "__interrupt__" in p2
+    assert executed == ["w1", "w2"]
+    assert graph.is_interrupted("thread-multi-1") is True
+
+    # Resume wave 2 -> runs wave 3 -> completes
+    p3 = graph.resume("thread-multi-1", {"approved": True, "note": "w2 ok"})
+    assert "__interrupt__" not in p3
+    assert p3["status"] == "completed"
+    assert executed == ["w1", "w2", "w3"]
+    assert graph.is_interrupted("thread-multi-1") is False
+
+    # Already-completed thread raises ValueError and does not re-run final wave
+    with pytest.raises(ValueError, match="not currently interrupted"):
+        graph.resume("thread-multi-1", True)
+    assert executed == ["w1", "w2", "w3"]
+
+    # Closed connection guards
+    graph.close()
+    graph.close()  # idempotent
+    with pytest.raises(RuntimeError, match="closed"):
+        graph.run(plan, thread_id="thread-after-close")
+    with pytest.raises(RuntimeError, match="closed"):
+        graph.resume("thread-multi-1", True)
+    with pytest.raises(RuntimeError, match="closed"):
+        graph.get_state("thread-multi-1")
+    with pytest.raises(RuntimeError, match="closed"):
+        graph.is_interrupted("thread-multi-1")
+
+
+def test_recover_interrupted_tasks_waiting_review_subtasks_and_rollback(db_session, monkeypatch):
+    """[IMP-4] Pause waiting_review subtasks and roll back cleanly if transition() raises."""
+    db_session.add(
+        Task(id="t-wr-sub", project_id="proj-default", title="With WR Subtask", status=TaskStatus.RUNNING)
+    )
+    db_session.add(
+        SubTask(id="st-wr", task_id="t-wr-sub", title="Gate step", status="waiting_review")
+    )
+    db_session.commit()
+
+    # First verify rollback when TaskStateMachine.transition fails mid-recovery
+    def failing_transition(*args, **kwargs):
+        raise RuntimeError("simulated transition failure")
+
+    monkeypatch.setattr("app.orchestrator.graph.TaskStateMachine.transition", failing_transition)
+    with pytest.raises(RuntimeError, match="simulated transition failure"):
+        recover_interrupted_tasks(db_session)
+
+    # SubTask must still be waiting_review (uncommitted mutation rolled back)
+    db_session.expire_all()
+    assert db_session.get(SubTask, "st-wr").status == "waiting_review"
+    assert db_session.get(Task, "t-wr-sub").status == TaskStatus.RUNNING
+
+    # Restore real transition and verify waiting_review subtask moves to paused
+    monkeypatch.undo()
+    recovered = recover_interrupted_tasks(db_session)
+    assert recovered == 1
+    assert db_session.get(Task, "t-wr-sub").status == TaskStatus.PAUSED
+    assert db_session.get(SubTask, "st-wr").status == "paused"

@@ -61,25 +61,29 @@ def recover_interrupted_tasks(session: Session) -> int:
     recovered_count = 0
 
     for task in running_tasks:
-        in_flight_subtasks = (
-            session.query(SubTask)
-            .filter(
-                SubTask.task_id == task.id,
-                SubTask.status.in_(["running", "in_progress"]),
+        try:
+            in_flight_subtasks = (
+                session.query(SubTask)
+                .filter(
+                    SubTask.task_id == task.id,
+                    SubTask.status.in_(["running", "in_progress", "waiting_review"]),
+                )
+                .all()
             )
-            .all()
-        )
-        for subtask in in_flight_subtasks:
-            subtask.status = "paused"
+            for subtask in in_flight_subtasks:
+                subtask.status = "paused"
 
-        TaskStateMachine.transition(
-            session=session,
-            task_id=task.id,
-            target_state=TaskStatus.PAUSED,
-            actor="system",
-            reason="crash_recovery",
-        )
-        recovered_count += 1
+            TaskStateMachine.transition(
+                session=session,
+                task_id=task.id,
+                target_state=TaskStatus.PAUSED,
+                actor="system",
+                reason="crash_recovery",
+            )
+            recovered_count += 1
+        except Exception:
+            session.rollback()
+            raise
 
     return recovered_count
 
@@ -94,28 +98,46 @@ def _default_node_executor(node: dict[str, Any], state: dict[str, Any]) -> dict[
     }
 
 
+_APPROVE_STRINGS = frozenset({"approve", "approved", "yes", "true", "ok", "1"})
+_REJECT_STRINGS = frozenset({"reject", "rejected", "no", "false", "deny", "denied", "0"})
+
+
+def _parse_bool_or_decision_str(value: Any) -> Optional[bool]:
+    """Parse strict boolean or known approve/reject string; return None if unrecognized."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _APPROVE_STRINGS:
+            return True
+        if normalized in _REJECT_STRINGS:
+            return False
+    return None
+
+
 def _parse_review_decision(decision: Any) -> tuple[bool, dict[str, Any]]:
-    """Normalize HIL resume payload into (approved, normalized_record)."""
+    """Normalize HIL resume payload into (approved, normalized_record), failing closed."""
     if isinstance(decision, bool):
         return decision, {"approved": decision}
     if isinstance(decision, str):
-        approved = decision.strip().lower() in {"approve", "approved", "yes", "true", "ok"}
+        approved = decision.strip().lower() in _APPROVE_STRINGS
         return approved, {"approved": approved, "decision": decision}
     if isinstance(decision, dict):
         if "approved" in decision:
-            approved = bool(decision["approved"])
+            parsed = _parse_bool_or_decision_str(decision["approved"])
+            approved = bool(parsed) if parsed is not None else False
         else:
-            approved = str(decision.get("decision", "approved")).lower() not in {
-                "reject",
-                "rejected",
-                "no",
-                "false",
-            }
+            raw_decision = decision.get("decision")
+            if isinstance(raw_decision, str):
+                approved = raw_decision.strip().lower() in _APPROVE_STRINGS
+            elif isinstance(raw_decision, bool):
+                approved = raw_decision
+            else:
+                approved = False
         record = dict(decision)
         record["approved"] = approved
         return approved, record
-    approved = bool(decision)
-    return approved, {"approved": approved, "value": decision}
+    return False, {"approved": False, "value": decision}
 
 
 class OrchestratorGraph:
@@ -250,6 +272,10 @@ class OrchestratorGraph:
             return {"status": "rejected"}
         return {"status": "completed"}
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("OrchestratorGraph connection is closed")
+
     def run(
         self,
         plan: ExecutionPlan,
@@ -257,6 +283,7 @@ class OrchestratorGraph:
         initial_context: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Execute an ExecutionPlan from wave 0 under the given thread_id."""
+        self._ensure_open()
         tid = thread_id or plan.task_id
         initial_state: OrchestratorState = {
             "task_id": plan.task_id,
@@ -279,6 +306,9 @@ class OrchestratorGraph:
 
     def resume(self, thread_id: str, decision: Any = True) -> dict[str, Any]:
         """Resume an interrupted graph execution from checkpoints.db."""
+        self._ensure_open()
+        if not self.is_interrupted(thread_id):
+            raise ValueError(f"Thread '{thread_id}' is not currently interrupted")
         return self._graph.invoke(
             Command(resume=decision),
             config={"configurable": {"thread_id": thread_id}},
@@ -286,10 +316,12 @@ class OrchestratorGraph:
 
     def get_state(self, thread_id: str) -> StateSnapshot:
         """Retrieve current LangGraph StateSnapshot for thread_id."""
+        self._ensure_open()
         return self._graph.get_state(config={"configurable": {"thread_id": thread_id}})
 
     def is_interrupted(self, thread_id: str) -> bool:
         """Return True when the thread is currently paused at an HIL interrupt()."""
+        self._ensure_open()
         snapshot = self.get_state(thread_id)
         if snapshot is None or not snapshot.tasks:
             return False

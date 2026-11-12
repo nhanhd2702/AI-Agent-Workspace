@@ -381,6 +381,12 @@ class DagPlanner:
         mode: str = "autopilot",
     ) -> ExecutionPlan:
         """Build and validate a multi-step DAG ExecutionPlan from ParsedIntent."""
+        normalized_mode = (mode or "autopilot").strip().lower()
+        if normalized_mode not in {"autopilot", "copilot"}:
+            raise ValueError(
+                f"Invalid mode '{mode}': expected 'autopilot' or 'copilot'"
+            )
+
         resolved_task_id = task_id or f"task-{uuid.uuid4().hex[:12]}"
         task_type = intent.task_type if intent.task_type in _TASK_TYPE_TEMPLATES else "general"
         template = _TASK_TYPE_TEMPLATES[task_type]
@@ -399,7 +405,7 @@ class DagPlanner:
                     agent_id=resolved_id,
                     instruction=instr_tpl.format(goal=goal_summary),
                     depends_on=list(deps),
-                    requires_review=bool(is_gate and mode == "copilot"),
+                    requires_review=bool(is_gate and normalized_mode == "copilot"),
                     metadata={
                         "agent_name": resolved_name,
                         "task_type": task_type,
@@ -411,13 +417,12 @@ class DagPlanner:
 
         # Ensure every @mentioned agent is represented in the DAG without exceeding 10 nodes
         if intent.mentioned_agents:
-            assigned_names = {
-                str(n.metadata.get("agent_name", n.agent_id)).lower() for n in nodes
-            }
-            assigned_ids = {n.agent_id.lower() for n in nodes}
-
             for idx, mentioned in enumerate(intent.mentioned_agents):
                 m_id, m_name = cls._resolve_agent(mentioned, lookup)
+                assigned_names = {
+                    str(n.metadata.get("agent_name", n.agent_id)).lower() for n in nodes
+                }
+                assigned_ids = {n.agent_id.lower() for n in nodes}
                 if m_name.lower() in assigned_names or m_id.lower() in assigned_ids:
                     continue
 
@@ -425,8 +430,6 @@ class DagPlanner:
                     # Assign primary mentioned agent to the first execution node
                     nodes[0].agent_id = m_id
                     nodes[0].metadata["agent_name"] = m_name
-                    assigned_names.add(m_name.lower())
-                    assigned_ids.add(m_id.lower())
                 elif len(nodes) < cls.MAX_NODES:
                     # Append specialized parallel/final collaboration step depending on previous leaf
                     leaf_ids = [
@@ -449,8 +452,6 @@ class DagPlanner:
                             },
                         )
                     )
-                    assigned_names.add(m_name.lower())
-                    assigned_ids.add(m_id.lower())
 
         # Enforce hard 10-node ceiling before validation
         nodes = nodes[: cls.MAX_NODES]
@@ -462,5 +463,5 @@ class DagPlanner:
             task_type=task_type,
             nodes=ordered,
             waves=waves,
-            mode=mode,
+            mode=normalized_mode,
         )
