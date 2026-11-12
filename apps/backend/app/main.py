@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api.agents import agents_router, departments_router
 from app.api.artifacts import router as artifacts_router
 from app.api.monitoring import router as monitoring_router
+from app.api.reviews import router as reviews_router
 from app.api.tasks import router as tasks_router
 from app.api.ws import TaskWebSocketManager, router as ws_router
 from app.config import AppSettings, get_settings
@@ -48,6 +49,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     )
     app.state.settings = resolved_settings
     app.state.session_factory = factory
+    app.state.checkpoint_db_path = (
+        resolved_settings.workspace_dir / "checkpoints.db"
+    ).resolve()
     app.state.ws_manager = TaskWebSocketManager(
         extra_secrets=[resolved_settings.local_auth_token]
     )
@@ -59,6 +63,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(departments_router)
     app.include_router(artifacts_router)
     app.include_router(monitoring_router)
+    app.include_router(reviews_router)
     app.include_router(ws_router)
 
     # CORS configuration for desktop Next.js / Tauri shell

@@ -90,6 +90,39 @@ export interface SidebarTaskItem {
   group?: TimeGroup;
 }
 
+export type ReviewDecision = "approve" | "edit" | "reject";
+
+export interface ReviewGate {
+  id: string;
+  taskId?: string;
+  task_id?: string;
+  checkpointId?: string | null;
+  checkpoint_id?: string | null;
+  gateType?: string;
+  gate_type?: string;
+  status?: "pending" | "approved" | "edited" | "rejected" | "expired" | string;
+  decision?: ReviewDecision | string | null;
+  feedbackText?: string | null;
+  feedback_text?: string | null;
+  actor?: string | null;
+  summary?: string | null;
+  payload?: unknown;
+  editedContent?: string | null;
+  edited_content?: string | null;
+  expiresAt?: string | null;
+  expires_at?: string | null;
+  decidedAt?: string | null;
+  decided_at?: string | null;
+  createdAt?: string | null;
+  created_at?: string | null;
+}
+
+export interface ReviewDecidePayload {
+  feedbackText?: string;
+  editedContent?: string;
+  actor?: string;
+}
+
 export interface ApiResponse<T> {
   status: "success" | "error";
   data: T;

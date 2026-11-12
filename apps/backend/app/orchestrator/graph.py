@@ -98,7 +98,7 @@ def _default_node_executor(node: dict[str, Any], state: dict[str, Any]) -> dict[
     }
 
 
-_APPROVE_STRINGS = frozenset({"approve", "approved", "yes", "true", "ok", "1"})
+_APPROVE_STRINGS = frozenset({"approve", "approved", "edit", "edited", "yes", "true", "ok", "1"})
 _REJECT_STRINGS = frozenset({"reject", "rejected", "no", "false", "deny", "denied", "0"})
 
 

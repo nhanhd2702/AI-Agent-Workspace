@@ -1,4 +1,13 @@
-import { Agent, ApiError, ApiResponse, ExecutionMode, ParsedTask } from "./types";
+import {
+  Agent,
+  ApiError,
+  ApiResponse,
+  ExecutionMode,
+  ParsedTask,
+  ReviewDecidePayload,
+  ReviewDecision,
+  ReviewGate,
+} from "./types";
 
 export interface ApiClientConfig {
   baseUrl?: string;
@@ -166,6 +175,89 @@ export class ApiClient {
     const qs = params.toString() ? `?${params.toString()}` : "";
     const history = await this.request<string[]>(`/api/v1/tasks/history${qs}`);
     return history || [];
+  }
+
+  /**
+   * List Human-in-the-Loop review gates with optional task or status filtering.
+   */
+  async listReviews(taskId?: string, status?: string): Promise<ReviewGate[]> {
+    const params = new URLSearchParams();
+    if (taskId) params.append("task_id", taskId);
+    if (status) params.append("status", status);
+
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const rawReviews = await this.request<any[]>(`/api/v1/reviews${qs}`);
+    return (rawReviews || []).map((raw) => this.normalizeReview(raw));
+  }
+
+  /**
+   * Create a new pending Human-in-the-Loop review gate for a task.
+   */
+  async createReview(payload: {
+    taskId: string;
+    gateType?: string;
+    summary?: string;
+    payload?: unknown;
+    expiresInHours?: number;
+  }): Promise<ReviewGate> {
+    const raw = await this.request<any>("/api/v1/reviews", {
+      method: "POST",
+      body: JSON.stringify({
+        task_id: payload.taskId,
+        gate_type: payload.gateType || "hil",
+        summary: payload.summary,
+        payload: payload.payload,
+        expires_in_hours: payload.expiresInHours,
+      }),
+    });
+    return this.normalizeReview(raw);
+  }
+
+  /**
+   * Submit a human decision ('approve', 'edit', or 'reject') on a review gate.
+   */
+  async decideReview(
+    reviewId: string,
+    decision: ReviewDecision,
+    payload?: ReviewDecidePayload
+  ): Promise<ReviewGate> {
+    const raw = await this.request<any>(`/api/v1/reviews/${reviewId}/decide`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        decision,
+        feedback_text: payload?.feedbackText,
+        edited_content: payload?.editedContent,
+        actor: payload?.actor || "user",
+      }),
+    });
+    return this.normalizeReview(raw);
+  }
+
+  private normalizeReview(raw: any): ReviewGate {
+    return {
+      id: raw.id,
+      taskId: raw.taskId || raw.task_id,
+      task_id: raw.task_id || raw.taskId,
+      checkpointId: raw.checkpointId ?? raw.checkpoint_id ?? null,
+      checkpoint_id: raw.checkpoint_id ?? raw.checkpointId ?? null,
+      gateType: raw.gateType || raw.gate_type || "hil",
+      gate_type: raw.gate_type || raw.gateType || "hil",
+      status: raw.status || "pending",
+      decision: raw.decision ?? null,
+      feedbackText: raw.feedbackText ?? raw.feedback_text ?? null,
+      feedback_text: raw.feedback_text ?? raw.feedbackText ?? null,
+      actor: raw.actor ?? null,
+      summary: raw.summary ?? null,
+      payload: raw.payload ?? null,
+      editedContent: raw.editedContent ?? raw.edited_content ?? null,
+      edited_content: raw.edited_content ?? raw.editedContent ?? null,
+      expiresAt: raw.expiresAt ?? raw.expires_at ?? null,
+      expires_at: raw.expires_at ?? raw.expiresAt ?? null,
+      decidedAt: raw.decidedAt ?? raw.decided_at ?? null,
+      decided_at: raw.decided_at ?? raw.decidedAt ?? null,
+      createdAt: raw.createdAt ?? raw.created_at ?? null,
+      created_at: raw.created_at ?? raw.createdAt ?? null,
+    };
   }
 
   private normalizeAgent(raw: any): Agent {
