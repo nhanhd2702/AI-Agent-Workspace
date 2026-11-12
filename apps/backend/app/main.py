@@ -2,7 +2,9 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.tasks import router as tasks_router
 from app.config import AppSettings, get_settings
+from app.db.session import init_db, seed_defaults
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
@@ -15,6 +17,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         description="FastAPI sidecar daemon for AI Agent Workspace (Văn Phòng AI)",
     )
     app.state.settings = resolved_settings
+
+    # Initialize SQLite database and seed defaults for the active settings
+    factory = init_db(resolved_settings.resolved_db_path)
+    with factory() as db_session:
+        seed_defaults(db_session)
+
+    # Mount API routers
+    app.include_router(tasks_router)
 
     # CORS configuration for desktop Next.js / Tauri shell
     app.add_middleware(

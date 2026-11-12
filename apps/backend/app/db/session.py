@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+from starlette.requests import Request
 
 from app.db.models import (
     Agent,
@@ -322,8 +323,25 @@ def seed_defaults(session: Session) -> None:
     session.commit()
 
 
-def get_db(db_path: Optional[Path | str] = None) -> Generator[Session, None, None]:
-    """FastAPI dependency for yielding database sessions."""
-    SessionLocal = init_db(db_path, cache=True)
+def get_db(
+    request: Request = None,  # type: ignore[assignment]
+    db_path: Optional[Path | str] = None,
+) -> Generator[Session, None, None]:
+    """FastAPI dependency for yielding database sessions.
+
+    Supports both FastAPI dependency injection (resolving db_path from request.app.state.settings)
+    and direct function calls get_db(db_path) for test suites.
+    """
+    resolved_path: Optional[Path | str] = None
+    if isinstance(request, Request):
+        app_settings = getattr(request.app.state, "settings", None)
+        if app_settings is not None:
+            resolved_path = app_settings.resolved_db_path
+    elif isinstance(request, (Path, str)):
+        resolved_path = request
+    elif db_path is not None:
+        resolved_path = db_path
+
+    SessionLocal = init_db(resolved_path, cache=True)
     with SessionLocal() as session:
         yield session
