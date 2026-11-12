@@ -155,6 +155,14 @@ def test_target_agent_input_contract_validation(db_session):
             artifact_ids=[],
         )
 
+    # Whitespace-only or blank required key rejected
+    with pytest.raises(HandoffContractError, match="missing required keys"):
+        mgr.validate_input_contract(
+            target_agent,
+            payload={"brief": "   ", "target_audience": "B2B Tech"},
+            artifact_ids=[],
+        )
+
     # All keys present
     mgr.validate_input_contract(
         target_agent,
@@ -183,12 +191,28 @@ def test_target_agent_input_contract_validation(db_session):
             artifact_ids=["art-1"],
         )
 
-    # Valid with 2 artifacts
+    # Duplicate artifact IDs cannot bypass min_artifacts=2
+    with pytest.raises(HandoffContractError, match="expected at least 2 artifacts"):
+        mgr.validate_input_contract(
+            target_agent,
+            payload={"summary": "Market analysis complete"},
+            artifact_ids=["art-1", "art-1"],
+        )
+
+    # Valid with 2 distinct artifacts
     mgr.validate_input_contract(
         target_agent,
         payload={"summary": "Market analysis complete"},
         artifact_ids=["art-1", "art-2"],
     )
+
+    # Safely coerces malformed min_artifacts without crashing
+    target_agent.config = {
+        "input_contract": {
+            "min_artifacts": "not-an-int",
+        }
+    }
+    mgr.validate_input_contract(target_agent, payload={}, artifact_ids=[])
 
 
 # ============================================================================
@@ -237,7 +261,7 @@ def test_execute_handoff_db_persistence_and_phieu_buoc(db_session, tmp_path):
         from_agent="DeepResearcher",
         to_agent="ContentWriter",
         payload=raw_payload,
-        artifact_ids=[art.id],
+        artifact_ids=[art.id, art.id],
     )
 
     assert isinstance(record, HandoffRecord)
@@ -256,6 +280,7 @@ def test_execute_handoff_db_persistence_and_phieu_buoc(db_session, tmp_path):
     assert pb["to_agent"] == "ContentWriter"
     assert pb["summary"] == "Phiếu bước 1: Đã tổng hợp 10 báo cáo thị trường"
     assert pb["artifact_ids"] == [art.id]
+    assert pb["deliverables"] == [f"artifact:{art.id}"]
     assert "created_at" in pb
 
     # Check that secrets are masked in Phiếu bước payload
@@ -483,6 +508,7 @@ def test_handoff_api_e2e_success_and_ws_broadcast(client_env):
     assert len(broadcast_events) == 1
     ev = broadcast_events[0]
     assert ev["task_id"] == task_id
+    assert ev["event"]["event"] == "handoff"
     assert ev["event"]["type"] == "handoff"
     assert "sk-1234567890123456" not in str(ev["event"])
 

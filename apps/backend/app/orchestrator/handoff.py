@@ -168,12 +168,20 @@ class HandoffManager:
             return
 
         payload_dict = payload if isinstance(payload, dict) else {}
+        clean_artifacts = list(dict.fromkeys(artifact_ids or []))
+
+        def _is_missing_or_blank(val: Any) -> bool:
+            if val is None:
+                return True
+            if isinstance(val, str) and not val.strip():
+                return True
+            return False
 
         # List/Tuple/Set contract: list of required key strings
         if isinstance(contract, (list, tuple, set)):
             required_keys = [str(k) for k in contract]
             missing_keys = [
-                k for k in required_keys if k not in payload_dict or payload_dict[k] is None
+                k for k in required_keys if _is_missing_or_blank(payload_dict.get(k))
             ]
             if missing_keys:
                 raise HandoffContractError(
@@ -191,7 +199,7 @@ class HandoffManager:
             )
             if isinstance(required_keys, (list, tuple, set)):
                 missing_keys = [
-                    k for k in required_keys if k not in payload_dict or payload_dict[k] is None
+                    k for k in required_keys if _is_missing_or_blank(payload_dict.get(k))
                 ]
                 if missing_keys:
                     raise HandoffContractError(
@@ -199,17 +207,21 @@ class HandoffManager:
                         f"missing required keys: {', '.join(sorted(missing_keys))}"
                     )
 
-            if contract.get("require_artifacts") and not artifact_ids:
+            if contract.get("require_artifacts") and not clean_artifacts:
                 raise HandoffContractError(
                     f"Agent '{to_agent_record.name}' input contract violation: "
                     "at least one artifact is required"
                 )
 
-            min_artifacts = contract.get("min_artifacts", 0)
-            if min_artifacts and len(artifact_ids) < min_artifacts:
+            try:
+                min_artifacts = int(contract.get("min_artifacts", 0) or 0)
+            except (ValueError, TypeError):
+                min_artifacts = 0
+
+            if min_artifacts > 0 and len(clean_artifacts) < min_artifacts:
                 raise HandoffContractError(
                     f"Agent '{to_agent_record.name}' input contract violation: "
-                    f"expected at least {min_artifacts} artifacts, received {len(artifact_ids)}"
+                    f"expected at least {min_artifacts} artifacts, received {len(clean_artifacts)}"
                 )
 
     def _resolve_agent(self, db: Session, identifier: str) -> Optional[Agent]:
@@ -276,7 +288,7 @@ class HandoffManager:
             raise HandoffNotFoundError(f"Target agent '{to_agent}' not found")
 
         # 3. Validate artifacts existence and ensure they belong to this task
-        clean_artifact_ids = list(artifact_ids or [])
+        clean_artifact_ids = list(dict.fromkeys(artifact_ids or []))
         for art_id in clean_artifact_ids:
             art = db.get(Artifact, art_id)
             if not art:

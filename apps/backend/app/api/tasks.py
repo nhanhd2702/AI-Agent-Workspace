@@ -518,6 +518,7 @@ async def handoff_task(
             await ws_manager.broadcast(
                 task_id=task_id,
                 event={
+                    "event": "handoff",
                     "type": "handoff",
                     "task_id": task_id,
                     "data": record.to_dict(),
