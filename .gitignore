@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.sqlite*
+
+# Node / Next.js / Tauri
+node_modules/
+.next/
+out/
+dist/
+target/
+
+# Worktrees & SDD scratch
+.worktrees/
+.superpowers/
+
+# Env & local runtime
+.env
+.env.local
+workspace/
+chroma/
