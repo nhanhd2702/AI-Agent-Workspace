@@ -8,9 +8,13 @@ from app.mcp.browser_server import (
     CaptchaRequiredError,
 )
 from app.mcp.gateway import McpGateway
+from app.mcp.security import (
+    SecurityPolicyError,
+    validate_safe_http_url,
+    validate_task_workspace,
+)
 from app.mcp.shell_server import (
     DEFAULT_ALLOWED_EXECUTABLES,
-    SecurityPolicyError,
     ShellExecutor,
     ShellResult,
     ShellTimeoutError,
@@ -28,4 +32,6 @@ __all__ = [
     "ShellExecutor",
     "ShellResult",
     "ShellTimeoutError",
+    "validate_safe_http_url",
+    "validate_task_workspace",
 ]

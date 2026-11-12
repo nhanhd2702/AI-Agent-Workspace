@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
+import shutil
+import socket
 import sys
 import time
 from typing import Any
@@ -25,6 +28,10 @@ from app.mcp.shell_server import (
     ShellResult,
     ShellTimeoutError,
 )
+
+
+def _public_dns(_host: str) -> list[str]:
+    return ["93.184.216.34"]
 
 
 # ============================================================================
@@ -334,6 +341,24 @@ async def test_shell_executor_timeout_kills_process_tree(tmp_path: Path):
 # ============================================================================
 
 
+class FakeRouteRequest:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+class FakeRoute:
+    def __init__(self, url: str) -> None:
+        self.request = FakeRouteRequest(url)
+        self.aborted = False
+        self.continued = False
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+
 class FakePage:
     def __init__(
         self,
@@ -343,12 +368,14 @@ class FakePage:
         body_text: str = "Hello world",
         html: str = "<html><body><p>Hello world</p></body></html>",
         matching_selectors: set[str] | None = None,
+        redirect_to: str | None = None,
     ) -> None:
         self.url = url
         self._title = title
         self._body_text = body_text
         self._html = html
         self._matching_selectors = matching_selectors or set()
+        self._redirect_to = redirect_to
         self.closed = False
         self.timeouts_seen: list[Any] = []
         self.clicked_selectors: list[str] = []
@@ -357,11 +384,19 @@ class FakePage:
         self.screenshot_calls: list[dict[str, Any]] = []
         self.set_content_calls: list[str] = []
         self.viewport_sizes: list[dict[str, int]] = []
+        self._context: FakeContext | None = None
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         self.timeouts_seen.append(kwargs.get("timeout"))
         self.goto_calls.append((url, kwargs))
-        self.url = url
+        target = self._redirect_to or url
+        if self._context is not None and self._context.route_handlers:
+            route = FakeRoute(target)
+            for handler in self._context.route_handlers:
+                await handler(route)
+            if route.aborted:
+                raise RuntimeError("net::ERR_ABORTED")
+        self.url = target
 
     async def click(self, selector: str, **kwargs: Any) -> None:
         self.timeouts_seen.append(kwargs.get("timeout"))
@@ -419,7 +454,12 @@ class FakePage:
 class FakeContext:
     def __init__(self, page: FakePage) -> None:
         self.page = page
+        self.page._context = self
         self.closed = False
+        self.route_handlers: list[Any] = []
+
+    async def route(self, pattern: str, handler: Any) -> None:
+        self.route_handlers.append(handler)
 
     async def new_page(self) -> FakePage:
         return self.page
@@ -431,11 +471,17 @@ class FakeContext:
 class FakeBrowser:
     def __init__(self, page: FakePage | None = None) -> None:
         self.page = page or FakePage()
+        self.extra_pages: list[FakePage] = []
         self.contexts: list[FakeContext] = []
         self.closed = False
 
     async def new_context(self, **kwargs: Any) -> FakeContext:
-        ctx = FakeContext(self.page)
+        if len(self.contexts) == 0:
+            p = self.page
+        else:
+            p = FakePage()
+            self.extra_pages.append(p)
+        ctx = FakeContext(p)
         self.contexts.append(ctx)
         return ctx
 
@@ -464,6 +510,7 @@ async def test_browser_controller_enforces_30s_timeout_and_closes_on_exit(
     async with BrowserController(
         workspace_root=tmp_path,
         browser=fake_browser,
+        dns_resolver=_public_dns,
     ) as ctrl:
         assert ctrl.action_timeout_s == 30.0
         nav_res = await ctrl.navigate("https://example.com", task_workspace=task_dir)
@@ -504,7 +551,9 @@ async def test_browser_controller_closes_resources_even_on_exception(tmp_path: P
     fake_browser = FakeBrowser(fake_page)
 
     with pytest.raises(RuntimeError, match="boom"):
-        async with BrowserController(workspace_root=tmp_path, browser=fake_browser) as ctrl:
+        async with BrowserController(
+            workspace_root=tmp_path, browser=fake_browser, dns_resolver=_public_dns
+        ) as ctrl:
             await ctrl.navigate("https://example.com")
             raise RuntimeError("boom")
 
@@ -621,7 +670,9 @@ async def test_browser_controller_stops_on_captcha_2fa_payment_gates(
     task_dir = tmp_path / "task-gate"
     task_dir.mkdir()
 
-    async with BrowserController(workspace_root=tmp_path, browser=fake_browser) as ctrl:
+    async with BrowserController(
+        workspace_root=tmp_path, browser=fake_browser, dns_resolver=_public_dns
+    ) as ctrl:
         res = await ctrl.navigate(page_kwargs["url"], task_workspace=task_dir)
         assert isinstance(res, BrowserActionResult)
         assert res.status == "CAPTCHA_REQUIRED"
@@ -652,7 +703,9 @@ async def test_browser_controller_lazy_playwright_factory(tmp_path: Path):
         factory_called = True
         return fake_pw
 
-    ctrl = BrowserController(workspace_root=tmp_path, playwright_factory=_factory)
+    ctrl = BrowserController(
+        workspace_root=tmp_path, playwright_factory=_factory, dns_resolver=_public_dns
+    )
     assert factory_called is False  # Lazy: not started until an action runs
 
     res = await ctrl.navigate("https://example.com")
@@ -692,6 +745,7 @@ async def test_mcp_gateway_wires_settings_lists_tools_and_enforces_workspace(
         workspace_root=workspace_root,
         browser=fake_browser,
         extra_secrets=[settings.local_auth_token],
+        dns_resolver=_public_dns,
     )
 
     async with McpGateway(settings=settings, browser_controller=browser_ctrl) as gateway:
@@ -727,3 +781,420 @@ async def test_mcp_gateway_wires_settings_lists_tools_and_enforces_workspace(
             await gateway.call_tool("unknown.tool", {}, task_workspace=task_dir)
 
     assert fake_browser.closed is True
+
+
+
+# ============================================================================
+# Security Review Regression Tests (Findings 1-13)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("executable", "args"),
+    [
+        # Critical 1: Glued short flags
+        ("yt-dlp", ["-o../../escape.mp4", "https://example.com/v"]),
+        ("yt-dlp", ["-a/etc/passwd"]),
+        ("yt-dlp", ["-P/tmp/escape", "https://example.com/v"]),
+        ("node", ["-r../../outside.js", "app.js"]),
+        ("ffmpeg", ["-i../../escape.mp4", "out.mp4"]),
+        # Critical 2: Python short flags containing 'c' & -m module execution
+        ("python", ["-Pc", "print(1)"]),
+        ("python", ["-bc", "print(1)"]),
+        ("python", ["-Rc", "print(1)"]),
+        ("python", ["-tc", "print(1)"]),
+        ("python", ["-Sc", "print(1)"]),
+        ("python", ["-m", "pip", "list"]),
+        ("python", ["-m", "timeit", "1+1"]),
+        ("python", ["-m", "http.server"]),
+        ("python", ["-m", "json.tool"]),
+        ("python", ["-mpdb", "script.py"]),
+        # Critical 3: yt-dlp dangerous flags
+        ("yt-dlp", ["--exec-before-download", "echo pwn", "https://example.com/v"]),
+        ("yt-dlp", ["--alias", "pwn", "--exec calc", "https://example.com/v"]),
+        ("yt-dlp", ["--alias=pwn:--exec calc", "https://example.com/v"]),
+        ("yt-dlp", ["--plugin-dirs", "/tmp/plugins", "https://example.com/v"]),
+        ("yt-dlp", ["--plugin-dirs=/tmp/plugins", "https://example.com/v"]),
+        ("yt-dlp", ["--use-postprocessor", "Exec", "https://example.com/v"]),
+        ("yt-dlp", ["--config-location", "yt.conf", "https://example.com/v"]),
+        ("yt-dlp", ["--cookies", "cookies.txt", "https://example.com/v"]),
+        ("yt-dlp", ["--ffmpeg-location", "ffmpeg", "https://example.com/v"]),
+        # Critical 4: ffmpeg/ffprobe filter graphs, avio protocols & SSRF URLs
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "drawtext=textfile=/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "drawtext=textfile=../../secret.txt", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "movie=/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-af", "amovie=../../secret.wav", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "subtitles=/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vf", "sendcmd=filename=/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-filter_complex_script", "../../f.txt", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-filter_script", "/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-vstats_file", "../../vstats.log", "out.mp4"]),
+        ("ffmpeg", ["-i", "in.mp4", "-passlogfile", "../../pass", "out.mp4"]),
+        ("ffmpeg", ["-i", "file:/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "concat:/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "subfile,,start,0,end,100,,:/etc/passwd", "out.mp4"]),
+        ("ffmpeg", ["-i", "http://169.254.169.254/latest/meta-data/", "out.mp4"]),
+        ("ffprobe", ["file:/etc/passwd"]),
+        # Important 8: Node.js loader / debugger / env flags
+        ("node", ["-r", "./hook.js", "app.js"]),
+        ("node", ["--require", "./hook.js", "app.js"]),
+        ("node", ["--require=./hook.js", "app.js"]),
+        ("node", ["--import", "./hook.mjs", "app.js"]),
+        ("node", ["--loader", "./loader.mjs", "app.js"]),
+        ("node", ["--experimental-loader", "./loader.mjs", "app.js"]),
+        ("node", ["--inspect", "app.js"]),
+        ("node", ["--inspect-brk=0.0.0.0:9229", "app.js"]),
+        ("node", ["--env-file=.env", "app.js"]),
+        ("node", ["--watch", "app.js"]),
+    ],
+)
+async def test_shell_executor_blocks_critical_flag_and_filter_bypasses(
+    tmp_path: Path, executable: str, args: list[str]
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-sec"
+    task_dir.mkdir()
+    executor = ShellExecutor(workspace_root=ws_root, dns_resolver=_public_dns)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run(executable, args, task_workspace=task_dir)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ssrf_url",
+    [
+        "http://localhost:8080/",
+        "http://sub.localhost/admin",
+        "http://printer.local/",
+        "http://service.internal/secret",
+        "http://2852039166/latest/meta-data/",
+        "http://0xa9fea9fe/latest/meta-data/",
+        "http://0251.0376.0251.0376/latest/meta-data/",
+        "http://127.1/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://[::ffff:169.254.169.254]/",
+        "http://[::1]/",
+        "http://10.0.0.1/",
+        "http://172.16.0.1/",
+        "http://192.168.1.1/",
+        "http://100.64.0.1/",
+    ],
+)
+async def test_shared_ssrf_blocks_localhost_internal_and_alt_ip_notations(
+    tmp_path: Path, ssrf_url: str
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-ssrf"
+    task_dir.mkdir()
+
+    fake_browser = FakeBrowser()
+    async with BrowserController(workspace_root=ws_root, browser=fake_browser) as ctrl:
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.navigate(ssrf_url, task_workspace=task_dir)
+
+    executor = ShellExecutor(workspace_root=ws_root)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run("yt-dlp", [ssrf_url], task_workspace=task_dir)
+
+
+@pytest.mark.asyncio
+async def test_ssrf_fails_closed_on_private_dns_rebinding_and_dns_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-dns"
+    task_dir.mkdir()
+
+    # 1. DNS rebinding / private IP resolution via dns_resolver
+    async with BrowserController(
+        workspace_root=ws_root,
+        browser=FakeBrowser(),
+        dns_resolver=lambda _host: ["127.0.0.1"],
+    ) as ctrl:
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.navigate("https://rebind.example.com", task_workspace=task_dir)
+
+    # 2. Default socket.getaddrinfo returning link-local metadata IP
+    def fake_getaddrinfo_private(*_args: Any, **_kwargs: Any) -> list[Any]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo_private)
+    async with BrowserController(workspace_root=ws_root, browser=FakeBrowser()) as ctrl:
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.navigate("https://evil-dns.example.com", task_workspace=task_dir)
+
+    # 3. Default socket.getaddrinfo failing (offline / NXDOMAIN) -> fail closed
+    def fake_getaddrinfo_fail(*_args: Any, **_kwargs: Any) -> list[Any]:
+        raise socket.gaierror("DNS failure")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo_fail)
+    async with BrowserController(workspace_root=ws_root, browser=FakeBrowser()) as ctrl:
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.navigate("https://unresolvable.example.com", task_workspace=task_dir)
+
+
+@pytest.mark.asyncio
+async def test_browser_controller_blocks_ssrf_redirects_and_isolates_render_html(
+    tmp_path: Path,
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-redir"
+    task_dir.mkdir()
+
+    # 1. Redirect from safe public URL to metadata SSRF target must be aborted & rejected
+    redir_page = FakePage(redirect_to="http://169.254.169.254/latest/meta-data/")
+    fake_browser = FakeBrowser(redir_page)
+    async with BrowserController(
+        workspace_root=ws_root, browser=fake_browser, dns_resolver=_public_dns
+    ) as ctrl:
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.navigate("https://example.com/start", task_workspace=task_dir)
+
+    # 2. render_html_to_png uses isolated page/context, blocks http/file subresources, bounds viewport
+    active_page = FakePage(url="https://example.com/active")
+    iso_browser = FakeBrowser(active_page)
+    async with BrowserController(
+        workspace_root=ws_root, browser=iso_browser, dns_resolver=_public_dns
+    ) as ctrl:
+        await ctrl.navigate("https://example.com/active", task_workspace=task_dir)
+        out_png = task_dir / "card.png"
+        res = await ctrl.render_html_to_png(
+            "<img src='https://evil.com/leak.png'><img src='file:///etc/passwd'>",
+            out_png,
+            width=800,
+            height=600,
+            task_workspace=task_dir,
+        )
+        assert res.status == BrowserGateStatus.OK
+        assert out_png.exists()
+
+        # Caller's active page was NOT modified or closed
+        assert active_page.set_content_calls == []
+        assert active_page.viewport_sizes == []
+        assert active_page.closed is False
+
+        # Isolated context/page had route handlers blocking external/file subresources and closed
+        assert len(iso_browser.extra_pages) == 1
+        iso_page = iso_browser.extra_pages[0]
+        assert iso_page.closed is True
+        assert iso_browser.contexts[-1].closed is True
+
+        iso_handlers = iso_browser.contexts[-1].route_handlers
+        assert len(iso_handlers) == 1
+        http_route = FakeRoute("https://evil.com/leak.png")
+        file_route = FakeRoute("file:///etc/passwd")
+        data_route = FakeRoute("data:image/png;base64,AAAA")
+        await iso_handlers[0](http_route)
+        await iso_handlers[0](file_route)
+        await iso_handlers[0](data_route)
+        assert http_route.aborted is True
+        assert file_route.aborted is True
+        assert data_route.continued is True
+
+        # Viewport bounds enforced
+        with pytest.raises(ValueError):
+            await ctrl.render_html_to_png(
+                "<h1>Too big</h1>", out_png, width=5000, height=720, task_workspace=task_dir
+            )
+        with pytest.raises(ValueError):
+            await ctrl.render_html_to_png(
+                "<h1>Zero</h1>", out_png, width=0, height=720, task_workspace=task_dir
+            )
+
+
+@pytest.mark.asyncio
+async def test_strict_task_workspace_isolation_forbids_root_and_db_chroma_dirs(
+    tmp_path: Path,
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    (ws_root / "app.db").write_text("db", encoding="utf-8")
+    chroma_dir = ws_root / "chroma"
+    chroma_dir.mkdir()
+    bad_task_with_db = ws_root / "bad-task"
+    bad_task_with_db.mkdir()
+    (bad_task_with_db / "checkpoints.db").write_text("ckpt", encoding="utf-8")
+
+    task_dir = ws_root / "good-task"
+    task_dir.mkdir()
+    local_html = task_dir / "page.html"
+    local_html.write_text("<p>hi</p>", encoding="utf-8")
+
+    executor = ShellExecutor(workspace_root=ws_root)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run("python", ["--version"], task_workspace=ws_root)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run("python", ["--version"], task_workspace=chroma_dir)
+    with pytest.raises(SecurityPolicyError):
+        await executor.run("python", ["--version"], task_workspace=bad_task_with_db)
+
+    async with BrowserController(
+        workspace_root=ws_root, browser=FakeBrowser(), dns_resolver=_public_dns
+    ) as ctrl:
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.navigate(local_html.as_uri(), task_workspace=None)
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.screenshot(task_dir / "a.png", task_workspace=None)
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.render_html_to_png("<p>x</p>", task_dir / "b.png", task_workspace=None)
+        with pytest.raises(BrowserPolicyError):
+            await ctrl.screenshot(ws_root / "a.png", task_workspace=ws_root)
+
+    settings = AppSettings(workspace_dir=ws_root)
+    async with McpGateway(
+        settings=settings,
+        browser_controller=BrowserController(
+            workspace_root=ws_root, browser=FakeBrowser(), dns_resolver=_public_dns
+        ),
+    ) as gateway:
+        with pytest.raises(SecurityPolicyError):
+            await gateway.call_tool(
+                "shell.run",
+                {"executable": "python", "args": ["--version"]},
+                task_workspace=ws_root,
+            )
+
+
+@pytest.mark.asyncio
+async def test_secret_masking_on_args_errors_and_gateway_param_validation(
+    tmp_path: Path,
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-mask"
+    task_dir.mkdir()
+    script = task_dir / "echo_arg.py"
+    script.write_text("import sys; print('ok')", encoding="utf-8")
+
+    secret = "sk-verysecretvalue99999"
+    executor = ShellExecutor(workspace_root=ws_root, extra_secrets=[secret])
+
+    res = await executor.run(
+        "python", ["echo_arg.py", f"--token={secret}"], task_workspace=task_dir
+    )
+    assert all(secret not in a for a in res.args)
+    assert any("***REDACTED***" in a for a in res.args)
+
+    with pytest.raises(SecurityPolicyError) as exc_info:
+        await executor.run("python", ["-c", secret], task_workspace=task_dir)
+    assert secret not in str(exc_info.value)
+
+    settings = AppSettings(workspace_dir=ws_root, local_auth_token="tok-secret-888")
+    gateway = McpGateway(
+        settings=settings,
+        browser_controller=BrowserController(
+            workspace_root=ws_root, browser=FakeBrowser(), dns_resolver=_public_dns
+        ),
+    )
+    assert "tok-secret-888" in gateway.shell.extra_secrets
+    assert "tok-secret-888" in gateway.browser.extra_secrets
+    with pytest.raises(ValueError, match="Missing required parameter"):
+        await gateway.call_tool("shell.run", {}, task_workspace=task_dir)
+    await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_controller_bounds_title_content_and_evaluate_timeouts(
+    tmp_path: Path,
+):
+    class HangingPage(FakePage):
+        async def title(self) -> str:
+            await asyncio.sleep(5)
+            return "never"
+
+        async def content(self) -> str:
+            await asyncio.sleep(5)
+            return "never"
+
+        async def evaluate(self, script: str) -> Any:
+            await asyncio.sleep(5)
+            return {}
+
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-hang"
+    task_dir.mkdir()
+
+    async with BrowserController(
+        workspace_root=ws_root,
+        action_timeout_s=0.05,
+        browser=FakeBrowser(HangingPage()),
+        dns_resolver=_public_dns,
+    ) as ctrl:
+        snap = await ctrl.take_snapshot(task_workspace=task_dir)
+        assert snap.status == BrowserGateStatus.OK
+        assert snap.title == ""
+
+
+@pytest.mark.asyncio
+async def test_shell_executor_fails_closed_when_binary_missing_and_cleans_up_on_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    task_dir = ws_root / "task-minor"
+    task_dir.mkdir()
+
+    # Minor 12: shutil.which returning None must fail closed rather than falling back to bare name
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+    executor = ShellExecutor(workspace_root=ws_root)
+    with pytest.raises(FileNotFoundError):
+        await executor.run("ffmpeg", ["-version"], task_workspace=task_dir)
+
+    # Minor 13: CancelledError during run kills the process tree cleanly
+    pid_file = task_dir / "cancel.pid"
+    script = task_dir / "wait_forever.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import os, pathlib, time",
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')",
+                "time.sleep(60)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    task = asyncio.create_task(
+        executor.run("python", ["wait_forever.py"], task_workspace=task_dir, timeout_s=30)
+    )
+    deadline = time.monotonic() + 3.0
+    while not pid_file.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert pid_file.exists()
+    child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Confirm child process exited after cancellation
+    kill_deadline = time.monotonic() + 2.0
+    alive = True
+    while time.monotonic() < kill_deadline:
+        if sys.platform == "win32":
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, child_pid)
+            if not handle:
+                alive = False
+                break
+            exit_code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            if not ok or exit_code.value != 259:
+                alive = False
+                break
+        else:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+        await asyncio.sleep(0.05)
+    assert alive is False

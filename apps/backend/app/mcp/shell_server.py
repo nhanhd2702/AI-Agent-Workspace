@@ -12,14 +12,16 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from app.config import get_settings
+from app.mcp.security import (
+    SecurityPolicyError,
+    mask_policy_text,
+    validate_safe_http_url,
+    validate_task_workspace,
+)
 from app.orchestrator.dispatcher import mask_secrets
-
-
-class SecurityPolicyError(Exception):
-    """Raised when a command, argument, URL, or path violates sandbox policy."""
 
 
 class ShellTimeoutError(TimeoutError):
@@ -85,27 +87,6 @@ _FORBIDDEN_METACHAR_TOKENS: tuple[str, ...] = (
     "\x00",
 )
 
-_PATH_TAKING_FLAGS: frozenset[str] = frozenset(
-    {
-        "-i",
-        "-o",
-        "--output",
-        "--input",
-        "--out",
-        "--file",
-        "--config",
-        "--config-location",
-        "--paths",
-        "-p",
-        "--batch-file",
-        "-a",
-        "--cookies",
-        "--download-archive",
-        "--write-info-json",
-        "--load-info-json",
-    }
-)
-
 _SAFE_ENV_KEYS: tuple[str, ...] = (
     "PATH",
     "SYSTEMROOT",
@@ -120,8 +101,193 @@ _SAFE_ENV_KEYS: tuple[str, ...] = (
 _WINDOWS_DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:[/\\]")
 _WINDOWS_DRIVE_REL_RE = re.compile(r"^[A-Za-z]:(?![/\\])")
 _URL_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
-_PYTHON_SHORT_C_RE = re.compile(r"^-[BEIOQSqsudvxi]*c")
-_NODE_SHORT_EVAL_RE = re.compile(r"^-[A-Za-z]*[ep]")
+
+# Python safe flags (strict allowlist; blocks -c, -Pc, -m, -W, -X, -, etc.)
+_PYTHON_SAFE_SHORT_RE = re.compile(r"^-[uBEIOqsVv]+$")
+_PYTHON_SAFE_LONG_FLAGS: frozenset[str] = frozenset({"--version", "--help"})
+
+# Node safe flags (strict allowlist; blocks -e, --eval, -p, --print, -r, --require, --import, --loader, --inspect*, --env-file*, --watch*, -)
+_NODE_SAFE_FLAGS: frozenset[str] = frozenset(
+    {"-v", "--version", "-h", "--help", "--check", "--no-warnings", "--trace-warnings"}
+)
+
+# yt-dlp safe flags (strict allowlist; blocks --exec*, --alias*, --plugin-dirs*, --use-postprocessor*, --config-location*, --cookies*, --ffmpeg-location*, etc.)
+_YTDLP_SAFE_NO_VAL_FLAGS: frozenset[str] = frozenset(
+    {
+        "--version",
+        "--help",
+        "-h",
+        "--no-playlist",
+        "--yes-playlist",
+        "-x",
+        "--extract-audio",
+        "--write-subs",
+        "--write-auto-subs",
+        "--write-thumbnail",
+        "--write-info-json",
+        "--dump-json",
+        "-j",
+        "--quiet",
+        "-q",
+        "--no-warnings",
+        "--progress",
+        "--newline",
+        "--no-overwrites",
+        "--force-overwrites",
+        "--restrict-filenames",
+        "--windows-filenames",
+        "--no-part",
+    }
+)
+_YTDLP_PATH_FLAGS: frozenset[str] = frozenset(
+    {
+        "-o",
+        "--output",
+        "-P",
+        "--paths",
+        "-a",
+        "--batch-file",
+        "--download-archive",
+        "--load-info-json",
+    }
+)
+_YTDLP_SCALAR_FLAGS: frozenset[str] = frozenset(
+    {
+        "-f",
+        "--format",
+        "-S",
+        "--format-sort",
+        "--audio-format",
+        "--audio-quality",
+        "--merge-output-format",
+        "--remux-video",
+        "--recode-video",
+        "--sub-langs",
+        "--convert-subs",
+        "--print",
+        "--trim-filenames",
+        "--retries",
+        "--fragment-retries",
+        "-N",
+        "--concurrent-fragments",
+        "--max-filesize",
+        "--match-filter",
+        "-I",
+        "--playlist-items",
+    }
+)
+
+# ffmpeg / ffprobe safe flags & filter graph file keys
+_FFMPEG_PATH_FLAGS: frozenset[str] = frozenset(
+    {
+        "-i",
+        "-o",
+        "--output",
+        "--input",
+        "-filter_complex_script",
+        "-filter_script",
+        "-filter_script:v",
+        "-filter_script:a",
+        "-vstats_file",
+        "-passlogfile",
+        "-sdp_file",
+        "-attach",
+        "-dump_attachment",
+    }
+)
+_FFMPEG_FILTER_FLAGS: frozenset[str] = frozenset(
+    {"-vf", "-af", "-filter_complex", "-lavfi", "-filter", "-filter:v", "-filter:a"}
+)
+_FFMPEG_SAFE_FLAGS: frozenset[str] = frozenset(
+    {
+        *_FFMPEG_PATH_FLAGS,
+        *_FFMPEG_FILTER_FLAGS,
+        "-vn",
+        "-an",
+        "-sn",
+        "-dn",
+        "-map",
+        "-crf",
+        "-preset",
+        "-tune",
+        "-pix_fmt",
+        "-movflags",
+        "-threads",
+        "-loglevel",
+        "-hide_banner",
+        "-version",
+        "--version",
+        "-formats",
+        "-codecs",
+        "-filters",
+        "-shortest",
+        "-re",
+        "-loop",
+        "-stream_loop",
+        "-ss",
+        "-to",
+        "-itsoffset",
+        "-copyts",
+        "-avoid_negative_ts",
+        "-fflags",
+        "-flags",
+        "-strict",
+        "-ar",
+        "-ac",
+        "-ab",
+        "-vb",
+        "-maxrate",
+        "-bufsize",
+        "-g",
+        "-keyint_min",
+        "-sc_threshold",
+        "-rc_override",
+        "-metadata",
+        "-show_format",
+        "-show_streams",
+        "-show_entries",
+        "-select_streams",
+        "-print_format",
+        "-of",
+        "-v",
+        "-f",
+        "-t",
+        "-y",
+        "-n",
+        "-q",
+        "-h",
+        "-help",
+        "--help",
+        "-show_packets",
+        "-show_frames",
+        "-count_frames",
+        "-count_packets",
+        "-read_intervals",
+    }
+)
+_FFMPEG_COLON_FLAG_RE = re.compile(
+    r"^-(c|b|r|s|codec|profile|level|filter|filter_script|metadata)(:[A-Za-z0-9_]+)+$"
+)
+_FFMPEG_FILE_FILTER_KEYS: frozenset[str] = frozenset(
+    {
+        "textfile",
+        "fontfile",
+        "filename",
+        "file",
+        "movie",
+        "amovie",
+        "subtitles",
+        "ass",
+        "lut",
+        "lut3d",
+        "haldclut",
+        "icc",
+        "psfile",
+        "curves",
+        "f",
+        "src",
+    }
+)
 
 
 class ShellExecutor:
@@ -134,6 +300,8 @@ class ShellExecutor:
         default_timeout_s: float = 300.0,
         max_output_bytes: int = 1024 * 1024,
         extra_secrets: Optional[Iterable[str]] = None,
+        allow_private_network: bool = False,
+        dns_resolver: Optional[Callable[[str], Iterable[str]]] = None,
     ) -> None:
         if default_timeout_s <= 0:
             raise ValueError("default_timeout_s must be > 0")
@@ -149,6 +317,8 @@ class ShellExecutor:
             }
         self.default_timeout_s = float(default_timeout_s)
         self.max_output_bytes = int(max_output_bytes)
+        self.allow_private_network = allow_private_network
+        self.dns_resolver = dns_resolver
 
         secrets: list[str] = []
         if extra_secrets is not None:
@@ -161,6 +331,9 @@ class ShellExecutor:
                 secrets.append(settings.encryption_key.decode("utf-8", errors="ignore"))
         self.extra_secrets = secrets
 
+    def _policy_error(self, message: str) -> SecurityPolicyError:
+        return SecurityPolicyError(mask_policy_text(message, self.extra_secrets))
+
     @staticmethod
     def _normalize_whitelist_entry(entry: str) -> str:
         raw = str(entry).strip().lower()
@@ -172,77 +345,40 @@ class ShellExecutor:
 
     def _validate_executable(self, executable: str) -> str:
         if not isinstance(executable, str):
-            raise SecurityPolicyError("Executable name must be a string")
+            raise self._policy_error("Executable name must be a string")
         raw = executable.strip()
         if not raw:
-            raise SecurityPolicyError("Executable name cannot be empty")
+            raise self._policy_error("Executable name cannot be empty")
         if any(tok in raw for tok in _FORBIDDEN_METACHAR_TOKENS) or any(
             ch.isspace() for ch in raw
         ):
-            raise SecurityPolicyError(f"Invalid characters in executable: {executable!r}")
+            raise self._policy_error(f"Invalid characters in executable: {executable!r}")
         if "/" in raw or "\\" in raw or ".." in raw or ":" in raw:
-            raise SecurityPolicyError(
+            raise self._policy_error(
                 f"Path separators or traversal forbidden in executable: {executable!r}"
             )
         norm = raw.lower()
         if norm.endswith(".exe"):
             norm = norm[:-4]
         if norm not in self.allowed_executables:
-            raise SecurityPolicyError(
+            raise self._policy_error(
                 f"Executable '{executable}' is not in the allowed whitelist: {sorted(self.allowed_executables)}"
             )
         return norm
 
     def _validate_task_workspace(self, task_workspace: Path) -> Path:
-        if not isinstance(task_workspace, (Path, str)):
-            raise SecurityPolicyError("task_workspace must be a valid Path")
-        raw_ws = Path(task_workspace)
-        resolved_ws = raw_ws.resolve()
-        if not resolved_ws.is_relative_to(self.workspace_root):
-            raise SecurityPolicyError(
-                f"task_workspace '{task_workspace}' escapes workspace_root '{self.workspace_root}'"
-            )
-        if not resolved_ws.exists() or not resolved_ws.is_dir():
-            raise SecurityPolicyError(
-                f"task_workspace '{task_workspace}' must be an existing directory"
-            )
-        return resolved_ws
+        return validate_task_workspace(
+            task_workspace,
+            self.workspace_root,
+            error_cls=SecurityPolicyError,
+            extra_secrets=self.extra_secrets,
+        )
 
-    @staticmethod
-    def _check_metacharacters(arg: str) -> None:
+    def _check_metacharacters(self, arg: str) -> None:
         for token in _FORBIDDEN_METACHAR_TOKENS:
             if token in arg:
-                raise SecurityPolicyError(
+                raise self._policy_error(
                     f"Forbidden shell metacharacter {token!r} in argument {arg!r}"
-                )
-
-    def _validate_inline_execution(self, executable: str, arg: str) -> None:
-        lower = arg.lower()
-        if arg == "-":
-            raise SecurityPolicyError(
-                f"Stdin execution '-' is forbidden for '{executable}'"
-            )
-        if lower == "--eval" or lower.startswith("--eval="):
-            raise SecurityPolicyError(
-                f"Inline code evaluation flag {arg!r} is forbidden"
-            )
-
-        if executable == "python":
-            if _PYTHON_SHORT_C_RE.match(arg):
-                raise SecurityPolicyError(
-                    f"Inline Python execution flag {arg!r} is forbidden"
-                )
-        elif executable == "node":
-            if lower in {"-e", "--eval", "-p", "--print"} or lower.startswith(
-                ("--eval=", "--print=")
-            ) or _NODE_SHORT_EVAL_RE.match(arg):
-                raise SecurityPolicyError(
-                    f"Inline Node.js execution flag {arg!r} is forbidden"
-                )
-        elif executable == "yt-dlp":
-            if lower == "--exec" or lower.startswith("--exec="):
-                raise SecurityPolicyError(
-                    "yt-dlp '--exec' command hook is forbidden"
                 )
 
     def _validate_path_value(
@@ -251,53 +387,373 @@ class ShellExecutor:
         task_workspace_resolved: Path,
         *,
         is_flag_context: bool = False,
+        allow_http_url: bool = True,
+        allow_ytdlp_prefix: bool = False,
     ) -> None:
         if not value:
             if is_flag_context:
-                raise SecurityPolicyError("Empty path argument is forbidden")
+                raise self._policy_error("Empty path argument is forbidden")
             return
+
+        if allow_ytdlp_prefix and ":" in value:
+            prefix, rest = value.split(":", 1)
+            if prefix.lower() in {"home", "temp"} and not _WINDOWS_DRIVE_ABS_RE.match(
+                value
+            ):
+                value = rest
+                if not value:
+                    raise self._policy_error("Empty yt-dlp -P path suffix is forbidden")
 
         # UNC paths (\\server\share or //server/share)
         if value.startswith("\\\\") or value.startswith("//"):
-            raise SecurityPolicyError(f"UNC path forbidden: {value!r}")
+            raise self._policy_error(f"UNC path forbidden: {value!r}")
 
         # Home directory expansion (~ or ~/...)
         if value == "~" or value.startswith("~/") or value.startswith("~\\"):
-            raise SecurityPolicyError(f"Home directory path forbidden: {value!r}")
+            raise self._policy_error(f"Home directory path forbidden: {value!r}")
 
         # Drive-relative Windows paths like C:foo.txt
         if _WINDOWS_DRIVE_REL_RE.match(value):
-            raise SecurityPolicyError(
-                f"Drive-relative path forbidden: {value!r}"
+            raise self._policy_error(f"Drive-relative path forbidden: {value!r}")
+
+        # URL scheme handling: only http:// or https:// passing strict SSRF checks
+        lower_val = value.lower()
+        if lower_val.startswith(("http://", "https://")):
+            if not allow_http_url:
+                raise self._policy_error(f"URL not allowed in this argument: {value!r}")
+            validate_safe_http_url(
+                value,
+                allow_private_network=self.allow_private_network,
+                dns_resolver=self.dns_resolver,
+                error_cls=SecurityPolicyError,
+                extra_secrets=self.extra_secrets,
+            )
+            return
+
+        # Windows drive absolute path
+        if _WINDOWS_DRIVE_ABS_RE.match(value):
+            if sys.platform != "win32":
+                raise self._policy_error(
+                    f"Windows drive path forbidden on non-Windows host: {value!r}"
+                )
+            resolved = Path(value).resolve()
+            if not resolved.is_relative_to(task_workspace_resolved):
+                raise self._policy_error(
+                    f"Path argument {value!r} resolves to '{resolved}' outside task_workspace '{task_workspace_resolved}'"
+                )
+            return
+
+        # Block any colon in non-URL, non-Windows-drive values (blocks avio protocols like file:, concat:, subfile,,..:)
+        if ":" in value:
+            raise self._policy_error(
+                f"Colon/protocol specifier forbidden in argument: {value!r}"
             )
 
-        # URL scheme handling (allow http/https URLs; block file:// and others)
         scheme_match = _URL_SCHEME_RE.match(value)
-        if scheme_match and not _WINDOWS_DRIVE_ABS_RE.match(value):
-            scheme = scheme_match.group(1).lower()
-            if scheme in {"http", "https"}:
-                return
-            raise SecurityPolicyError(
-                f"URI scheme '{scheme}://' is forbidden in shell arguments: {value!r}"
+        if scheme_match:
+            raise self._policy_error(
+                f"URI scheme '{scheme_match.group(1).lower()}://' is forbidden: {value!r}"
             )
 
-        # Windows drive-letter absolute path on POSIX must always be rejected
-        if _WINDOWS_DRIVE_ABS_RE.match(value) and sys.platform != "win32":
-            raise SecurityPolicyError(
-                f"Windows drive path forbidden on non-Windows host: {value!r}"
-            )
-
-        # Resolve relative to task_workspace and ensure strict containment
         candidate = Path(value)
-        if not candidate.is_absolute():
-            resolved = (task_workspace_resolved / candidate).resolve()
-        else:
-            resolved = candidate.resolve()
-
+        resolved = (
+            (task_workspace_resolved / candidate).resolve()
+            if not candidate.is_absolute()
+            else candidate.resolve()
+        )
         if not resolved.is_relative_to(task_workspace_resolved):
-            raise SecurityPolicyError(
+            raise self._policy_error(
                 f"Path argument {value!r} resolves to '{resolved}' outside task_workspace '{task_workspace_resolved}'"
             )
+
+    def _validate_ffmpeg_filter_graph(
+        self,
+        expr: str,
+        task_workspace_resolved: Path,
+    ) -> None:
+        if not expr:
+            raise self._policy_error("Empty ffmpeg filter expression is forbidden")
+
+        for item in re.split(r"[,;]", expr):
+            token = item.strip()
+            if not token:
+                continue
+
+            # Reject colons in filter expressions (avio/options) unless valid Windows drive path inside workspace
+            if ":" in token:
+                parts_eq = token.split("=")
+                last_val = parts_eq[-1].strip().strip("'\"")
+                if not (
+                    sys.platform == "win32" and _WINDOWS_DRIVE_ABS_RE.match(last_val)
+                ):
+                    raise self._policy_error(
+                        f"Colon specifier forbidden in ffmpeg filter graph: {expr!r}"
+                    )
+
+            # Handle nested `filter=key=val` chains (e.g., drawtext=textfile=/etc/passwd)
+            eq_parts = [p.strip().strip("'\"") for p in token.split("=")]
+            for idx, part in enumerate(eq_parts):
+                prev_key = eq_parts[idx - 1].lower() if idx > 0 else ""
+                is_file_key = prev_key in _FFMPEG_FILE_FILTER_KEYS
+                if (
+                    is_file_key
+                    or "/" in part
+                    or "\\" in part
+                    or ".." in part
+                    or part.startswith("~")
+                    or _WINDOWS_DRIVE_ABS_RE.match(part)
+                    or _WINDOWS_DRIVE_REL_RE.match(part)
+                ):
+                    self._validate_path_value(
+                        part,
+                        task_workspace_resolved,
+                        is_flag_context=is_file_key,
+                        allow_http_url=False,
+                    )
+
+    def _validate_python_args(
+        self, args: Sequence[str], task_workspace_resolved: Path
+    ) -> list[str]:
+        validated: list[str] = []
+        seen_script = False
+        for arg in args:
+            if not seen_script and arg == "-":
+                raise self._policy_error("Stdin execution '-' is forbidden for 'python'")
+            if not seen_script and arg.startswith("-"):
+                if arg in _PYTHON_SAFE_LONG_FLAGS or _PYTHON_SAFE_SHORT_RE.match(arg):
+                    validated.append(arg)
+                    continue
+                raise self._policy_error(
+                    f"Flag {arg!r} is not permitted for 'python'"
+                )
+            seen_script = True
+            if "=" in arg:
+                _, val = arg.split("=", 1)
+                self._validate_path_value(
+                    val, task_workspace_resolved, allow_http_url=False
+                )
+            else:
+                self._validate_path_value(
+                    arg, task_workspace_resolved, allow_http_url=False
+                )
+            validated.append(arg)
+        return validated
+
+    def _validate_node_args(
+        self, args: Sequence[str], task_workspace_resolved: Path
+    ) -> list[str]:
+        validated: list[str] = []
+        seen_script = False
+        for arg in args:
+            if not seen_script and arg == "-":
+                raise self._policy_error("Stdin execution '-' is forbidden for 'node'")
+            if not seen_script and arg.startswith("-"):
+                if arg in _NODE_SAFE_FLAGS:
+                    validated.append(arg)
+                    continue
+                raise self._policy_error(f"Flag {arg!r} is not permitted for 'node'")
+            seen_script = True
+            if "=" in arg:
+                _, val = arg.split("=", 1)
+                self._validate_path_value(
+                    val, task_workspace_resolved, allow_http_url=False
+                )
+            else:
+                self._validate_path_value(
+                    arg, task_workspace_resolved, allow_http_url=False
+                )
+            validated.append(arg)
+        return validated
+
+    def _validate_ytdlp_args(
+        self, args: Sequence[str], task_workspace_resolved: Path
+    ) -> list[str]:
+        validated: list[str] = []
+        expect_path = False
+        expect_paths_prefix = False
+        expect_scalar = False
+
+        for arg in args:
+            if expect_path:
+                self._validate_path_value(
+                    arg,
+                    task_workspace_resolved,
+                    is_flag_context=True,
+                    allow_http_url=False,
+                    allow_ytdlp_prefix=expect_paths_prefix,
+                )
+                expect_path = False
+                expect_paths_prefix = False
+                validated.append(arg)
+                continue
+
+            if expect_scalar:
+                if arg.startswith("-"):
+                    raise self._policy_error(f"Expected scalar value, got flag {arg!r}")
+                self._validate_path_value(
+                    arg, task_workspace_resolved, allow_http_url=False
+                )
+                expect_scalar = False
+                validated.append(arg)
+                continue
+
+            if arg == "-":
+                raise self._policy_error("Stdin '-' is forbidden for 'yt-dlp'")
+
+            if arg.startswith("-"):
+                if "=" in arg:
+                    flag_part, val_part = arg.split("=", 1)
+                    if flag_part in _YTDLP_PATH_FLAGS:
+                        self._validate_path_value(
+                            val_part,
+                            task_workspace_resolved,
+                            is_flag_context=True,
+                            allow_http_url=False,
+                            allow_ytdlp_prefix=(flag_part in {"-P", "--paths"}),
+                        )
+                        validated.append(arg)
+                        continue
+                    if flag_part in _YTDLP_SCALAR_FLAGS:
+                        self._validate_path_value(
+                            val_part, task_workspace_resolved, allow_http_url=False
+                        )
+                        validated.append(arg)
+                        continue
+                    raise self._policy_error(
+                        f"Flag {flag_part!r} is not permitted for 'yt-dlp'"
+                    )
+
+                if arg in _YTDLP_SAFE_NO_VAL_FLAGS:
+                    validated.append(arg)
+                    continue
+                if arg in _YTDLP_PATH_FLAGS:
+                    expect_path = True
+                    expect_paths_prefix = arg in {"-P", "--paths"}
+                    validated.append(arg)
+                    continue
+                if arg in _YTDLP_SCALAR_FLAGS:
+                    expect_scalar = True
+                    validated.append(arg)
+                    continue
+
+                # Glued short flags: e.g. -o../escape.mp4, -a/etc/passwd, -P/tmp/escape, -fbest
+                if not arg.startswith("--") and len(arg) > 2:
+                    prefix = arg[:2]
+                    suffix = arg[2:]
+                    if prefix in _YTDLP_PATH_FLAGS:
+                        self._validate_path_value(
+                            suffix,
+                            task_workspace_resolved,
+                            is_flag_context=True,
+                            allow_http_url=False,
+                            allow_ytdlp_prefix=(prefix == "-P"),
+                        )
+                        validated.append(arg)
+                        continue
+                    if prefix in _YTDLP_SCALAR_FLAGS:
+                        self._validate_path_value(
+                            suffix, task_workspace_resolved, allow_http_url=False
+                        )
+                        validated.append(arg)
+                        continue
+
+                raise self._policy_error(f"Flag {arg!r} is not permitted for 'yt-dlp'")
+
+            self._validate_path_value(arg, task_workspace_resolved, allow_http_url=True)
+            validated.append(arg)
+
+        if expect_path or expect_scalar:
+            raise self._policy_error(f"Flag {validated[-1]!r} requires a value")
+        return validated
+
+    def _validate_ffmpeg_args(
+        self, executable: str, args: Sequence[str], task_workspace_resolved: Path
+    ) -> list[str]:
+        validated: list[str] = []
+        expect_path = False
+        expect_filter = False
+
+        for arg in args:
+            if expect_path:
+                self._validate_path_value(
+                    arg,
+                    task_workspace_resolved,
+                    is_flag_context=True,
+                    allow_http_url=True,
+                )
+                expect_path = False
+                validated.append(arg)
+                continue
+
+            if expect_filter:
+                self._validate_ffmpeg_filter_graph(arg, task_workspace_resolved)
+                expect_filter = False
+                validated.append(arg)
+                continue
+
+            if arg == "-":
+                raise self._policy_error(f"Stdin/stdout '-' is forbidden for '{executable}'")
+
+            if arg.startswith("-"):
+                if "=" in arg:
+                    flag_part, val_part = arg.split("=", 1)
+                    flag_l = flag_part.lower()
+                    if flag_l in _FFMPEG_PATH_FLAGS:
+                        self._validate_path_value(
+                            val_part,
+                            task_workspace_resolved,
+                            is_flag_context=True,
+                            allow_http_url=True,
+                        )
+                        validated.append(arg)
+                        continue
+                    if flag_l in _FFMPEG_FILTER_FLAGS:
+                        self._validate_ffmpeg_filter_graph(
+                            val_part, task_workspace_resolved
+                        )
+                        validated.append(arg)
+                        continue
+                    if flag_l in _FFMPEG_SAFE_FLAGS or _FFMPEG_COLON_FLAG_RE.match(
+                        flag_part
+                    ):
+                        self._validate_path_value(
+                            val_part, task_workspace_resolved, allow_http_url=False
+                        )
+                        validated.append(arg)
+                        continue
+                    raise self._policy_error(
+                        f"Flag {flag_part!r} is not permitted for '{executable}'"
+                    )
+
+                arg_l = arg.lower()
+                if arg_l in _FFMPEG_PATH_FLAGS:
+                    expect_path = True
+                    validated.append(arg)
+                    continue
+                if arg_l in _FFMPEG_FILTER_FLAGS:
+                    expect_filter = True
+                    validated.append(arg)
+                    continue
+                if arg_l in _FFMPEG_SAFE_FLAGS or _FFMPEG_COLON_FLAG_RE.match(arg):
+                    validated.append(arg)
+                    continue
+
+                raise self._policy_error(
+                    f"Flag {arg!r} is not permitted for '{executable}'"
+                )
+
+            # Positional argument or scalar option value
+            if "=" in arg and not arg.lower().startswith(("http://", "https://")):
+                self._validate_ffmpeg_filter_graph(arg, task_workspace_resolved)
+            else:
+                self._validate_path_value(
+                    arg, task_workspace_resolved, allow_http_url=True
+                )
+            validated.append(arg)
+
+        if expect_path or expect_filter:
+            raise self._policy_error(f"Flag {validated[-1]!r} requires an argument")
+        return validated
 
     def _validate_args(
         self,
@@ -306,67 +762,40 @@ class ShellExecutor:
         task_workspace_resolved: Path,
     ) -> list[str]:
         if not isinstance(args, (list, tuple)):
-            raise SecurityPolicyError("args must be a sequence of strings")
-
-        validated: list[str] = []
-        expect_path_next = False
+            raise self._policy_error("args must be a sequence of strings")
 
         for raw_arg in args:
             if not isinstance(raw_arg, str):
-                raise SecurityPolicyError(
+                raise self._policy_error(
                     f"All arguments must be strings, got {type(raw_arg).__name__}"
                 )
             self._check_metacharacters(raw_arg)
-            self._validate_inline_execution(executable, raw_arg)
 
-            if expect_path_next:
-                self._validate_path_value(
-                    raw_arg, task_workspace_resolved, is_flag_context=True
-                )
-                expect_path_next = False
-                validated.append(raw_arg)
-                continue
+        if executable == "python":
+            return self._validate_python_args(args, task_workspace_resolved)
+        if executable == "node":
+            return self._validate_node_args(args, task_workspace_resolved)
+        if executable == "yt-dlp":
+            return self._validate_ytdlp_args(args, task_workspace_resolved)
+        if executable in {"ffmpeg", "ffprobe"}:
+            return self._validate_ffmpeg_args(executable, args, task_workspace_resolved)
 
+        # Generic fallback for custom allowed_executables
+        validated: list[str] = []
+        for raw_arg in args:
+            if raw_arg == "-":
+                raise self._policy_error("Stdin '-' is forbidden")
             if raw_arg.startswith("-"):
-                lower_flag = raw_arg.lower()
-                # Check flag=value form (e.g., --output=../../etc/passwd)
                 if "=" in raw_arg:
-                    flag_part, val_part = raw_arg.split("=", 1)
-                    self._validate_inline_execution(executable, flag_part)
+                    _, val_part = raw_arg.split("=", 1)
                     self._validate_path_value(
-                        val_part,
-                        task_workspace_resolved,
-                        is_flag_context=(flag_part.lower() in _PATH_TAKING_FLAGS),
+                        val_part, task_workspace_resolved, allow_http_url=False
                     )
-                elif lower_flag in _PATH_TAKING_FLAGS:
-                    # Note: for node, '-p' is already blocked above; for yt-dlp '-P' is paths
-                    if not (executable == "node" and lower_flag == "-p"):
-                        expect_path_next = True
-                validated.append(raw_arg)
-                continue
-
-            # Non-flag positional argument: validate if path-like, key=value, or file reference
-            if "=" in raw_arg and not _URL_SCHEME_RE.match(raw_arg):
-                _, val_part = raw_arg.split("=", 1)
-                if (
-                    "/" in val_part
-                    or "\\" in val_part
-                    or ".." in val_part
-                    or val_part.startswith("~")
-                    or _WINDOWS_DRIVE_ABS_RE.match(val_part)
-                    or _WINDOWS_DRIVE_REL_RE.match(val_part)
-                ):
-                    self._validate_path_value(val_part, task_workspace_resolved)
             else:
-                self._validate_path_value(raw_arg, task_workspace_resolved)
-
+                self._validate_path_value(
+                    raw_arg, task_workspace_resolved, allow_http_url=False
+                )
             validated.append(raw_arg)
-
-        if expect_path_next:
-            raise SecurityPolicyError(
-                f"Flag '{validated[-1]}' requires a path argument"
-            )
-
         return validated
 
     def _build_sanitized_env(self, task_workspace_resolved: Path) -> dict[str, str]:
@@ -392,19 +821,52 @@ class ShellExecutor:
             if sys.executable and Path(sys.executable).exists():
                 return sys.executable
         located = shutil.which(norm_exec)
-        return located or norm_exec
+        if not located:
+            raise FileNotFoundError(
+                f"Allowed executable '{norm_exec}' was not found on system PATH"
+            )
+        return located
 
-    def _decode_and_sanitize_output(self, raw_bytes: bytes) -> str:
-        truncated = False
+    def _decode_and_sanitize_output(
+        self, raw_bytes: bytes, *, truncated: bool = False
+    ) -> str:
+        was_truncated = truncated
         data = raw_bytes
         if len(data) > self.max_output_bytes:
             data = data[: self.max_output_bytes]
-            truncated = True
+            was_truncated = True
         text = data.decode("utf-8", errors="replace")
         masked = str(mask_secrets(text, extra_secrets=self.extra_secrets))
-        if truncated:
+        if was_truncated:
             masked += "\n... [TRUNCATED]"
         return masked
+
+    @staticmethod
+    async def _read_bounded_stream(
+        stream: Optional[asyncio.StreamReader],
+        limit: int,
+    ) -> tuple[bytes, bool]:
+        if stream is None:
+            return b"", False
+        chunks: list[bytes] = []
+        total = 0
+        truncated = False
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            if total < limit:
+                remaining = limit - total
+                if len(chunk) > remaining:
+                    chunks.append(chunk[:remaining])
+                    total += remaining
+                    truncated = True
+                else:
+                    chunks.append(chunk)
+                    total += len(chunk)
+            else:
+                truncated = True
+        return b"".join(chunks), truncated
 
     async def _kill_process_tree(self, proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
@@ -440,6 +902,26 @@ class ShellExecutor:
             except ProcessLookupError:
                 pass
 
+    async def _cleanup_process(self, proc: asyncio.subprocess.Process) -> None:
+        await self._kill_process_tree(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except Exception:
+            pass
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(proc, stream_name, None)
+            if stream is not None and hasattr(stream, "feed_eof"):
+                try:
+                    stream.feed_eof()
+                except Exception:
+                    pass
+        transport = getattr(proc, "_transport", None)
+        if transport is not None and hasattr(transport, "close"):
+            try:
+                transport.close()
+            except Exception:
+                pass
+
     async def run(
         self,
         executable: str,
@@ -453,6 +935,10 @@ class ShellExecutor:
         norm_exec = self._validate_executable(executable)
         ws_resolved = self._validate_task_workspace(task_workspace)
         validated_args = self._validate_args(norm_exec, args, ws_resolved)
+        masked_args = [
+            str(mask_secrets(arg, extra_secrets=self.extra_secrets))
+            for arg in validated_args
+        ]
         effective_timeout = (
             float(timeout_s) if timeout_s is not None else self.default_timeout_s
         )
@@ -481,62 +967,48 @@ class ShellExecutor:
             **spawn_kwargs,
         )
 
+        read_task = asyncio.gather(
+            self._read_bounded_stream(proc.stdout, self.max_output_bytes),
+            self._read_bounded_stream(proc.stderr, self.max_output_bytes),
+            proc.wait(),
+        )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=effective_timeout,
+            (stdout_bytes, out_trunc), (stderr_bytes, err_trunc), returncode = (
+                await asyncio.wait_for(read_task, timeout=effective_timeout)
             )
             duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
             return ShellResult(
                 executable=norm_exec,
-                args=validated_args,
-                returncode=int(proc.returncode or 0),
-                stdout=self._decode_and_sanitize_output(stdout_bytes or b""),
-                stderr=self._decode_and_sanitize_output(stderr_bytes or b""),
+                args=masked_args,
+                returncode=int(returncode or 0),
+                stdout=self._decode_and_sanitize_output(stdout_bytes, truncated=out_trunc),
+                stderr=self._decode_and_sanitize_output(stderr_bytes, truncated=err_trunc),
                 timed_out=False,
                 duration_ms=duration_ms,
             )
         except asyncio.TimeoutError as exc:
-            await self._kill_process_tree(proc)
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                stdout_bytes, stderr_bytes = b"", b""
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-
+            await asyncio.shield(self._cleanup_process(proc))
             duration_ms = max(0, int((time.perf_counter() - t0) * 1000))
-            out_str = self._decode_and_sanitize_output(stdout_bytes or b"")
-            err_str = self._decode_and_sanitize_output(stderr_bytes or b"")
-
             if raise_on_timeout:
                 raise ShellTimeoutError(
-                    f"Command '{norm_exec}' timed out after {effective_timeout}s",
+                    mask_policy_text(
+                        f"Command '{norm_exec}' timed out after {effective_timeout}s",
+                        self.extra_secrets,
+                    ),
                     executable=norm_exec,
                     timeout_s=effective_timeout,
-                    stdout=out_str,
-                    stderr=err_str,
                     duration_ms=duration_ms,
                 ) from exc
 
             return ShellResult(
                 executable=norm_exec,
-                args=validated_args,
+                args=masked_args,
                 returncode=-1,
-                stdout=out_str,
-                stderr=err_str,
+                stdout="",
+                stderr="",
                 timed_out=True,
                 duration_ms=duration_ms,
             )
         except BaseException:
-            await self._kill_process_tree(proc)
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except Exception:
-                pass
+            await asyncio.shield(self._cleanup_process(proc))
             raise

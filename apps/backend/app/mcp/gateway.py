@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from app.config import AppSettings, get_settings
 from app.mcp.browser_server import BrowserController
+from app.mcp.security import validate_task_workspace
 from app.mcp.shell_server import SecurityPolicyError, ShellExecutor
 
 
@@ -62,6 +63,7 @@ class McpGateway:
         settings: Optional[AppSettings] = None,
         shell_executor: Optional[ShellExecutor] = None,
         browser_controller: Optional[BrowserController] = None,
+        dns_resolver: Optional[Callable[[str], Iterable[str]]] = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.workspace_root = self.settings.workspace_dir.resolve()
@@ -76,11 +78,20 @@ class McpGateway:
         self.shell = shell_executor or ShellExecutor(
             workspace_root=self.workspace_root,
             extra_secrets=secrets,
+            dns_resolver=dns_resolver,
         )
         self.browser = browser_controller or BrowserController(
             workspace_root=self.workspace_root,
             extra_secrets=secrets,
+            dns_resolver=dns_resolver,
         )
+
+        # Ensure gateway secrets are always included even when executors were injected
+        for sec in secrets:
+            if sec not in self.shell.extra_secrets:
+                self.shell.extra_secrets.append(sec)
+            if sec not in self.browser.extra_secrets:
+                self.browser.extra_secrets.append(sec)
 
     async def __aenter__(self) -> "McpGateway":
         return self
@@ -96,16 +107,20 @@ class McpGateway:
         return [dict(item) for item in _TOOL_REGISTRY]
 
     def _validate_task_workspace(self, task_workspace: Path | str) -> Path:
-        ws = Path(task_workspace).resolve()
-        if not ws.is_relative_to(self.workspace_root):
-            raise SecurityPolicyError(
-                f"task_workspace '{task_workspace}' escapes configured workspace_dir '{self.workspace_root}'"
+        return validate_task_workspace(
+            task_workspace,
+            self.workspace_root,
+            error_cls=SecurityPolicyError,
+            extra_secrets=self.shell.extra_secrets,
+        )
+
+    @staticmethod
+    def _require_param(args: dict[str, Any], key: str, tool_name: str) -> Any:
+        if key not in args or args[key] is None:
+            raise ValueError(
+                f"Missing required parameter '{key}' for MCP tool '{tool_name}'"
             )
-        if not ws.exists() or not ws.is_dir():
-            raise SecurityPolicyError(
-                f"task_workspace '{task_workspace}' must be an existing directory"
-            )
-        return ws
+        return args[key]
 
     async def call_tool(
         self,
@@ -115,36 +130,44 @@ class McpGateway:
     ) -> dict[str, Any]:
         """Dispatch a tool invocation with workspace containment enforcement."""
         ws = self._validate_task_workspace(task_workspace)
+        if params is not None and not isinstance(params, dict):
+            raise ValueError("MCP tool params must be a dictionary")
         args = dict(params or {})
 
         if name == "shell.run":
+            executable = self._require_param(args, "executable", name)
+            cmd_args = args.get("args", [])
             result = await self.shell.run(
-                executable=args["executable"],
-                args=args.get("args", []),
+                executable=executable,
+                args=cmd_args,
                 task_workspace=ws,
                 timeout_s=args.get("timeout_s"),
             )
             return result.to_dict()
 
         if name == "browser.navigate":
+            url = self._require_param(args, "url", name)
             result = await self.browser.navigate(
-                url=args["url"],
+                url=url,
                 task_workspace=ws,
                 wait_until=args.get("wait_until", "domcontentloaded"),
             )
             return result.to_dict()
 
         if name == "browser.click":
+            selector = self._require_param(args, "selector", name)
             result = await self.browser.click(
-                selector=args["selector"],
+                selector=selector,
                 task_workspace=ws,
             )
             return result.to_dict()
 
         if name == "browser.fill":
+            selector = self._require_param(args, "selector", name)
+            value = self._require_param(args, "value", name)
             result = await self.browser.fill(
-                selector=args["selector"],
-                value=args["value"],
+                selector=selector,
+                value=value,
                 task_workspace=ws,
             )
             return result.to_dict()
@@ -161,8 +184,9 @@ class McpGateway:
             return result.to_dict()
 
         if name == "browser.screenshot":
+            output_path = self._require_param(args, "output_path", name)
             result = await self.browser.screenshot(
-                output_path=args["output_path"],
+                output_path=output_path,
                 full_page=bool(args.get("full_page", True)),
                 selector=args.get("selector"),
                 task_workspace=ws,
@@ -170,9 +194,11 @@ class McpGateway:
             return result.to_dict()
 
         if name == "browser.render_html_to_png":
+            html = self._require_param(args, "html", name)
+            output_path = self._require_param(args, "output_path", name)
             result = await self.browser.render_html_to_png(
-                html=args["html"],
-                output_path=args["output_path"],
+                html=html,
+                output_path=output_path,
                 width=int(args.get("width", 1280)),
                 height=int(args.get("height", 720)),
                 full_page=bool(args.get("full_page", False)),
