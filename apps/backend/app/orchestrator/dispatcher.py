@@ -15,6 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.base import BaseWorkerAgent, WorkerResult
+from app.config import get_settings
 from app.db.models import Agent, SubTask, Task, TaskStatus, TurnLog
 from app.db.state_machine import TaskStateMachine
 from app.llm.router import LlmRouter
@@ -24,27 +25,47 @@ if TYPE_CHECKING:
     from app.api.ws import TaskWebSocketManager
 
 
+class TaskDispatchConflictError(RuntimeError):
+    """Raised when a task cannot be dispatched from its current lifecycle state."""
+
+
 # ============================================================================
 # Secret Masking Utility
 # ============================================================================
+
+_SECRET_KEYS_PATTERN = (
+    r"password|passwd|pwd|api_?key|secret|local_auth_token|auth_token|"
+    r"access_token|refresh_token|client_secret|private_key|bearer_token|"
+    r"x-local-auth-token|authorization"
+)
 
 _SECRET_STRING_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # OpenAI / Anthropic style keys (sk-..., sk-proj-..., sk-ant-...)
     (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"), "sk-***REDACTED***"),
     # Google / Gemini API keys (AIza...)
     (re.compile(r"\bAIza[0-9A-Za-z_-]{10,}\b"), "AIza***REDACTED***"),
-    # Bearer tokens
-    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer ***REDACTED***"),
+    # Bearer tokens (unquoted or quoted)
+    (
+        re.compile(r"(?i)\bBearer\s+(['\"]?)([A-Za-z0-9._~+/=-]+)\1"),
+        r"Bearer \1***REDACTED***\1",
+    ),
     # Slack tokens (xoxb-, xoxp-, xoxa-, etc.)
     (re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{6,}\b"), "xox-***REDACTED***"),
     # GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{10,}\b"), "gh_***REDACTED***"),
-    # Inline key=value or key: value assignments
+    # Quoted JSON / dict-string / key="value" assignments (supports spaces inside quotes)
     (
         re.compile(
-            r"(?i)\b(password|passwd|pwd|api_?key|secret|local_auth_token|auth_token|access_token|refresh_token|client_secret|private_key)\b(\s*[:=]\s*)(['\"]?)([^\s'\",;}{]+)\3"
+            rf"(?i)(['\"]?)\b({_SECRET_KEYS_PATTERN})\b\1(\s*[:=]\s*)(['\"])([^'\"]*)\4"
         ),
-        r"\1\2\3***REDACTED***\3",
+        r"\1\2\1\3\4***REDACTED***\4",
+    ),
+    # Unquoted key=value or Header: value assignments
+    (
+        re.compile(
+            rf"(?i)(['\"]?)\b({_SECRET_KEYS_PATTERN})\b\1(\s*[:=]\s*)([^\s'\",;}}{{]+)"
+        ),
+        r"\1\2\1\3***REDACTED***",
     ),
 ]
 
@@ -58,7 +79,7 @@ def mask_secrets(
     data: Any,
     extra_secrets: Optional[Iterable[str]] = None,
 ) -> Any:
-    """Recursively redact API keys, tokens, and credentials from strings, dicts, and lists."""
+    """Recursively redact API keys, tokens, and credentials from strings, bytes, dicts, and lists."""
     extra_list = [s for s in (extra_secrets or ()) if isinstance(s, str) and len(s) >= 4]
 
     def _mask_str(text: str) -> str:
@@ -75,12 +96,19 @@ def mask_secrets(
             return node
         if isinstance(node, str):
             return _mask_str(node)
+        if isinstance(node, (bytes, bytearray)):
+            return _mask_str(bytes(node).decode("utf-8", errors="replace"))
         if isinstance(node, dict):
             cleaned: dict[Any, Any] = {}
             for k, v in node.items():
                 key_str = str(k)
-                if _SENSITIVE_DICT_KEY_RE.match(key_str) and isinstance(v, str) and v:
-                    cleaned[k] = "***REDACTED***"
+                if _SENSITIVE_DICT_KEY_RE.match(key_str) and not isinstance(
+                    v, (dict, list, tuple)
+                ):
+                    if v not in (None, "", b"", bytearray()):
+                        cleaned[k] = "***REDACTED***"
+                    else:
+                        cleaned[k] = v
                 else:
                     cleaned[k] = _walk(v)
             return cleaned
@@ -141,6 +169,7 @@ class AgentDispatcher:
         session_factory: Optional[sessionmaker[Session]] = None,
         ws_manager: Optional["TaskWebSocketManager"] = None,
         llm_router: Optional[LlmRouter] = None,
+        extra_secrets: Optional[Iterable[str]] = None,
     ) -> None:
         if max_parallel < 1:
             raise ValueError("max_parallel must be >= 1")
@@ -153,18 +182,46 @@ class AgentDispatcher:
         self.session_factory = session_factory
         self.ws_manager = ws_manager
         self.llm_router = llm_router or LlmRouter()
+        if extra_secrets is not None:
+            self.extra_secrets = [str(s) for s in extra_secrets if s]
+        else:
+            default_tok = get_settings().local_auth_token
+            self.extra_secrets = [default_tok] if default_tok else []
 
         self._semaphore = asyncio.Semaphore(max_parallel)
         self._agent_locks: dict[str, asyncio.Lock] = {}
+        self._canonical_agent_map: dict[str, str] = {}
         self._db_lock = asyncio.Lock()
+
+    @staticmethod
+    def _normalize_agent_key(agent_id: str) -> str:
+        """Normalize agent handle/id so 'ContentWriter' and 'agent-content-writer' map identically."""
+        cleaned = agent_id.strip().lower()
+        if cleaned.startswith("agent-"):
+            cleaned = cleaned[len("agent-"):]
+        return re.sub(r"[-_]", "", cleaned)
+
+    def _populate_agent_map_sync(self, session: Session) -> None:
+        """Cache DB Agent id/name -> canonical lowercase Agent.id."""
+        for ag_id, ag_name in session.query(Agent.id, Agent.name).all():
+            canonical = str(ag_id).strip().lower()
+            self._canonical_agent_map[canonical] = canonical
+            if ag_name:
+                self._canonical_agent_map[str(ag_name).strip().lower()] = canonical
+                self._canonical_agent_map[self._normalize_agent_key(str(ag_name))] = canonical
+            self._canonical_agent_map[self._normalize_agent_key(str(ag_id))] = canonical
 
     def _get_agent_lock(self, agent_id: Optional[str]) -> Optional[asyncio.Lock]:
         """Return FIFO asyncio.Lock for a given agent_id, or None for unbound items."""
         if not agent_id:
             return None
-        key = str(agent_id).strip().lower()
-        if not key:
+        raw = str(agent_id).strip().lower()
+        if not raw:
             return None
+        key = self._canonical_agent_map.get(raw)
+        if key is None:
+            norm = self._normalize_agent_key(raw)
+            key = self._canonical_agent_map.get(norm, norm or raw)
         if key not in self._agent_locks:
             self._agent_locks[key] = asyncio.Lock()
         return self._agent_locks[key]
@@ -258,10 +315,13 @@ class AgentDispatcher:
 
         return list(await asyncio.gather(*(_run_one(item) for item in items)))
 
+    def _mask(self, data: Any) -> Any:
+        return mask_secrets(data, extra_secrets=self.extra_secrets)
+
     async def _broadcast(self, task_id: str, event: dict[str, Any]) -> None:
         if self.ws_manager is None:
             return
-        await self.ws_manager.broadcast(task_id, mask_secrets(event))
+        await self.ws_manager.broadcast(task_id, self._mask(event))
 
     def _resolve_agent_record_sync(self, db: Optional[Session], agent_id: str) -> Agent:
         """Load Agent ORM record from DB or synthesize an in-memory fallback."""
@@ -338,34 +398,47 @@ class AgentDispatcher:
         suffix = uuid.uuid5(uuid.NAMESPACE_DNS, raw).hex[:12]
         return f"{raw[:51]}-{suffix}"
 
+    NON_DISPATCHABLE_STATUSES = (
+        TaskStatus.RUNNING,
+        TaskStatus.WAITING_REVIEW,
+        TaskStatus.COMPLETED,
+        TaskStatus.CANCELLED,
+    )
+
     async def _prepare_task_and_subtasks(
         self,
         task_id: str,
         plan: ExecutionPlan,
     ) -> dict[str, str]:
-        """Transition Task to RUNNING and ensure SubTask rows exist in SQLite."""
+        """Validate task state, transition to RUNNING, and ensure SubTask rows exist in SQLite."""
         subtask_db_ids: dict[str, str] = {}
         if self.session_factory is None:
             return subtask_db_ids
 
         async with self._db_lock:
             with self.session_factory() as s:
+                self._populate_agent_map_sync(s)
                 task = s.get(Task, task_id)
                 if task is None:
                     return subtask_db_ids
 
-                if task.status in (
-                    TaskStatus.PENDING,
-                    TaskStatus.PAUSED,
-                    TaskStatus.REJECTED,
-                ):
-                    TaskStateMachine.transition(
-                        session=s,
-                        task_id=task_id,
-                        target_state=TaskStatus.RUNNING,
-                        actor="commander",
-                        reason="dispatch_started",
+                current_status = (
+                    TaskStatus(task.status)
+                    if isinstance(task.status, str)
+                    else task.status
+                )
+                if current_status in self.NON_DISPATCHABLE_STATUSES:
+                    raise TaskDispatchConflictError(
+                        f"Task '{task_id}' cannot be dispatched from state '{current_status.value}'"
                     )
+
+                TaskStateMachine.transition(
+                    session=s,
+                    task_id=task_id,
+                    target_state=TaskStatus.RUNNING,
+                    actor="commander",
+                    reason="dispatch_started",
+                )
 
                 for idx, node in enumerate(plan.nodes):
                     # Reuse pre-existing SubTask if caller inserted one with id=node.id for this task
@@ -375,12 +448,16 @@ class AgentDispatcher:
                         .first()
                     )
                     if existing is not None:
+                        existing.status = "pending"
+                        existing.result = None
                         subtask_db_ids[node.id] = existing.id
                         continue
 
                     candidate_id = self._build_subtask_db_id(task_id, node.id)
                     existing_scoped = s.get(SubTask, candidate_id)
                     if existing_scoped is not None:
+                        existing_scoped.status = "pending"
+                        existing_scoped.result = None
                         subtask_db_ids[node.id] = existing_scoped.id
                         continue
 
@@ -417,7 +494,7 @@ class AgentDispatcher:
                 if st is not None:
                     st.status = status_value
                     if result_payload is not None:
-                        st.result = mask_secrets(
+                        st.result = self._mask(
                             result_payload
                             if isinstance(result_payload, dict)
                             else {"value": result_payload}
@@ -439,9 +516,9 @@ class AgentDispatcher:
         error_message: Optional[str] = None,
     ) -> dict[str, Any]:
         """Append an immutable, secret-masked TurnLog row and return its serialized dict."""
-        masked_input = mask_secrets(input_payload)
-        masked_output = mask_secrets(output_payload)
-        masked_error = mask_secrets(error_message) if error_message else None
+        masked_input = self._mask(input_payload)
+        masked_output = self._mask(output_payload)
+        masked_error = self._mask(error_message) if error_message else None
         now = datetime.now(timezone.utc)
         turn_id = f"turn-{uuid.uuid4().hex[:12]}"
         turn_number = 1
@@ -588,7 +665,7 @@ class AgentDispatcher:
                     if isinstance(raw_res, WorkerResult):
                         if raw_res.status == "failed":
                             err_msg = str(
-                                mask_secrets(raw_res.error or "Worker returned failed status")
+                                self._mask(raw_res.error or "Worker returned failed status")
                             )
                             await self._set_subtask_status(
                                 st_db_id, "failed", {"error": err_msg}
@@ -649,7 +726,7 @@ class AgentDispatcher:
                         effective_ms = duration_ms
                         tool_name = "worker_fn" if self.worker_fn else "worker_agent"
 
-                    masked_out = mask_secrets(out_payload)
+                    masked_out = self._mask(out_payload)
                     await self._set_subtask_status(st_db_id, "completed", masked_out)
                     log_entry = await self._append_turn_log(
                         task_id=task_id,
@@ -720,7 +797,7 @@ class AgentDispatcher:
 
                 except Exception as exc:
                     duration_ms = max(1, int((time.perf_counter() - node_t0) * 1000))
-                    err_msg = str(mask_secrets(str(exc)))
+                    err_msg = str(self._mask(str(exc)))
                     await self._set_subtask_status(
                         st_db_id, "failed", {"error": err_msg}
                     )

@@ -14,7 +14,11 @@ from app.config import AppSettings, get_settings
 from app.db.models import Agent, Project, SubTask, Task, TaskStatus, TurnLog
 from app.db.session import DEFAULT_AGENTS, get_db, init_db
 from app.llm.router import LlmRouter
-from app.orchestrator.dispatcher import AgentDispatcher, mask_secrets
+from app.orchestrator.dispatcher import (
+    AgentDispatcher,
+    TaskDispatchConflictError,
+    mask_secrets,
+)
 from app.orchestrator.parser import ParsedIntent, PromptValidationError, TaskParser
 from app.orchestrator.planner import DagCycleError, DagPlanner, ExecutionPlan, SubTaskNode
 
@@ -71,7 +75,15 @@ def _get_session_factory(request: Request) -> sessionmaker[Session]:
     return init_db(settings.resolved_db_path, cache=True)
 
 
-def _serialize_turn(turn: TurnLog) -> dict[str, Any]:
+def _get_extra_secrets(request: Request) -> list[str]:
+    settings: AppSettings = getattr(request.app.state, "settings", None) or get_settings()
+    return [settings.local_auth_token] if settings.local_auth_token else []
+
+
+def _serialize_turn(
+    turn: TurnLog,
+    extra_secrets: Optional[list[str]] = None,
+) -> dict[str, Any]:
     return mask_secrets(
         {
             "id": turn.id,
@@ -88,7 +100,8 @@ def _serialize_turn(turn: TurnLog) -> dict[str, Any]:
             "status": turn.status,
             "error_message": turn.error_message,
             "created_at": turn.created_at.isoformat() if turn.created_at else None,
-        }
+        },
+        extra_secrets=extra_secrets,
     )
 
 
@@ -142,12 +155,17 @@ def _build_plan_for_task(
             for n in existing_plan["nodes"]
         ]
         waves = list(existing_plan.get("waves") or DagPlanner.compute_waves(nodes))
+        resolved_mode = (
+            payload.mode
+            if (payload is not None and payload.mode)
+            else str(existing_plan.get("mode") or mode)
+        )
         return ExecutionPlan(
             task_id=task.id,
             task_type=str(existing_plan.get("task_type") or meta.get("task_type") or "general"),
             nodes=nodes,
             waves=waves,
-            mode=str(existing_plan.get("mode") or mode),
+            mode=resolved_mode,
         )
 
     raw_prompt = task.description or task.title
@@ -294,6 +312,7 @@ def get_task_history(
 @router.get("/{task_id}", status_code=status.HTTP_200_OK)
 def get_task(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Retrieve Task details, subtasks, and execution turn count."""
@@ -311,6 +330,7 @@ def get_task(
         .all()
     )
     turn_count = db.query(TurnLog).filter(TurnLog.task_id == task_id).count()
+    extra_secrets = _get_extra_secrets(request)
 
     return {
         "status": "success",
@@ -337,7 +357,7 @@ def get_task(
                     "status": st.status,
                     "depends_on": st.depends_on or [],
                     "order_index": st.order_index,
-                    "result": mask_secrets(st.result),
+                    "result": mask_secrets(st.result, extra_secrets=extra_secrets),
                 }
                 for st in subtasks
             ],
@@ -361,13 +381,14 @@ async def dispatch_task(
         )
 
     if task.status in (
+        TaskStatus.RUNNING,
+        TaskStatus.WAITING_REVIEW,
         TaskStatus.COMPLETED,
         TaskStatus.CANCELLED,
-        TaskStatus.WAITING_REVIEW,
     ):
         raise HTTPException(
-            status_code=422,
-            detail=f"Task '{task_id}' is in status '{task.status.value}' and cannot be dispatched",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Task '{task_id}' cannot be dispatched from status '{task.status.value}'",
         )
 
     plan = _build_plan_for_task(task, db, payload)
@@ -379,6 +400,7 @@ async def dispatch_task(
     session_factory = _get_session_factory(request)
     ws_manager = getattr(request.app.state, "ws_manager", None)
     llm_router = getattr(request.app.state, "llm_router", None) or LlmRouter()
+    extra_secrets = _get_extra_secrets(request)
 
     dispatcher = AgentDispatcher(
         max_parallel=(payload.max_parallel if payload and payload.max_parallel else 3),
@@ -386,8 +408,15 @@ async def dispatch_task(
         session_factory=session_factory,
         ws_manager=ws_manager,
         llm_router=llm_router,
+        extra_secrets=extra_secrets,
     )
-    result = await dispatcher.dispatch(task_id=task_id, plan=plan)
+    try:
+        result = await dispatcher.dispatch(task_id=task_id, plan=plan)
+    except TaskDispatchConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
 
     return {
         "status": "success",
@@ -398,6 +427,7 @@ async def dispatch_task(
 @router.get("/{task_id}/turns", status_code=status.HTTP_200_OK)
 def get_task_turns(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """List immutable secret-masked TurnLog execution records for task_id."""
@@ -408,6 +438,7 @@ def get_task_turns(
             detail=f"Task '{task_id}' not found",
         )
 
+    extra_secrets = _get_extra_secrets(request)
     turns = (
         db.query(TurnLog)
         .filter(TurnLog.task_id == task_id)
@@ -416,5 +447,5 @@ def get_task_turns(
     )
     return {
         "status": "success",
-        "data": [_serialize_turn(t) for t in turns],
+        "data": [_serialize_turn(t, extra_secrets=extra_secrets) for t in turns],
     }

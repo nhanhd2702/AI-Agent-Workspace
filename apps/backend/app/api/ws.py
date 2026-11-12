@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
@@ -19,15 +19,20 @@ router = APIRouter(tags=["websocket"])
 class TaskWebSocketManager:
     """Manages active per-task WebSocket connections and broadcasts turn events safely."""
 
-    def __init__(self) -> None:
+    def __init__(self, extra_secrets: Optional[Iterable[str]] = None) -> None:
         self._connections: dict[str, set[WebSocket]] = {}
         self._lock = asyncio.Lock()
+        self._extra_secrets = [str(s) for s in (extra_secrets or ()) if s]
+
+    async def register(self, task_id: str, websocket: WebSocket) -> None:
+        """Register an already-accepted WebSocket connection for task_id."""
+        async with self._lock:
+            self._connections.setdefault(task_id, set()).add(websocket)
 
     async def connect(self, task_id: str, websocket: WebSocket) -> None:
         """Accept and register a WebSocket connection for task_id."""
         await websocket.accept()
-        async with self._lock:
-            self._connections.setdefault(task_id, set()).add(websocket)
+        await self.register(task_id, websocket)
 
     async def disconnect(self, task_id: str, websocket: WebSocket) -> None:
         """Remove a WebSocket connection from task_id safely."""
@@ -53,7 +58,7 @@ class TaskWebSocketManager:
         if not targets:
             return
 
-        safe_event = mask_secrets(event)
+        safe_event = mask_secrets(event, extra_secrets=self._extra_secrets)
         dead_sockets: list[WebSocket] = []
 
         for ws in targets:
@@ -100,7 +105,12 @@ def _is_valid_token(provided: Optional[str], expected: str) -> bool:
     )
 
 
-def _load_recent_turns(websocket: WebSocket, task_id: str, limit: int = 20) -> list[dict[str, Any]]:
+def _load_recent_turns(
+    websocket: WebSocket,
+    task_id: str,
+    limit: int = 20,
+    extra_secrets: Optional[Iterable[str]] = None,
+) -> list[dict[str, Any]]:
     factory = getattr(websocket.app.state, "session_factory", None)
     if factory is None:
         settings = getattr(websocket.app.state, "settings", None) or get_settings()
@@ -111,10 +121,11 @@ def _load_recent_turns(websocket: WebSocket, task_id: str, limit: int = 20) -> l
             rows = (
                 session.query(TurnLog)
                 .filter(TurnLog.task_id == task_id)
-                .order_by(TurnLog.turn_number.asc(), TurnLog.created_at.asc())
+                .order_by(TurnLog.turn_number.desc(), TurnLog.created_at.desc())
                 .limit(limit)
                 .all()
             )
+            rows = list(reversed(rows))
             return [
                 mask_secrets(
                     {
@@ -132,7 +143,8 @@ def _load_recent_turns(websocket: WebSocket, task_id: str, limit: int = 20) -> l
                         "status": r.status,
                         "error_message": r.error_message,
                         "created_at": r.created_at.isoformat() if r.created_at else None,
-                    }
+                    },
+                    extra_secrets=extra_secrets,
                 )
                 for r in rows
             ]
@@ -154,10 +166,14 @@ async def task_events_websocket(websocket: WebSocket, task_id: str) -> None:
         return
 
     manager = _get_manager(websocket)
-    await manager.connect(task_id, websocket)
+    await websocket.accept()
 
     try:
-        recent_turns = _load_recent_turns(websocket, task_id)
+        recent_turns = _load_recent_turns(
+            websocket,
+            task_id,
+            extra_secrets=[settings.local_auth_token],
+        )
         await websocket.send_json(
             {
                 "event": "connected",
@@ -165,6 +181,9 @@ async def task_events_websocket(websocket: WebSocket, task_id: str) -> None:
                 "recent_turns": recent_turns,
             }
         )
+        # Register after sending the initial 'connected' frame so live broadcasts
+        # cannot race ahead of it.
+        await manager.register(task_id, websocket)
 
         while True:
             msg = await websocket.receive_text()

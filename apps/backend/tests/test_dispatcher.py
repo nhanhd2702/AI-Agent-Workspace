@@ -652,9 +652,9 @@ def test_tasks_dispatch_and_turns_api_endpoints(tmp_path: Path):
     assert task_data["status"] == "completed"
     assert task_data["turn_count"] == len(turns)
 
-    # Re-dispatching a completed task returns 422
+    # Re-dispatching a completed task returns 409 Conflict
     redispatch_resp = client.post(f"/api/v1/tasks/{task_id}/dispatch", headers=headers)
-    assert redispatch_resp.status_code == 422
+    assert redispatch_resp.status_code == 409
 
     # Dispatching with a cyclic custom DAG returns 422
     parse_resp2 = client.post(
@@ -754,4 +754,252 @@ async def test_parallel_default_workers_with_llm_router_and_sqlite_concurrency(d
         usages = session.query(UsageRecord).filter_by(task_id="task-parallel-llm").all()
         assert len(turns) == 4
         assert len(usages) == 4
+
+
+def test_dispatch_allows_failed_retry_and_blocks_running_with_409(tmp_path: Path):
+    """FAILED tasks can be re-dispatched cleanly to COMPLETED; RUNNING tasks return 409 Conflict."""
+    settings = AppSettings(workspace_dir=tmp_path, local_auth_token="retry-tok-123")
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"X-Local-Auth-Token": "retry-tok-123"}
+    factory = app.state.session_factory
+
+    with factory() as session:
+        session.add(
+            Task(
+                id="task-failed-retry",
+                project_id="proj-default",
+                title="Failed Task",
+                description="Retry after failure",
+                status=TaskStatus.FAILED,
+                task_metadata={"mode": "autopilot", "task_type": "general"},
+            )
+        )
+        session.add(
+            Task(
+                id="task-running-conflict",
+                project_id="proj-default",
+                title="Running Task",
+                description="Already executing",
+                status=TaskStatus.RUNNING,
+                task_metadata={"mode": "autopilot", "task_type": "general"},
+            )
+        )
+        session.commit()
+
+    # 1. Re-dispatching FAILED task succeeds (200) and transitions to COMPLETED
+    retry_resp = client.post("/api/v1/tasks/task-failed-retry/dispatch", headers=headers)
+    assert retry_resp.status_code == 200
+    assert retry_resp.json()["data"]["status"] == "completed"
+
+    with factory() as session:
+        retried = session.get(Task, "task-failed-retry")
+        assert retried is not None
+        assert retried.status == TaskStatus.COMPLETED
+
+    # 2. Dispatching RUNNING task is rejected with 409 Conflict
+    running_resp = client.post("/api/v1/tasks/task-running-conflict/dispatch", headers=headers)
+    assert running_resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_raises_conflict_on_running_and_handles_approved_retry(db_env):
+    """AgentDispatcher rejects RUNNING with TaskDispatchConflictError and transitions APPROVED -> COMPLETED."""
+    from app.orchestrator.dispatcher import TaskDispatchConflictError
+
+    factory, _ = db_env
+    with factory() as session:
+        session.add(
+            Task(
+                id="t-run-atomic",
+                project_id="proj-default",
+                title="Running",
+                status=TaskStatus.RUNNING,
+            )
+        )
+        session.add(
+            Task(
+                id="t-approved-run",
+                project_id="proj-default",
+                title="Approved",
+                status=TaskStatus.APPROVED,
+            )
+        )
+        session.commit()
+
+    worker_called = False
+
+    async def tracked_worker(node: SubTaskNode, context: dict[str, Any]):
+        nonlocal worker_called
+        worker_called = True
+        return {"content": "ok"}
+
+    dispatcher = AgentDispatcher(max_parallel=3, worker_fn=tracked_worker, session_factory=factory)
+
+    plan_running = ExecutionPlan(
+        task_id="t-run-atomic",
+        task_type="general",
+        nodes=[SubTaskNode(id="n1", agent_id="agent-commander", instruction="noop")],
+        waves=[["n1"]],
+    )
+    with pytest.raises(TaskDispatchConflictError):
+        await dispatcher.dispatch(task_id="t-run-atomic", plan=plan_running)
+    assert worker_called is False
+
+    plan_approved = ExecutionPlan(
+        task_id="t-approved-run",
+        task_type="general",
+        nodes=[SubTaskNode(id="n1", agent_id="agent-commander", instruction="deliver")],
+        waves=[["n1"]],
+    )
+    res = await dispatcher.dispatch(task_id="t-approved-run", plan=plan_approved)
+    assert res.status == "completed"
+    assert worker_called is True
+
+
+def test_mask_secrets_hardened_patterns_and_runtime_token():
+    """mask_secrets redacts JSON secret strings, X-Local-Auth-Token headers, bytes, quoted Bearer, and extra_secrets."""
+    payload = {
+        "json_blob": '{"api_key": "secret-12345", "local_auth_token": "tok-999", "note": "safe"}',
+        "header_str": "X-Local-Auth-Token: dev-local-token",
+        "quoted_bearer": 'Authorization: Bearer "eyJhbGciOiJIUzI1NiJ9.abc.xyz"',
+        "raw_bytes": b"token_bytes_here",
+        "secret": b"raw-secret-bytes",
+        "bare_runtime": "leaked my-custom-runtime-token-777 inside text",
+    }
+    masked = mask_secrets(payload, extra_secrets=["my-custom-runtime-token-777"])
+    assert "secret-12345" not in masked["json_blob"]
+    assert "tok-999" not in masked["json_blob"]
+    assert '"note": "safe"' in masked["json_blob"]
+    assert "dev-local-token" not in masked["header_str"]
+    assert "eyJhbGciOiJIUzI1NiJ9.abc.xyz" not in masked["quoted_bearer"]
+    assert masked["secret"] == "***REDACTED***"
+    assert "my-custom-runtime-token-777" not in masked["bare_runtime"]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_normalizes_agent_name_and_id_to_same_fifo_lock():
+    """'ContentWriter' and 'agent-content-writer' must share the exact same FIFO asyncio.Lock."""
+    active = 0
+    peak = 0
+    order: list[str] = []
+
+    async def worker(node: SubTaskNode):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        order.append(f"start:{node.id}")
+        await asyncio.sleep(0.03)
+        order.append(f"end:{node.id}")
+        active -= 1
+        return {"ok": True}
+
+    nodes = [
+        SubTaskNode(id="n1", agent_id="ContentWriter", instruction="first"),
+        SubTaskNode(id="n2", agent_id="agent-content-writer", instruction="second"),
+    ]
+    dispatcher = AgentDispatcher(max_parallel=3, worker_fn=worker)
+    await dispatcher.run_batch(nodes)
+
+    assert peak == 1
+    assert order == ["start:n1", "end:n1", "start:n2", "end:n2"]
+
+
+def test_websocket_loads_most_recent_20_turns_in_chronological_order(tmp_path: Path):
+    """WS initial snapshot returns the latest 20 turns (6..25) in ascending turn_number order."""
+    settings = AppSettings(workspace_dir=tmp_path, local_auth_token="ws-recent-tok")
+    app = create_app(settings)
+    factory = app.state.session_factory
+
+    with factory() as session:
+        session.add(
+            Task(
+                id="task-many-turns",
+                project_id="proj-default",
+                title="Many turns",
+                status=TaskStatus.RUNNING,
+            )
+        )
+        session.flush()
+        for i in range(1, 26):
+            session.add(
+                TurnLog(
+                    id=f"turn-{i}",
+                    task_id="task-many-turns",
+                    turn_number=i,
+                    action="execute_subtask",
+                    tool="worker_agent",
+                    input_payload={"step": i, "secret": "ws-recent-tok"},
+                    output_payload={"ok": True},
+                    status="completed",
+                )
+            )
+        session.commit()
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws/tasks/task-many-turns?token=ws-recent-tok") as ws:
+        msg = ws.receive_json()
+        assert msg["event"] == "connected"
+        turns = msg["recent_turns"]
+        assert len(turns) == 20
+        assert [t["turn_number"] for t in turns] == list(range(6, 26))
+        assert "ws-recent-tok" not in str(turns)
+
+
+def test_dispatch_explicit_mode_overrides_existing_plan_mode(tmp_path: Path):
+    """Explicit mode='copilot' on POST /dispatch overrides stored plan.mode='autopilot'."""
+    settings = AppSettings(workspace_dir=tmp_path, local_auth_token="mode-override-tok")
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"X-Local-Auth-Token": "mode-override-tok"}
+
+    parse_resp = client.post(
+        "/api/v1/tasks/parse",
+        headers=headers,
+        json={
+            "projectId": "proj-default",
+            "promptText": "Viết bài giới thiệu sản phẩm",
+            "mode": "autopilot",
+        },
+    )
+    assert parse_resp.status_code == 200
+    task_id = parse_resp.json()["data"]["task_id"]
+
+    # Seed stored plan with mode='autopilot' but one node having requires_review=False
+    factory = app.state.session_factory
+    with factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        meta = dict(task.task_metadata or {})
+        meta["plan"] = {
+            "task_id": task_id,
+            "task_type": "general",
+            "mode": "autopilot",
+            "nodes": [
+                {
+                    "id": "step1",
+                    "agent_id": "agent-commander",
+                    "instruction": "Do work",
+                    "depends_on": [],
+                    "requires_review": False,
+                    "metadata": {},
+                }
+            ],
+            "waves": [["step1"]],
+        }
+        task.task_metadata = meta
+        session.commit()
+
+    resp = client.post(
+        f"/api/v1/tasks/{task_id}/dispatch",
+        headers=headers,
+        json={"mode": "copilot"},
+    )
+    assert resp.status_code == 200
+    with factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None
+        assert task.task_metadata is not None
+        assert task.task_metadata["plan"]["mode"] == "copilot"
+
 

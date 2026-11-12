@@ -48,7 +48,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     )
     app.state.settings = resolved_settings
     app.state.session_factory = factory
-    app.state.ws_manager = TaskWebSocketManager()
+    app.state.ws_manager = TaskWebSocketManager(
+        extra_secrets=[resolved_settings.local_auth_token]
+    )
     app.state.recovered_tasks_count = 0
 
     # Mount API & WebSocket routers
