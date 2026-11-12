@@ -10,13 +10,14 @@ Provides unified, security-hardened client interfaces for:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import inspect
 import json
 from pathlib import Path
 import re
 import socket
 import time
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Optional
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -134,7 +135,7 @@ class ConnectorHealthResult:
 
 
 # ============================================================================
-# YouTube Client
+# YouTube Client Helpers & Class
 # ============================================================================
 
 _ALLOWED_YOUTUBE_HOSTS: frozenset[str] = frozenset(
@@ -147,6 +148,23 @@ _ALLOWED_YOUTUBE_HOSTS: frozenset[str] = frozenset(
 )
 
 _YOUTUBE_VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_RESOURCE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+_SHEET_RANGE_FORBIDDEN_CHARS: frozenset[str] = frozenset(
+    {"/", "\\", "?", "#", "\x00", "\r", "\n"}
+)
+
+_CHANNEL_SUBPATHS: frozenset[str] = frozenset(
+    {
+        "videos",
+        "shorts",
+        "streams",
+        "featured",
+        "community",
+        "playlists",
+        "about",
+        "live",
+    }
+)
 
 
 def _is_allowed_youtube_host(host: str) -> bool:
@@ -154,6 +172,50 @@ def _is_allowed_youtube_host(host: str) -> bool:
     if host_norm in _ALLOWED_YOUTUBE_HOSTS:
         return True
     return host_norm.endswith(".youtube.com")
+
+
+def extract_channel_identifier(channel_url: str) -> tuple[str, str]:
+    """Extract (identifier_type, identifier) from YouTube channel URL.
+
+    Strips known channel tab subpaths (/videos, /shorts, /streams, etc.) and
+    extracts the @handle, channel ID (/channel/UC...), custom URL (/c/...),
+    or user profile (/user/...).
+
+    Returns tuple of (id_type, identifier), e.g. ('handle', '@ChannelName')
+    or ('channel_id', 'UC1234567890').
+    """
+    parsed = urlparse(channel_url)
+    segments = [s for s in parsed.path.strip("/").split("/") if s]
+
+    # Strip known subpath tabs from end
+    while segments and segments[-1].lower() in _CHANNEL_SUBPATHS:
+        segments.pop()
+
+    if not segments:
+        raise ExternalApiError(f"Could not extract channel identifier from URL: {channel_url!r}")
+
+    # Check for @handle
+    for seg in segments:
+        if seg.startswith("@"):
+            return ("handle", seg)
+
+    # Check for /channel/<UC...>
+    if len(segments) >= 2 and segments[0].lower() == "channel":
+        return ("channel_id", segments[1])
+
+    # Check for /c/<name>
+    if len(segments) >= 2 and segments[0].lower() == "c":
+        return ("custom", segments[1])
+
+    # Check for /user/<name>
+    if len(segments) >= 2 and segments[0].lower() == "user":
+        return ("user", segments[1])
+
+    # Fallback to last segment
+    seg = segments[-1]
+    if seg.startswith("UC"):
+        return ("channel_id", seg)
+    return ("query", seg)
 
 
 class YouTubeClient:
@@ -167,6 +229,15 @@ class YouTubeClient:
         extra_secrets: Optional[Iterable[str]] = None,
         dns_resolver: Optional[Callable[[str], Iterable[str]]] = None,
     ) -> None:
+        """Initialize YouTube client.
+
+        Args:
+            api_key: Optional YouTube Data API v3 key.
+            transport: Optional in-memory transport or mock double.
+            gateway: Optional sandboxed McpGateway providing access to local media CLI tools (e.g. yt-dlp).
+            extra_secrets: Optional secrets to redact from error messages.
+            dns_resolver: Optional custom DNS resolver for SSRF validation.
+        """
         self.api_key = api_key
         self.transport = transport
         self.gateway = gateway
@@ -246,11 +317,20 @@ class YouTubeClient:
                     if isinstance(item, VideoMeta):
                         results.append(item)
                     elif isinstance(item, dict):
+                        raw_vc = item.get("view_count")
+                        # Never fabricate view_count as 0 when missing or None
+                        if raw_vc is None:
+                            continue
+                        try:
+                            view_cnt = int(raw_vc)
+                        except (ValueError, TypeError):
+                            continue
+
                         results.append(
                             VideoMeta(
                                 video_id=str(item["video_id"]),
                                 title=str(item["title"]),
-                                view_count=int(item["view_count"]),
+                                view_count=view_cnt,
                                 thumbnail_url=str(item["thumbnail_url"]),
                                 url=str(
                                     item.get("url")
@@ -272,10 +352,76 @@ class YouTubeClient:
         if self.api_key:
             return self._fetch_videos_via_api(validated_url, min_views=min_views, limit=limit)
 
+        if self.gateway is not None:
+            raise ExternalApiError(
+                "When using gateway without api_key, call fetch_channel_videos_via_gateway(..., task_workspace=...) in an async context",
+                extra_secrets=self.extra_secrets,
+            )
+
         raise ExternalApiError(
             "Missing credentials (api_key) or transport for YouTubeClient",
             extra_secrets=self.extra_secrets,
         )
+
+    async def fetch_channel_videos_via_gateway(
+        self,
+        channel_url: str,
+        task_workspace: Path,
+        min_views: int = 0,
+        limit: int = 20,
+    ) -> list[VideoMeta]:
+        """Fetch channel videos using yt-dlp via McpGateway in a sandboxed task workspace."""
+        if self.gateway is None:
+            raise ExternalApiError("McpGateway is not configured on this YouTubeClient")
+        validated_url = self._validate_channel_url(channel_url)
+        cmd_args = [
+            "--dump-json",
+            "--flat-playlist",
+            "--playlist-end",
+            str(limit * 2),
+            validated_url,
+        ]
+        res = await self.gateway.shell.run(
+            executable="yt-dlp",
+            args=cmd_args,
+            task_workspace=task_workspace,
+        )
+        if res.returncode != 0:
+            raise ExternalApiError(
+                f"yt-dlp execution failed: {res.stderr}",
+                extra_secrets=self.extra_secrets,
+            )
+
+        videos: list[VideoMeta] = []
+        for line in res.stdout.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                data = json.loads(line_str)
+            except Exception:
+                continue
+            raw_vc = data.get("view_count")
+            if raw_vc is None:
+                continue
+            try:
+                vc = int(raw_vc)
+            except (ValueError, TypeError):
+                continue
+            if vc < min_views:
+                continue
+            vid_id = data.get("id") or data.get("url") or ""
+            videos.append(
+                VideoMeta(
+                    video_id=str(vid_id),
+                    title=str(data.get("title", "")),
+                    view_count=vc,
+                    thumbnail_url=str(data.get("thumbnail") or f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg"),
+                    url=f"https://www.youtube.com/watch?v={vid_id}",
+                    duration_seconds=int(data["duration"]) if data.get("duration") is not None else None,
+                )
+            )
+        return videos[:limit]
 
     def _fetch_videos_via_api(
         self,
@@ -284,12 +430,10 @@ class YouTubeClient:
         limit: int,
     ) -> list[VideoMeta]:
         """Query YouTube Data API v3 search & videos endpoints."""
-        parsed = urlparse(channel_url)
-        path = parsed.path.strip("/")
-        handle_or_id = path.split("/")[-1] if path else ""
+        id_type, identifier = extract_channel_identifier(channel_url)
 
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=15.0, follow_redirects=False) as client:
                 search_params: dict[str, Any] = {
                     "key": self.api_key,
                     "part": "snippet",
@@ -297,12 +441,10 @@ class YouTubeClient:
                     "type": "video",
                     "order": "date",
                 }
-                if handle_or_id.startswith("@"):
-                    search_params["q"] = handle_or_id
-                elif handle_or_id.startswith("UC"):
-                    search_params["channelId"] = handle_or_id
+                if id_type == "channel_id":
+                    search_params["channelId"] = identifier
                 else:
-                    search_params["q"] = handle_or_id
+                    search_params["q"] = identifier
 
                 search_res = client.get(
                     "https://www.googleapis.com/youtube/v3/search",
@@ -343,7 +485,16 @@ class YouTubeClient:
                     vid_id = v["id"]
                     snippet = v.get("snippet", {})
                     stats = v.get("statistics", {})
-                    view_cnt = int(stats.get("viewCount", 0))
+
+                    # Never fabricate view_count as 0 when missing or None
+                    raw_vc = stats.get("viewCount")
+                    if raw_vc is None:
+                        continue
+                    try:
+                        view_cnt = int(raw_vc)
+                    except (ValueError, TypeError):
+                        continue
+
                     if view_cnt < min_views:
                         continue
                     thumb = (
@@ -454,7 +605,7 @@ class YouTubeClient:
 
         start = time.perf_counter()
         try:
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, follow_redirects=False) as client:
                 res = client.get(
                     "https://www.googleapis.com/youtube/v3/search",
                     params={"key": self.api_key, "part": "id", "maxResults": 1, "type": "video"},
@@ -509,7 +660,13 @@ class SheetsClient:
         return f"<SheetsClient credentials={masked!r} transport={trans_name!r}>"
 
     def _require_auth(self) -> None:
-        if self.credentials is None and self.transport is None:
+        has_creds = False
+        if isinstance(self.credentials, str):
+            has_creds = bool(self.credentials.strip())
+        elif isinstance(self.credentials, dict):
+            has_creds = bool(self.credentials)
+
+        if not has_creds and self.transport is None:
             raise ExternalApiError(
                 "Google Sheets credentials or transport required",
                 extra_secrets=self.extra_secrets,
@@ -520,17 +677,31 @@ class SheetsClient:
         spreadsheet_id: str,
         sheet_range: str,
         rows: Optional[list[list[Any]]] = None,
-    ) -> None:
-        if not spreadsheet_id or not isinstance(spreadsheet_id, str) or not spreadsheet_id.strip():
+    ) -> tuple[str, str]:
+        if not spreadsheet_id or not isinstance(spreadsheet_id, str):
             raise ExternalApiError(
                 "spreadsheet_id must be a non-empty string",
                 extra_secrets=self.extra_secrets,
             )
-        if not sheet_range or not isinstance(sheet_range, str) or not sheet_range.strip():
+        clean_id = spreadsheet_id.strip()
+        if not _RESOURCE_ID_RE.match(clean_id):
+            raise ExternalApiError(
+                f"Invalid spreadsheet_id format: {spreadsheet_id!r}",
+                extra_secrets=self.extra_secrets,
+            )
+
+        if not sheet_range or not isinstance(sheet_range, str):
             raise ExternalApiError(
                 "sheet_range must be a non-empty string",
                 extra_secrets=self.extra_secrets,
             )
+        clean_range = sheet_range.strip()
+        if not clean_range or any(ch in clean_range for ch in _SHEET_RANGE_FORBIDDEN_CHARS):
+            raise ExternalApiError(
+                f"Invalid sheet_range format (forbidden characters): {sheet_range!r}",
+                extra_secrets=self.extra_secrets,
+            )
+
         if rows is not None:
             if not isinstance(rows, list) or len(rows) == 0:
                 raise ExternalApiError(
@@ -542,6 +713,23 @@ class SheetsClient:
                     "Each item in rows must be a list",
                     extra_secrets=self.extra_secrets,
                 )
+        return clean_id, clean_range
+
+    def _extract_bearer_token(self) -> str:
+        token = ""
+        if isinstance(self.credentials, str):
+            token = self.credentials.strip()
+        elif isinstance(self.credentials, dict):
+            raw = self.credentials.get("token") or self.credentials.get("access_token")
+            if isinstance(raw, str):
+                token = raw.strip()
+
+        if not token:
+            raise ExternalApiError(
+                "Google Sheets credentials require a valid 'token' or 'access_token'",
+                extra_secrets=self.extra_secrets,
+            )
+        return token
 
     def append_rows(
         self,
@@ -551,39 +739,35 @@ class SheetsClient:
     ) -> SheetsAppendResult:
         """Append rows to a spreadsheet range."""
         self._require_auth()
-        self._validate_inputs(spreadsheet_id, sheet_range, rows)
+        clean_id, clean_range = self._validate_inputs(spreadsheet_id, sheet_range, rows)
 
         if self.transport is not None and hasattr(self.transport, "append_rows"):
             try:
-                res = self.transport.append_rows(spreadsheet_id, sheet_range, rows)
+                res = self.transport.append_rows(clean_id, clean_range, rows)
                 if isinstance(res, SheetsAppendResult):
                     return res
                 if isinstance(res, dict):
                     return SheetsAppendResult(
-                        spreadsheet_id=spreadsheet_id,
-                        sheet_range=sheet_range,
+                        spreadsheet_id=clean_id,
+                        sheet_range=clean_range,
                         rows_appended=int(res.get("rows_appended", len(rows))),
                         updated_range=res.get("updated_range"),
                         raw_response=res,
                     )
                 return SheetsAppendResult(
-                    spreadsheet_id=spreadsheet_id,
-                    sheet_range=sheet_range,
+                    spreadsheet_id=clean_id,
+                    sheet_range=clean_range,
                     rows_appended=len(rows),
                 )
             except Exception as exc:
                 raise ExternalApiError(str(exc), extra_secrets=self.extra_secrets) from exc
 
         # Production HTTP invocation
-        token = ""
-        if isinstance(self.credentials, str):
-            token = self.credentials
-        elif isinstance(self.credentials, dict):
-            token = self.credentials.get("token") or self.credentials.get("access_token", "")
-
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{sheet_range}:append"
+        token = self._extract_bearer_token()
+        encoded_range = quote(clean_range, safe="!':")
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{clean_id}/values/{encoded_range}:append"
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=15.0, follow_redirects=False) as client:
                 resp = client.post(
                     url,
                     headers={"Authorization": f"Bearer {token}"},
@@ -599,8 +783,8 @@ class SheetsClient:
                 data = resp.json()
                 updates = data.get("updates", {})
                 return SheetsAppendResult(
-                    spreadsheet_id=spreadsheet_id,
-                    sheet_range=sheet_range,
+                    spreadsheet_id=clean_id,
+                    sheet_range=clean_range,
                     rows_appended=int(updates.get("updatedRows", len(rows))),
                     updated_range=updates.get("updatedRange"),
                     raw_response=data,
@@ -613,23 +797,19 @@ class SheetsClient:
     def read_rows(self, spreadsheet_id: str, sheet_range: str) -> list[list[Any]]:
         """Read rows from a spreadsheet range."""
         self._require_auth()
-        self._validate_inputs(spreadsheet_id, sheet_range)
+        clean_id, clean_range = self._validate_inputs(spreadsheet_id, sheet_range)
 
         if self.transport is not None and hasattr(self.transport, "read_rows"):
             try:
-                return self.transport.read_rows(spreadsheet_id, sheet_range)
+                return self.transport.read_rows(clean_id, clean_range)
             except Exception as exc:
                 raise ExternalApiError(str(exc), extra_secrets=self.extra_secrets) from exc
 
-        token = ""
-        if isinstance(self.credentials, str):
-            token = self.credentials
-        elif isinstance(self.credentials, dict):
-            token = self.credentials.get("token") or self.credentials.get("access_token", "")
-
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{sheet_range}"
+        token = self._extract_bearer_token()
+        encoded_range = quote(clean_range, safe="!':")
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{clean_id}/values/{encoded_range}"
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=15.0, follow_redirects=False) as client:
                 resp = client.get(
                     url,
                     headers={"Authorization": f"Bearer {token}"},
@@ -704,7 +884,7 @@ class NotionClient:
         return f"<NotionClient api_token={masked!r} transport={trans_name!r}>"
 
     def _require_auth(self) -> None:
-        if self.api_token is None and self.transport is None:
+        if (not self.api_token or not str(self.api_token).strip()) and self.transport is None:
             raise ExternalApiError(
                 "Notion api_token or transport required",
                 extra_secrets=self.extra_secrets,
@@ -716,14 +896,28 @@ class NotionClient:
         title: str,
         content_blocks: Optional[list[dict[str, Any]]] = None,
         properties: Optional[dict[str, Any]] = None,
+        parent_type: Literal["database", "page"] = "database",
     ) -> NotionPageResult:
         """Create a page under parent database or page."""
         self._require_auth()
-        if not parent_id or not isinstance(parent_id, str) or not parent_id.strip():
+        if parent_type not in ("database", "page"):
+            raise ExternalApiError(
+                f"Invalid parent_type {parent_type!r}, must be 'database' or 'page'",
+                extra_secrets=self.extra_secrets,
+            )
+
+        if not parent_id or not isinstance(parent_id, str):
             raise ExternalApiError(
                 "parent_id must be a non-empty string",
                 extra_secrets=self.extra_secrets,
             )
+        clean_parent = parent_id.strip()
+        if not _RESOURCE_ID_RE.match(clean_parent):
+            raise ExternalApiError(
+                f"Invalid parent_id format: {parent_id!r}",
+                extra_secrets=self.extra_secrets,
+            )
+
         if not title or not isinstance(title, str) or not title.strip():
             raise ExternalApiError(
                 "title must be a non-empty string",
@@ -732,12 +926,17 @@ class NotionClient:
 
         if self.transport is not None and hasattr(self.transport, "create_page"):
             try:
-                res = self.transport.create_page(
-                    parent_id=parent_id,
-                    title=title,
-                    content_blocks=content_blocks,
-                    properties=properties,
-                )
+                sig = inspect.signature(self.transport.create_page)
+                call_kwargs: dict[str, Any] = {
+                    "parent_id": clean_parent,
+                    "title": title,
+                    "content_blocks": content_blocks,
+                    "properties": properties,
+                }
+                if "parent_type" in sig.parameters:
+                    call_kwargs["parent_type"] = parent_type
+
+                res = self.transport.create_page(**call_kwargs)
                 if isinstance(res, NotionPageResult):
                     return res
                 if isinstance(res, dict):
@@ -745,21 +944,26 @@ class NotionClient:
                         page_id=str(res.get("page_id") or res.get("id", "page-created")),
                         url=res.get("url"),
                         title=title,
-                        parent_id=parent_id,
+                        parent_id=clean_parent,
                         raw_response=res,
                     )
                 return NotionPageResult(
                     page_id="page-created",
                     title=title,
-                    parent_id=parent_id,
+                    parent_id=clean_parent,
                 )
             except Exception as exc:
                 raise ExternalApiError(str(exc), extra_secrets=self.extra_secrets) from exc
 
         # Production HTTP invocation
         url = "https://api.notion.com/v1/pages"
+        parent_payload = (
+            {"database_id": clean_parent}
+            if parent_type == "database"
+            else {"page_id": clean_parent}
+        )
         payload: dict[str, Any] = {
-            "parent": {"database_id": parent_id} if "-" in parent_id else {"page_id": parent_id},
+            "parent": parent_payload,
             "properties": properties
             or {
                 "title": {
@@ -771,7 +975,7 @@ class NotionClient:
             payload["children"] = content_blocks
 
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=15.0, follow_redirects=False) as client:
                 resp = client.post(
                     url,
                     headers={
@@ -792,7 +996,7 @@ class NotionClient:
                     page_id=data.get("id", ""),
                     url=data.get("url"),
                     title=title,
-                    parent_id=parent_id,
+                    parent_id=clean_parent,
                     raw_response=data,
                 )
         except ExternalApiError:
@@ -808,9 +1012,15 @@ class NotionClient:
     ) -> list[dict[str, Any]]:
         """Query a Notion database with optional filter and page size limit."""
         self._require_auth()
-        if not database_id or not isinstance(database_id, str) or not database_id.strip():
+        if not database_id or not isinstance(database_id, str):
             raise ExternalApiError(
                 "database_id must be a non-empty string",
+                extra_secrets=self.extra_secrets,
+            )
+        clean_db = database_id.strip()
+        if not _RESOURCE_ID_RE.match(clean_db):
+            raise ExternalApiError(
+                f"Invalid database_id format: {database_id!r}",
                 extra_secrets=self.extra_secrets,
             )
         if limit < 1:
@@ -819,20 +1029,20 @@ class NotionClient:
         if self.transport is not None and hasattr(self.transport, "query_database"):
             try:
                 return self.transport.query_database(
-                    database_id=database_id,
+                    database_id=clean_db,
                     filter_payload=filter_payload,
                     limit=limit,
                 )
             except Exception as exc:
                 raise ExternalApiError(str(exc), extra_secrets=self.extra_secrets) from exc
 
-        url = f"https://api.notion.com/v1/databases/{database_id}/query"
+        url = f"https://api.notion.com/v1/databases/{clean_db}/query"
         body: dict[str, Any] = {"page_size": min(limit, 100)}
         if filter_payload:
             body["filter"] = filter_payload
 
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=15.0, follow_redirects=False) as client:
                 resp = client.post(
                     url,
                     headers={

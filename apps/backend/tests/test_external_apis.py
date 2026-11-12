@@ -17,6 +17,7 @@ from app.mcp.external_apis import (
     VideoMeta,
     YouTubeClient,
     build_connector_client,
+    extract_channel_identifier,
 )
 
 
@@ -139,6 +140,7 @@ class MockNotionTransport:
         title: str,
         content_blocks: Optional[list[dict[str, Any]]] = None,
         properties: Optional[dict[str, Any]] = None,
+        parent_type: str = "database",
     ) -> NotionPageResult:
         if self.fail_with_secret:
             raise RuntimeError(f"Notion unauthorized with bearer {self.fail_with_secret}")
@@ -146,6 +148,7 @@ class MockNotionTransport:
         record = {
             "page_id": page_id,
             "parent_id": parent_id,
+            "parent_type": parent_type,
             "title": title,
             "content_blocks": content_blocks or [],
             "properties": properties or {},
@@ -156,7 +159,11 @@ class MockNotionTransport:
             url=f"https://notion.so/{page_id}",
             title=title,
             parent_id=parent_id,
-            raw_response={"id": page_id, "object": "page"},
+            raw_response={
+                "id": page_id,
+                "object": "page",
+                "parent": {f"{parent_type}_id": parent_id},
+            },
         )
 
     def query_database(
@@ -552,4 +559,131 @@ def test_youtube_fetch_channel_videos_dict_items_and_bounds() -> None:
 
     with pytest.raises(ExternalApiError, match="min_views cannot be negative"):
         client.fetch_channel_videos("https://www.youtube.com/@Channel", min_views=-5)
+
+
+# ---------------------------------------------------------------------------
+# Strict Review Hardening Tests (Items 1 - 8)
+# ---------------------------------------------------------------------------
+
+def test_youtube_missing_view_count_never_fabricated() -> None:
+    """Item 1: If view_count/viewCount is None or missing, skip video instead of fabricating 0."""
+    class MissingViewCountTransport:
+        def fetch_channel_videos(self, url: str, min_views: int = 0, limit: int = 20) -> list[dict[str, Any]]:
+            return [
+                {
+                    "video_id": "v_missing_vc",
+                    "title": "Video Without View Count",
+                    "view_count": None,  # Should be skipped, NEVER fabricated as 0
+                    "thumbnail_url": "https://img.youtube.com/thumb.jpg",
+                },
+                {
+                    "video_id": "v_has_vc",
+                    "title": "Valid Video",
+                    "view_count": 15000,
+                    "thumbnail_url": "https://img.youtube.com/thumb2.jpg",
+                },
+            ]
+
+    client = YouTubeClient(api_key="key", transport=MissingViewCountTransport())
+    videos = client.fetch_channel_videos("https://www.youtube.com/@Channel", min_views=0)
+    assert len(videos) == 1
+    assert videos[0].video_id == "v_has_vc"
+    assert videos[0].view_count == 15000
+
+
+def test_youtube_channel_subpath_extraction() -> None:
+    """Item 2: Subpaths like /videos, /shorts, /featured are stripped and identifiers extracted."""
+    # @Handle with subpaths
+    id_type, ident = extract_channel_identifier("https://www.youtube.com/@AIChannelOfficial/videos")
+    assert id_type == "handle"
+    assert ident == "@AIChannelOfficial"
+
+    id_type, ident = extract_channel_identifier("https://www.youtube.com/@Creator/shorts")
+    assert id_type == "handle"
+    assert ident == "@Creator"
+
+    # /channel/UC... with subpath
+    id_type, ident = extract_channel_identifier("https://www.youtube.com/channel/UC1234567890/featured")
+    assert id_type == "channel_id"
+    assert ident == "UC1234567890"
+
+    # /c/CustomName and /user/Username
+    id_type, ident = extract_channel_identifier("https://www.youtube.com/c/CustomChannel/community")
+    assert id_type == "custom"
+    assert ident == "CustomChannel"
+
+    id_type, ident = extract_channel_identifier("https://www.youtube.com/user/LegacyUser/playlists")
+    assert id_type == "user"
+    assert ident == "LegacyUser"
+
+
+def test_sheets_resource_id_and_range_injection_rejection() -> None:
+    """Item 3: Strict validation against path traversal and URI injection characters."""
+    client = SheetsClient(credentials={"token": "valid_token"}, transport=MockSheetsTransport())
+
+    # spreadsheet_id invalid injection
+    for bad_id in ["../secret_sheet", "sheet#fragment", "sheet?param=1", "sheet id with spaces", ""]:
+        with pytest.raises(ExternalApiError, match="spreadsheet_id"):
+            client.append_rows(bad_id, "Sheet1!A1", [["v"]])
+
+    # sheet_range URI injection characters
+    for bad_range in ["Sheet1/values", "Sheet1\\values", "Sheet1?evil=1", "Sheet1#anchor", ""]:
+        with pytest.raises(ExternalApiError, match="sheet_range"):
+            client.append_rows("valid_sheet_id", bad_range, [["v"]])
+
+
+def test_sheets_live_http_missing_token_raises_error() -> None:
+    """Item 5: Credentials without valid token must fail cleanly without empty Authorization header."""
+    client = SheetsClient(credentials={"client_email": "sa@example.com"}, transport=None)
+    with pytest.raises(ExternalApiError, match="Google Sheets credentials require a valid 'token' or 'access_token'"):
+        client.append_rows("valid_sheet_id", "Sheet1!A1", [["v"]])
+
+
+def test_notion_resource_id_injection_rejection() -> None:
+    """Item 3: Validate parent_id and database_id against strict regex."""
+    client = NotionClient(api_token="valid_token", transport=MockNotionTransport())
+
+    for bad_parent in ["../secret_page", "page#frag", "page?query=1", "parent id with spaces", ""]:
+        with pytest.raises(ExternalApiError, match="parent_id"):
+            client.create_page(bad_parent, "Title")
+
+    for bad_db in ["../secret_db", "db#frag", "db?filter=all", ""]:
+        with pytest.raises(ExternalApiError, match="database_id"):
+            client.query_database(bad_db)
+
+
+def test_notion_parent_type_parameter_and_validation() -> None:
+    """Item 4: Explicit parent_type ('database' vs 'page') instead of '-' heuristic."""
+    transport = MockNotionTransport()
+    client = NotionClient(api_token="valid_token", transport=transport)
+
+    # Page with parent_type="page" (even with dashed UUID)
+    res_page = client.create_page("uuid-1234-page", "Page Title", parent_type="page")
+    assert res_page.title == "Page Title"
+    assert transport.created_pages[-1]["parent_type"] == "page"
+
+    # Database with parent_type="database"
+    res_db = client.create_page("uuid5678db", "DB Row Title", parent_type="database")
+    assert res_db.title == "DB Row Title"
+    assert transport.created_pages[-1]["parent_type"] == "database"
+
+    # Invalid parent_type rejected
+    with pytest.raises(ExternalApiError, match="parent_type"):
+        client.create_page("uuid-1234", "Title", parent_type="invalid_type")  # type: ignore[arg-type]
+
+
+def test_notion_empty_token_raises_error() -> None:
+    """Item 8: Empty or whitespace api_token fails _require_auth cleanly."""
+    for empty_tok in ["", "   ", None]:
+        client = NotionClient(api_token=empty_tok, transport=None)
+        with pytest.raises(ExternalApiError, match="Notion api_token or transport required"):
+            client.create_page("parent_id_123", "Title")
+
+
+def test_youtube_gateway_documentation_and_error() -> None:
+    """Item 6: Gateway handling when api_key and transport are absent."""
+    client = YouTubeClient(gateway=object())  # Dummy gateway
+    with pytest.raises(ExternalApiError, match="gateway"):
+        client.fetch_channel_videos("https://www.youtube.com/@Channel")
+
 

@@ -18,6 +18,7 @@ from app.mcp.external_apis import (
     VideoMeta,
     YouTubeClient,
     build_connector_client,
+    extract_channel_identifier,
 )
 from app.mcp.gateway import McpGateway
 from app.mcp.security import (
@@ -54,6 +55,7 @@ __all__ = [
     "VideoMeta",
     "YouTubeClient",
     "build_connector_client",
+    "extract_channel_identifier",
     "validate_safe_http_url",
     "validate_task_workspace",
 ]
