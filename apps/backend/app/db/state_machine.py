@@ -100,6 +100,7 @@ class TaskStateMachine:
         target_state: TaskStatus | str,
         actor: str,
         reason: Optional[str] = None,
+        commit: bool = True,
     ) -> Task:
         """Transitions a task to a target state, validating against ALLOWED_TRANSITIONS and logging an audit record.
 
@@ -109,9 +110,11 @@ class TaskStateMachine:
             target_state: Destination TaskStatus enum or string value
             actor: Identity of initiator ("user", "commander", "system", agent slug)
             reason: Optional justification or feedback explaining the transition
+            commit: When True (default), commits and refreshes immediately. When False,
+                flushes changes into the active transaction so callers can commit atomically.
 
         Returns:
-            Updated and refreshed Task instance
+            Updated Task instance
 
         Raises:
             ValueError: If task_id does not exist
@@ -163,6 +166,9 @@ class TaskStateMachine:
             created_at=now,
         )
         session.add(audit)
-        session.commit()
-        session.refresh(task)
+        if commit:
+            session.commit()
+            session.refresh(task)
+        else:
+            session.flush()
         return task

@@ -33,7 +33,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             recovered_count = recover_interrupted_tasks(startup_session)
         app_instance.state.recovered_tasks_count = recovered_count
         app_instance.state.checkpoint_db_path = (
-            resolved_settings.workspace_dir / "checkpoints.db"
+            resolved_settings.resolved_db_path.parent / "checkpoints.db"
         ).resolve()
         yield
         # Dispose SQLAlchemy engine connections cleanly on shutdown
@@ -50,7 +50,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.settings = resolved_settings
     app.state.session_factory = factory
     app.state.checkpoint_db_path = (
-        resolved_settings.workspace_dir / "checkpoints.db"
+        resolved_settings.resolved_db_path.parent / "checkpoints.db"
     ).resolve()
     app.state.ws_manager = TaskWebSocketManager(
         extra_secrets=[resolved_settings.local_auth_token]

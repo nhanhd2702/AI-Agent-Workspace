@@ -214,6 +214,14 @@ export class ApiClient {
   }
 
   /**
+   * Retrieve a single Human-in-the-Loop review gate by ID.
+   */
+  async getReview(reviewId: string): Promise<ReviewGate> {
+    const raw = await this.request<any>(`/api/v1/reviews/${encodeURIComponent(reviewId)}`);
+    return this.normalizeReview(raw);
+  }
+
+  /**
    * Submit a human decision ('approve', 'edit', or 'reject') on a review gate.
    */
   async decideReview(
@@ -221,15 +229,18 @@ export class ApiClient {
     decision: ReviewDecision,
     payload?: ReviewDecidePayload
   ): Promise<ReviewGate> {
-    const raw = await this.request<any>(`/api/v1/reviews/${reviewId}/decide`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        decision,
-        feedback_text: payload?.feedbackText,
-        edited_content: payload?.editedContent,
-        actor: payload?.actor || "user",
-      }),
-    });
+    const raw = await this.request<any>(
+      `/api/v1/reviews/${encodeURIComponent(reviewId)}/decide`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          decision,
+          feedback_text: payload?.feedbackText,
+          edited_content: payload?.editedContent,
+          actor: payload?.actor || "user",
+        }),
+      }
+    );
     return this.normalizeReview(raw);
   }
 

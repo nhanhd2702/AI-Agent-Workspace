@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import asyncio
 import uuid
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import AppSettings
 from app.db.models import ReviewGate, Task, TaskAuditLog, TaskStatus, TurnLog
 from app.db.session import init_db
+from app.db.state_machine import TaskStateMachine
 from app.main import create_app
 from app.orchestrator.graph import OrchestratorGraph
 from app.orchestrator.planner import ExecutionPlan, SubTaskNode
@@ -550,3 +553,209 @@ def test_websocket_broadcasts_review_decided_event(env):
         assert event["task_id"] == task_id
         assert event["review_id"] == "rev-ws-1"
         assert event["decision"] == "approve"
+
+
+# --- 5. Regression Tests for Reviewer Findings ---
+
+
+def test_task_state_machine_transition_commit_false_rolls_back_atomically(tmp_path: Path):
+    """TaskStateMachine.transition(..., commit=False) flushes without committing until caller commits."""
+    SessionLocal = init_db(tmp_path / "fsm_atomic.db", cache=False)
+    with SessionLocal() as db:
+        from app.db.session import seed_defaults
+
+        seed_defaults(db)
+        db.add(
+            Task(
+                id="t-atomic",
+                project_id="proj-default",
+                title="Atomic FSM test",
+                status=TaskStatus.WAITING_REVIEW,
+            )
+        )
+        db.commit()
+
+        TaskStateMachine.transition(
+            db, "t-atomic", TaskStatus.REJECTED, actor="user", reason="r1", commit=False
+        )
+        TaskStateMachine.transition(
+            db, "t-atomic", TaskStatus.RUNNING, actor="system", reason="r2", commit=False
+        )
+        db.rollback()
+
+    with SessionLocal() as db:
+        t = db.get(Task, "t-atomic")
+        assert t is not None
+        assert t.status == TaskStatus.WAITING_REVIEW
+        assert db.query(TaskAuditLog).filter_by(task_id="t-atomic").count() == 0
+
+
+def test_decide_rejects_terminal_task_with_409_and_masks_actor(env):
+    client, app, _ = env
+    factory = app.state.session_factory
+    now = datetime.now(timezone.utc)
+
+    with factory() as db:
+        db.add(
+            Task(
+                id="task-terminal-done",
+                project_id="proj-default",
+                title="Already completed",
+                status=TaskStatus.COMPLETED,
+            )
+        )
+        db.add(
+            ReviewGate(
+                id="rev-terminal-done",
+                task_id="task-terminal-done",
+                gate_type="hil",
+                status="pending",
+                expires_at=now + timedelta(hours=24),
+            )
+        )
+        db.add(
+            Task(
+                id="task-mask-actor",
+                project_id="proj-default",
+                title="Actor masking task",
+                status=TaskStatus.WAITING_REVIEW,
+            )
+        )
+        db.add(
+            ReviewGate(
+                id="rev-mask-actor",
+                task_id="task-mask-actor",
+                gate_type="hil",
+                status="pending",
+                expires_at=now + timedelta(hours=24),
+            )
+        )
+        db.commit()
+
+    # Terminal task -> 409 Conflict
+    r_term = client.patch(
+        "/api/v1/reviews/rev-terminal-done/decide",
+        json={"decision": "approve"},
+    )
+    assert r_term.status_code == 409
+
+    # Secret inside actor is masked across ReviewGate, TurnLog, and TaskAuditLog
+    r_actor = client.patch(
+        "/api/v1/reviews/rev-mask-actor/decide",
+        json={
+            "decision": "reject",
+            "feedback_text": "Cần chỉnh sửa lại nội dung",
+            "actor": "user-sk-secretactor1234567890",
+        },
+    )
+    assert r_actor.status_code == 200
+    assert "sk-secretactor1234567890" not in str(r_actor.json()["data"]["actor"])
+
+    with factory() as db:
+        rev = db.get(ReviewGate, "rev-mask-actor")
+        assert rev is not None
+        assert rev.actor is not None
+        assert "sk-secretactor1234567890" not in rev.actor
+        assert "REDACTED" in rev.actor
+
+        turn = db.query(TurnLog).filter_by(task_id="task-mask-actor").first()
+        assert turn is not None
+        assert "sk-secretactor1234567890" not in str(turn.input_payload)
+
+        audit = db.query(TaskAuditLog).filter_by(task_id="task-mask-actor").first()
+        assert audit is not None
+        assert "sk-secretactor1234567890" not in audit.actor
+
+
+def test_decide_reverts_claim_to_pending_if_checkpoint_resume_fails(env, monkeypatch):
+    client, app, _ = env
+    factory = app.state.session_factory
+    now = datetime.now(timezone.utc)
+
+    with factory() as db:
+        db.add(
+            Task(
+                id="task-resume-fail",
+                project_id="proj-default",
+                title="Resume failure rollback",
+                status=TaskStatus.WAITING_REVIEW,
+            )
+        )
+        db.add(
+            ReviewGate(
+                id="rev-resume-fail",
+                task_id="task-resume-fail",
+                gate_type="storyboard",
+                status="pending",
+                expires_at=now + timedelta(hours=24),
+            )
+        )
+        db.commit()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated checkpoint failure")
+
+    monkeypatch.setattr("app.api.reviews._resume_graph_if_interrupted", boom)
+
+    with pytest.raises(RuntimeError, match="simulated checkpoint failure"):
+        client.patch(
+            "/api/v1/reviews/rev-resume-fail/decide",
+            json={"decision": "approve"},
+        )
+
+    with factory() as db:
+        rev = db.get(ReviewGate, "rev-resume-fail")
+        task = db.get(Task, "task-resume-fail")
+        assert rev is not None
+        assert rev.status == "pending"
+        assert rev.decided_at is None
+        assert task is not None
+        assert task.status == TaskStatus.WAITING_REVIEW
+        assert db.query(TaskAuditLog).filter_by(task_id="task-resume-fail").count() == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_decide_requests_yield_one_200_and_one_409(tmp_path: Path):
+    settings = AppSettings(
+        db_path=tmp_path / "custom" / "app.db",
+        local_auth_token="test-concurrent-tok",
+    )
+    app = create_app(settings)
+    # Verify checkpoints.db path derives from resolved_db_path.parent when db_path is explicit
+    assert app.state.checkpoint_db_path == (tmp_path / "custom" / "checkpoints.db").resolve()
+
+    now = datetime.now(timezone.utc)
+    with app.state.session_factory() as db:
+        db.add(
+            Task(
+                id="task-conc-1",
+                project_id="proj-default",
+                title="Concurrent decide",
+                status=TaskStatus.WAITING_REVIEW,
+            )
+        )
+        db.add(
+            ReviewGate(
+                id="rev-conc-1",
+                task_id="task-conc-1",
+                gate_type="hil",
+                status="pending",
+                expires_at=now + timedelta(hours=24),
+            )
+        )
+        db.commit()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"X-Local-Auth-Token": "test-concurrent-tok"},
+    ) as ac:
+        r1, r2 = await asyncio.gather(
+            ac.patch("/api/v1/reviews/rev-conc-1/decide", json={"decision": "approve"}),
+            ac.patch("/api/v1/reviews/rev-conc-1/decide", json={"decision": "approve"}),
+        )
+
+    codes = sorted([r1.status_code, r2.status_code])
+    assert codes == [200, 409]
+

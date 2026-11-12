@@ -107,8 +107,8 @@ export interface ReviewGate {
   actor?: string | null;
   summary?: string | null;
   payload?: unknown;
-  editedContent?: string | null;
-  edited_content?: string | null;
+  editedContent?: string | Record<string, unknown> | unknown | null;
+  edited_content?: string | Record<string, unknown> | unknown | null;
   expiresAt?: string | null;
   expires_at?: string | null;
   decidedAt?: string | null;

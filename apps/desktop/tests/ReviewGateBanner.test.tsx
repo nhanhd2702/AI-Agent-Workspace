@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
 import { ReviewGateBanner } from "@/components/reviews/ReviewGateBanner";
 
@@ -21,7 +21,7 @@ describe("ReviewGateBanner Component", () => {
     expect(screen.getByRole("button", { name: /xác nhận từ chối/i })).toBeDisabled();
   });
 
-  it("enables reject confirmation once trimmed feedback >= 5 chars and submits reject payload", () => {
+  it("enables reject confirmation once trimmed feedback >= 5 chars and submits reject payload", async () => {
     const onDecide = vi.fn();
     render(
       <ReviewGateBanner
@@ -41,14 +41,16 @@ describe("ReviewGateBanner Component", () => {
     fireEvent.change(textarea, { target: { value: "Cần sửa lại hook 3s đầu" } });
     expect(confirmBtn).not.toBeDisabled();
 
-    fireEvent.click(confirmBtn);
+    await act(async () => {
+      fireEvent.click(confirmBtn);
+    });
     expect(onDecide).toHaveBeenCalledTimes(1);
     expect(onDecide).toHaveBeenCalledWith("reject", {
       feedbackText: "Cần sửa lại hook 3s đầu",
     });
   });
 
-  it("triggers approve callback when Phê duyệt is clicked", () => {
+  it("triggers approve callback when Phê duyệt is clicked", async () => {
     const onDecide = vi.fn();
     render(
       <ReviewGateBanner
@@ -60,12 +62,14 @@ describe("ReviewGateBanner Component", () => {
     expect(screen.getByText(/publish/i)).toBeInTheDocument();
     expect(screen.getByText("Xuất bản bài viết")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /phê duyệt/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /phê duyệt/i }));
+    });
     expect(onDecide).toHaveBeenCalledTimes(1);
     expect(onDecide).toHaveBeenCalledWith("approve");
   });
 
-  it("supports inline edit flow and submits editedContent on confirm", () => {
+  it("supports inline edit flow and submits editedContent on confirm", async () => {
     const onDecide = vi.fn();
     render(
       <ReviewGateBanner
@@ -84,7 +88,9 @@ describe("ReviewGateBanner Component", () => {
     fireEvent.change(editor, { target: { value: "Bản đã chỉnh sửa hoàn chỉnh" } });
 
     const saveEditBtn = screen.getByRole("button", { name: /lưu & phê duyệt|xác nhận chỉnh sửa/i });
-    fireEvent.click(saveEditBtn);
+    await act(async () => {
+      fireEvent.click(saveEditBtn);
+    });
 
     expect(onDecide).toHaveBeenCalledTimes(1);
     expect(onDecide).toHaveBeenCalledWith(
@@ -127,5 +133,67 @@ describe("ReviewGateBanner Component", () => {
     );
     expect(screen.getByText(/đã phê duyệt/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /phê duyệt/i })).not.toBeInTheDocument();
+  });
+
+  it("resets activeMode, feedbackText, and editedContent when review prop changes", () => {
+    const onDecide = vi.fn();
+    const { rerender } = render(
+      <ReviewGateBanner
+        review={{
+          id: "r-old",
+          gateType: "storyboard",
+          summary: "Kịch bản cũ",
+          editedContent: { title: "Draft 1" },
+        }}
+        onDecide={onDecide}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /đặt lại/i }));
+    const rejectBox = screen.getByRole("textbox");
+    fireEvent.change(rejectBox, { target: { value: "Nội dung phản hồi đang gõ dở" } });
+    expect(rejectBox).toHaveValue("Nội dung phản hồi đang gõ dở");
+
+    rerender(
+      <ReviewGateBanner
+        review={{
+          id: "r-new",
+          gateType: "copy",
+          summary: "Kịch bản mới",
+          editedContent: { title: "Draft 2" },
+        }}
+        onDecide={onDecide}
+      />
+    );
+
+    // Reject drawer closed on new review
+    expect(screen.queryByRole("button", { name: /xác nhận từ chối/i })).not.toBeInTheDocument();
+
+    // Non-string editedContent renders cleanly as formatted JSON
+    fireEvent.click(screen.getByRole("button", { name: /chỉnh sửa/i }));
+    const editor = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(editor.value).toContain('"title": "Draft 2"');
+  });
+
+  it("preserves feedback and shows inline error when async onDecide rejects", async () => {
+    const onDecide = vi.fn().mockRejectedValue(new Error("Lỗi kết nối máy chủ"));
+    render(
+      <ReviewGateBanner
+        review={{ id: "r-err", gateType: "storyboard", summary: "Duyệt kịch bản" }}
+        onDecide={onDecide}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /đặt lại/i }));
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "Cần bổ sung số liệu cụ thể" } });
+    fireEvent.click(screen.getByRole("button", { name: /xác nhận từ chối/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Lỗi kết nối máy chủ");
+    });
+
+    // User's typed feedback is preserved instead of wiped on error
+    expect(screen.getByRole("textbox")).toHaveValue("Cần bổ sung số liệu cụ thể");
   });
 });

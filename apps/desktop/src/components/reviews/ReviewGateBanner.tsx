@@ -1,7 +1,8 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
+  AlertCircle,
   CheckCircle2,
   Clock,
   Edit3,
@@ -26,6 +27,23 @@ export interface ReviewGateBannerProps {
 }
 
 const MIN_REJECT_FEEDBACK_LENGTH = 5;
+
+function formatEditValue(review: ReviewGate): string {
+  const rawEdited = review.editedContent ?? review.edited_content;
+  if (typeof rawEdited === "string") {
+    return rawEdited;
+  }
+  if (rawEdited != null) {
+    return JSON.stringify(rawEdited, null, 2);
+  }
+  if (typeof review.payload === "string") {
+    return review.payload;
+  }
+  if (review.payload != null) {
+    return JSON.stringify(review.payload, null, 2);
+  }
+  return review.summary ?? "";
+}
 
 function formatRemainingTime(expiresAt?: string | null): {
   expired: boolean;
@@ -60,52 +78,96 @@ export function ReviewGateBanner({
   const gateType = review.gateType || review.gate_type || "hil";
   const status = (review.status || "pending").toLowerCase();
   const expiresAt = review.expiresAt ?? review.expires_at ?? null;
-  const initialEditValue =
-    review.editedContent ??
-    review.edited_content ??
-    (typeof review.payload === "string"
-      ? review.payload
-      : review.payload != null
-      ? JSON.stringify(review.payload, null, 2)
-      : review.summary ?? "");
 
   const [activeMode, setActiveMode] = useState<"idle" | "edit" | "reject">("idle");
   const [feedbackText, setFeedbackText] = useState("");
-  const [editedContent, setEditedContent] = useState(initialEditValue);
+  const [editedContent, setEditedContent] = useState(() => formatEditValue(review));
+  const [localSubmitting, setLocalSubmitting] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setActiveMode("idle");
+    setFeedbackText("");
+    setEditedContent(formatEditValue(review));
+    setErrorMessage(null);
+    setLocalSubmitting(false);
+  }, [
+    review.id,
+    review.summary,
+    review.payload,
+    review.editedContent,
+    review.edited_content,
+  ]);
 
   const expiryInfo = formatRemainingTime(expiresAt);
   const isExpired = status === "expired" || (status === "pending" && expiryInfo.expired);
   const isDecided =
     status === "approved" || status === "edited" || status === "rejected";
-  const isDisabled = isSubmitting || isExpired || isDecided;
+  const isDisabled = isSubmitting || localSubmitting || isExpired || isDecided;
 
   const trimmedFeedback = feedbackText.trim();
   const canConfirmReject =
     !isDisabled && trimmedFeedback.length >= MIN_REJECT_FEEDBACK_LENGTH;
   const canConfirmEdit = !isDisabled && editedContent.trim().length > 0;
 
-  const handleApprove = () => {
+  const handleApprove = async () => {
     if (isDisabled) return;
-    setActiveMode("idle");
-    void onDecide("approve");
+    setLocalSubmitting(true);
+    setErrorMessage(null);
+    try {
+      await onDecide("approve");
+      setActiveMode("idle");
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : "Không thể phê duyệt review gate. Vui lòng thử lại."
+      );
+    } finally {
+      setLocalSubmitting(false);
+    }
   };
 
-  const handleConfirmEdit = () => {
+  const handleConfirmEdit = async () => {
     if (!canConfirmEdit) return;
-    void onDecide("edit", {
-      editedContent,
-      ...(trimmedFeedback ? { feedbackText: trimmedFeedback } : {}),
-    });
-    setActiveMode("idle");
+    setLocalSubmitting(true);
+    setErrorMessage(null);
+    try {
+      await onDecide("edit", {
+        editedContent,
+        ...(trimmedFeedback ? { feedbackText: trimmedFeedback } : {}),
+      });
+      setActiveMode("idle");
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : "Không thể lưu chỉnh sửa. Vui lòng thử lại."
+      );
+    } finally {
+      setLocalSubmitting(false);
+    }
   };
 
-  const handleConfirmReject = () => {
+  const handleConfirmReject = async () => {
     if (!canConfirmReject) return;
-    void onDecide("reject", {
-      feedbackText: trimmedFeedback,
-    });
-    setActiveMode("idle");
-    setFeedbackText("");
+    setLocalSubmitting(true);
+    setErrorMessage(null);
+    try {
+      await onDecide("reject", {
+        feedbackText: trimmedFeedback,
+      });
+      setActiveMode("idle");
+      setFeedbackText("");
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : "Không thể gửi yêu cầu đặt lại. Vui lòng thử lại."
+      );
+    } finally {
+      setLocalSubmitting(false);
+    }
   };
 
   return (
@@ -204,9 +266,10 @@ export function ReviewGateBanner({
             <button
               type="button"
               disabled={isDisabled}
-              onClick={() =>
-                setActiveMode((prev) => (prev === "edit" ? "idle" : "edit"))
-              }
+              onClick={() => {
+                setErrorMessage(null);
+                setActiveMode((prev) => (prev === "edit" ? "idle" : "edit"));
+              }}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
                 activeMode === "edit"
                   ? "bg-sky-900/60 border-sky-500/60 text-sky-200"
@@ -220,9 +283,10 @@ export function ReviewGateBanner({
             <button
               type="button"
               disabled={isDisabled}
-              onClick={() =>
-                setActiveMode((prev) => (prev === "reject" ? "idle" : "reject"))
-              }
+              onClick={() => {
+                setErrorMessage(null);
+                setActiveMode((prev) => (prev === "reject" ? "idle" : "reject"));
+              }}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
                 activeMode === "reject"
                   ? "bg-rose-950/80 border-rose-500/60 text-rose-200"
@@ -235,6 +299,17 @@ export function ReviewGateBanner({
           </div>
         )}
       </div>
+
+      {/* Inline error feedback */}
+      {errorMessage && (
+        <div
+          role="alert"
+          className="mt-3 px-3 py-2 rounded-xl bg-rose-950/60 border border-rose-800/70 text-xs text-rose-200 flex items-center gap-2"
+        >
+          <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+          <span>{errorMessage}</span>
+        </div>
+      )}
 
       {/* Inline Edit Panel */}
       {activeMode === "edit" && !isDecided && (
@@ -252,8 +327,9 @@ export function ReviewGateBanner({
           <div className="flex items-center justify-end gap-2">
             <button
               type="button"
+              disabled={localSubmitting || isSubmitting}
               onClick={() => setActiveMode("idle")}
-              className="px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors cursor-pointer"
+              className="px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors cursor-pointer disabled:opacity-40"
             >
               Hủy
             </button>
@@ -296,11 +372,12 @@ export function ReviewGateBanner({
           <div className="flex items-center justify-end gap-2">
             <button
               type="button"
+              disabled={localSubmitting || isSubmitting}
               onClick={() => {
                 setActiveMode("idle");
                 setFeedbackText("");
               }}
-              className="px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors cursor-pointer"
+              className="px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors cursor-pointer disabled:opacity-40"
             >
               Hủy
             </button>
