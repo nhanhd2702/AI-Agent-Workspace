@@ -83,11 +83,11 @@ def test_sanitize_fragment_html_and_csp_injection():
 
 
 def test_sanitize_replaces_existing_untrusted_csp():
-    """Untrusted author CSP is stripped and replaced by our strict CSP."""
+    """Untrusted author CSP is stripped and replaced by our strict CSP (including whitespace-padded)."""
     raw = """
     <html>
       <head>
-        <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval'">
+        <meta http-equiv="  Content-Security-Policy  " content="default-src * 'unsafe-inline' 'unsafe-eval'">
         <title>Test</title>
       </head>
       <body>Hello</body>
@@ -96,6 +96,34 @@ def test_sanitize_replaces_existing_untrusted_csp():
     cleaned, _ = sanitize_offline_html(raw)
     assert "default-src *" not in cleaned
     assert "default-src 'none'" in cleaned
+
+
+def test_sanitize_strips_base_tags():
+    """<base> tags are stripped and recorded as warnings to prevent form-action/link hijacking."""
+    raw = '<html><head><base href="https://attacker.com/sub/"></head><body><a href="login">Link</a></body></html>'
+    cleaned, warnings = sanitize_offline_html(raw)
+    assert "<base" not in cleaned
+    assert "attacker.com" not in cleaned
+    assert len(warnings) == 1
+    assert "Blocked base tag" in warnings[0]
+
+
+def test_sanitize_style_with_html_comments_and_multi_nodes():
+    """Style tags containing comments or multi-node children are properly sanitized via get_text()."""
+    raw = """
+    <html>
+      <head>
+        <style><!-- HTML comment inside style -->
+          @import url('https://evil.com/font.css');
+          h1 { color: blue; }
+        </style>
+      </head>
+      <body><h1>Title</h1></body>
+    </html>
+    """
+    cleaned, warnings = sanitize_offline_html(raw)
+    assert "evil.com" not in cleaned
+    assert any("evil.com" in w for w in warnings)
 
 
 # --- 3. API Fixture and Tests ---
@@ -258,3 +286,81 @@ def test_artifact_render_api_markdown(client_with_db: TestClient):
     data = resp.json()["data"]
     assert data["content"].startswith("# Bàn Giao Kịch Bản")
     assert data["sanitized_html"] is None
+
+
+def test_artifact_render_api_raw_headers_hardened(client_with_db: TestClient):
+    """HTML artifact with ?format=raw returns Content-Security-Policy sandbox and X-Content-Type-Options: nosniff."""
+    _, task_id = _seed_project_and_task(client_with_db)
+    settings = client_with_db.app_settings  # type: ignore[attr-defined]
+    factory = init_db(settings.resolved_db_path)
+
+    with factory() as session:
+        art = Artifact(
+            id="art-raw-headers",
+            task_id=task_id,
+            name="landing.html",
+            file_path="landing.html",
+            file_type="html",
+            mime_type="text/html",
+            artifact_metadata={"content_inline": "<h1>Landing Page</h1>"},
+        )
+        session.add(art)
+        session.commit()
+
+    resp = client_with_db.get("/api/v1/artifacts/art-raw-headers/render?format=raw")
+    assert resp.status_code == 200
+    assert "nosniff" in resp.headers.get("x-content-type-options", "").lower()
+    csp = resp.headers.get("content-security-policy", "")
+    assert "sandbox allow-scripts allow-forms" in csp
+    assert "default-src 'none'" in csp
+
+
+def test_artifact_render_api_raw_svg_hardened(client_with_db: TestClient):
+    """SVG artifact with ?format=raw returns CSP sandbox and attachment disposition."""
+    _, task_id = _seed_project_and_task(client_with_db)
+    settings = client_with_db.app_settings  # type: ignore[attr-defined]
+    factory = init_db(settings.resolved_db_path)
+
+    with factory() as session:
+        art = Artifact(
+            id="art-svg-1",
+            task_id=task_id,
+            name="chart.svg",
+            file_path="chart.svg",
+            file_type="svg",
+            mime_type="image/svg+xml",
+            artifact_metadata={"content_inline": "<svg><circle cx='50' cy='50' r='40'/></svg>"},
+        )
+        session.add(art)
+        session.commit()
+
+    resp = client_with_db.get("/api/v1/artifacts/art-svg-1/render?format=raw")
+    assert resp.status_code == 200
+    assert "nosniff" in resp.headers.get("x-content-type-options", "").lower()
+    assert "sandbox" in resp.headers.get("content-security-policy", "")
+    assert "attachment" in resp.headers.get("content-disposition", "")
+
+
+def test_artifact_render_api_binary_decode_guard_415(client_with_db: TestClient):
+    """Non-UTF8 binary file artifact returns 415 Unsupported Media Type."""
+    _, task_id = _seed_project_and_task(client_with_db)
+    settings = client_with_db.app_settings  # type: ignore[attr-defined]
+    bin_file = settings.workspace_dir / "sample.bin"
+    bin_file.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\xfd")
+
+    factory = init_db(settings.resolved_db_path)
+    with factory() as session:
+        art = Artifact(
+            id="art-bin-1",
+            task_id=task_id,
+            name="sample.bin",
+            file_path="sample.bin",
+            file_type="bin",
+            mime_type="application/octet-stream",
+        )
+        session.add(art)
+        session.commit()
+
+    resp = client_with_db.get("/api/v1/artifacts/art-bin-1/render")
+    assert resp.status_code == 415
+    assert "non-utf-8 binary" in resp.json()["detail"].lower()

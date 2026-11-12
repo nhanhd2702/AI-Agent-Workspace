@@ -51,28 +51,66 @@ describe("HtmlSandboxViewer Component", () => {
     expect(screen.getByText(/evil.com\/a.css/)).toBeInTheDocument();
   });
 
-  it("triggers external browser open on button click", () => {
-    const onExternalOpen = vi.fn();
-    // Mock URL.createObjectURL and window.open
-    const originalCreateObjectURL = window.URL.createObjectURL;
-    const originalOpen = window.open;
-    window.URL.createObjectURL = vi.fn().mockReturnValue("blob:mock-url");
-    window.open = vi.fn();
+  it("triggers onOpenExternal or onExternalOpen callback when provided", () => {
+    const onOpenExternal = vi.fn();
 
     render(
       <HtmlSandboxViewer
         html="<h1>Open in Browser</h1>"
         title="browser.html"
-        onExternalOpen={onExternalOpen}
+        onOpenExternal={onOpenExternal}
       />
     );
 
     const openBtn = screen.getByRole("button", { name: /mở bằng trình duyệt|mở ngoài/i });
     fireEvent.click(openBtn);
 
-    expect(onExternalOpen).toHaveBeenCalledTimes(1);
+    expect(onOpenExternal).toHaveBeenCalledTimes(1);
+  });
 
+  it("safely falls back to file download with URL.revokeObjectURL instead of opening unsandboxed blob tab", () => {
+    const originalCreateObjectURL = window.URL.createObjectURL;
+    const originalRevokeObjectURL = window.URL.revokeObjectURL;
+    const originalOpen = window.open;
+
+    const createObjectURLMock = vi.fn().mockReturnValue("blob:mock-safe-url");
+    const revokeObjectURLMock = vi.fn();
+    const windowOpenMock = vi.fn();
+
+    window.URL.createObjectURL = createObjectURLMock;
+    window.URL.revokeObjectURL = revokeObjectURLMock;
+    window.open = windowOpenMock;
+
+    // Spy on anchor click
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    vi.useFakeTimers();
+
+    render(
+      <HtmlSandboxViewer
+        html="<h1>Safe Download</h1>"
+        title="dashboard.html"
+      />
+    );
+
+    const openBtn = screen.getByRole("button", { name: /mở bằng trình duyệt|mở ngoài/i });
+    fireEvent.click(openBtn);
+
+    // CRITICAL SECURITY ASSERTION: Must NOT call window.open(blobUrl) to prevent same-origin XSS escape
+    expect(windowOpenMock).not.toHaveBeenCalled();
+
+    // Must create download anchor with safe filename and trigger click
+    expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+
+    // Must revoke object URL to prevent memory leaks
+    vi.advanceTimersByTime(1100);
+    expect(revokeObjectURLMock).toHaveBeenCalledWith("blob:mock-safe-url");
+
+    vi.useRealTimers();
     window.URL.createObjectURL = originalCreateObjectURL;
+    window.URL.revokeObjectURL = originalRevokeObjectURL;
     window.open = originalOpen;
+    clickSpy.mockRestore();
   });
 });

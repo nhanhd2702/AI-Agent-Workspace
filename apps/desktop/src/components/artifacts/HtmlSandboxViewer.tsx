@@ -15,6 +15,8 @@ export interface HtmlSandboxViewerProps {
   html: string;
   title?: string;
   warnings?: string[];
+  externalUrl?: string;
+  onOpenExternal?: () => void;
   onExternalOpen?: () => void;
   className?: string;
 }
@@ -23,6 +25,8 @@ export function HtmlSandboxViewer({
   html,
   title = "index.html",
   warnings = [],
+  externalUrl,
+  onOpenExternal,
   onExternalOpen,
   className = "",
 }: HtmlSandboxViewerProps) {
@@ -30,17 +34,41 @@ export function HtmlSandboxViewer({
   const [isWarningsOpen, setIsWarningsOpen] = useState(true);
 
   const handleExternalOpen = () => {
-    if (onExternalOpen) {
-      onExternalOpen();
+    // 1. If an external opener callback is provided (e.g. Tauri shell plugin), invoke it
+    const openCallback = onOpenExternal || onExternalOpen;
+    if (openCallback) {
+      openCallback();
+      return;
     }
 
+    // 2. If an explicit sandboxed URL endpoint is provided, open that
+    if (externalUrl && typeof window !== "undefined") {
+      window.open(externalUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+
+    // 3. Browser fallback: NEVER open unsandboxed text/html blob: URLs via window.open!
+    // That would inherit the parent desktop app origin without iframe sandbox restrictions.
+    // Instead, safely trigger a download so the user can open it offline in their OS browser.
     if (typeof window !== "undefined") {
       try {
         const blob = new Blob([html], { type: "text/html;charset=utf-8" });
         const blobUrl = URL.createObjectURL(blob);
-        window.open(blobUrl, "_blank", "noopener,noreferrer");
+        const safeFilename = title.endsWith(".html") || title.endsWith(".htm") ? title : `${title}.html`;
+
+        const link = document.createElement("a");
+        link.href = blobUrl;
+        link.download = safeFilename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        // Revoke Object URL to prevent memory leaks
+        setTimeout(() => {
+          URL.revokeObjectURL(blobUrl);
+        }, 1000);
       } catch (err) {
-        console.error("Failed to open external window:", err);
+        console.error("Failed to trigger artifact download:", err);
       }
     }
   };

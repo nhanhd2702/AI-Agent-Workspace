@@ -102,25 +102,34 @@ def sanitize_offline_html(raw_html: str) -> Tuple[str, List[str]]:
             warnings.append(f"Blocked external stylesheet: {href}")
             link.decompose()
 
-    # 3. Strip any author-provided Content-Security-Policy meta tags to prevent policy bypass
+    # 3. Strip all <base> tags to prevent link and form-action hijacking
+    for base_tag in soup.find_all("base"):
+        href = base_tag.get("href", "")
+        warnings.append(f"Blocked base tag: {href}")
+        base_tag.decompose()
+
+    # 4. Strip any author-provided Content-Security-Policy meta tags to prevent policy bypass
     for meta in soup.find_all("meta"):
         http_equiv = meta.get("http-equiv", "")
-        if isinstance(http_equiv, str) and http_equiv.lower() == "content-security-policy":
+        if isinstance(http_equiv, str) and http_equiv.strip().lower() == "content-security-policy":
             meta.decompose()
 
-    # 4. Sanitize <style> tags content
+    # 5. Sanitize <style> tags content (using get_text to handle comments and multi-node children)
     for style_tag in soup.find_all("style"):
-        if style_tag.string:
-            style_tag.string = _sanitize_css_content(style_tag.string, warnings)
+        css_text = style_tag.get_text()
+        if css_text:
+            cleaned_css = _sanitize_css_content(css_text, warnings)
+            style_tag.clear()
+            style_tag.append(cleaned_css)
 
-    # 5. Sanitize inline style attributes
+    # 6. Sanitize inline style attributes
     for tag_with_style in soup.find_all(attrs={"style": True}):
         orig_style = tag_with_style.get("style", "")
         if orig_style:
             sanitized_style = _sanitize_css_content(orig_style, warnings)
             tag_with_style["style"] = sanitized_style
 
-    # 6. Ensure full HTML structure exists
+    # 7. Ensure full HTML structure exists
     has_html = soup.html is not None
     has_head = soup.head is not None
 
