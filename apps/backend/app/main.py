@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.agents import agents_router, departments_router
 from app.api.artifacts import router as artifacts_router
+from app.api.monitoring import router as monitoring_router
 from app.api.tasks import router as tasks_router
 from app.config import AppSettings, get_settings
 from app.db.session import init_db, seed_defaults
@@ -51,6 +52,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(agents_router)
     app.include_router(departments_router)
     app.include_router(artifacts_router)
+    app.include_router(monitoring_router)
 
     # CORS configuration for desktop Next.js / Tauri shell
     app.add_middleware(
