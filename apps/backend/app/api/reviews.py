@@ -358,13 +358,15 @@ async def create_review_gate(
 def list_review_gates(
     request: Request,
     task_id: Optional[str] = Query(default=None),
+    taskId: Optional[str] = Query(default=None),
     review_status: Optional[str] = Query(default=None, alias="status"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """List HIL review gates with optional filtering by task_id and status."""
+    resolved_task_id = task_id or taskId
     query = db.query(ReviewGate)
-    if task_id:
-        query = query.filter(ReviewGate.task_id == task_id)
+    if resolved_task_id:
+        query = query.filter(ReviewGate.task_id == resolved_task_id)
     if review_status:
         query = query.filter(ReviewGate.status == review_status)
 

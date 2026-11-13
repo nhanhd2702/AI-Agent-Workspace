@@ -183,6 +183,7 @@ class MessagingBridge:
         rate_limit_per_min: float = 30.0,
         event_bus: Optional[Any] = None,
         max_dedup_size: int = 10000,
+        retriever: Optional[Any] = None,
     ) -> None:
         self._db = db
         self.db_session_factory = db_session_factory
@@ -191,6 +192,7 @@ class MessagingBridge:
         if adapter:
             self.adapters[getattr(adapter, "channel", "mock").lower()] = adapter
         self.rate_limiter = TokenBucketRateLimiter(rate_per_min=rate_limit_per_min)
+        self.retriever = retriever
         # Monotonically increasing generation per conversation to prevent race conditions
         self.takeover_generation: dict[str, int] = {}
         self._processed_client_ids_set: set[str] = set()
@@ -485,6 +487,14 @@ class MessagingBridge:
 
     def _generate_draft_reply(self, query: str) -> str:
         """Generate helpful contextual customer service reply."""
+        if getattr(self, "retriever", None) is not None:
+            try:
+                chunks = self.retriever.search(query=query, collections=["catalog", "knowledge", "qa"], top_k=2)
+                if chunks and getattr(chunks[0], "score", 0.0) >= 0.7:
+                    return f"Dạ theo thông tin bên em: {chunks[0].text}"
+            except Exception:
+                pass
+
         lower = query.lower()
         if "giá" in lower or "bao nhiêu" in lower:
             return "Dạ chào bạn, các sản phẩm hiện có mức giá ưu đãi từ 199.000đ - 499.000đ. Bạn đang quan tâm mẫu nào ạ?"

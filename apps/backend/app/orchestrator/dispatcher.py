@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import inspect
+from pathlib import Path
 import re
 import time
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
@@ -16,7 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.base import BaseWorkerAgent, WorkerResult
 from app.config import get_settings
-from app.db.models import Agent, SubTask, Task, TaskStatus, TurnLog
+from app.db.models import Agent, Artifact, ReviewGate, SubTask, Task, TaskStatus, TurnLog
 from app.db.state_machine import TaskStateMachine
 from app.llm.router import LlmRouter
 from app.orchestrator.planner import ExecutionPlan, SubTaskNode
@@ -170,6 +171,11 @@ class AgentDispatcher:
         ws_manager: Optional["TaskWebSocketManager"] = None,
         llm_router: Optional[LlmRouter] = None,
         extra_secrets: Optional[Iterable[str]] = None,
+        yt_client: Optional[Any] = None,
+        browser: Optional[Any] = None,
+        retriever: Optional[Any] = None,
+        brand_profile: Optional[Any] = None,
+        workspace_dir: Optional[Path] = None,
     ) -> None:
         if max_parallel < 1:
             raise ValueError("max_parallel must be >= 1")
@@ -182,6 +188,11 @@ class AgentDispatcher:
         self.session_factory = session_factory
         self.ws_manager = ws_manager
         self.llm_router = llm_router or LlmRouter()
+        self.yt_client = yt_client
+        self.browser = browser
+        self.retriever = retriever
+        self.brand_profile = brand_profile
+        self.workspace_dir = workspace_dir
         if extra_secrets is not None:
             self.extra_secrets = [str(s) for s in extra_secrets if s]
         else:
@@ -347,12 +358,133 @@ class AgentDispatcher:
             max_tokens=4096,
         )
 
+    def _create_specialized_or_base_worker(
+        self,
+        agent_record: Agent,
+        task_type: Optional[str] = None,
+    ) -> BaseWorkerAgent:
+        if task_type == "general":
+            return BaseWorkerAgent(
+                agent=agent_record,
+                llm_router=self.llm_router,
+                session_factory=self.session_factory,
+            )
+
+        ag_name = (agent_record.name or "").strip().lower()
+        ag_id = (agent_record.id or "").strip().lower()
+        key = self._normalize_agent_key(ag_name or ag_id)
+
+        if key in ("deepresearcher", "deep_researcher"):
+            try:
+                from app.agents.content import DeepResearcherAgent
+                return DeepResearcherAgent(
+                    agent=agent_record,
+                    yt_client=self.yt_client,
+                    browser=self.browser,
+                    llm=self.llm_router,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        if key in ("contentwriter", "content_writer"):
+            try:
+                from app.agents.content import ContentWriterAgent
+                return ContentWriterAgent(
+                    agent=agent_record,
+                    llm=self.llm_router,
+                    brand_profile=self.brand_profile,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        if key in ("imagestudio", "image_studio") and self.browser is not None:
+            try:
+                from app.agents.content import ImageStudioAgent
+                return ImageStudioAgent(
+                    agent=agent_record,
+                    browser=self.browser,
+                    llm=self.llm_router,
+                    brand_profile=self.brand_profile,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        if key in ("funnelsagent", "funnels", "funnel"):
+            try:
+                from app.agents.funnels import FunnelsAgent
+                return FunnelsAgent(
+                    agent=agent_record,
+                    llm=self.llm_router,
+                    brand_profile=self.brand_profile,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        if key in ("growthadvisor", "growth_advisor", "growth"):
+            try:
+                from app.agents.funnels import GrowthAdvisorAgent
+                return GrowthAdvisorAgent(
+                    agent=agent_record,
+                    llm=self.llm_router,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        if key in ("uidesigner", "ui_designer", "landing"):
+            try:
+                from app.agents.funnels import UIDesignerAgent
+                return UIDesignerAgent(
+                    agent=agent_record,
+                    llm=self.llm_router,
+                    brand_profile=self.brand_profile,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        if key in ("salesagent", "sales"):
+            try:
+                from app.agents.engagement import SalesAgent
+                return SalesAgent(
+                    agent=agent_record,
+                    llm=self.llm_router,
+                    retriever=self.retriever,
+                    brand_profile=self.brand_profile,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        if key in ("supportagent", "customersupportagent", "support"):
+            try:
+                from app.agents.engagement import SupportAgent
+                return SupportAgent(
+                    agent=agent_record,
+                    llm=self.llm_router,
+                    retriever=self.retriever,
+                    brand_profile=self.brand_profile,
+                    session_factory=self.session_factory,
+                )
+            except Exception:
+                pass
+
+        return BaseWorkerAgent(
+            agent=agent_record,
+            llm_router=self.llm_router,
+            session_factory=self.session_factory,
+        )
+
     async def _run_default_worker(
         self,
         node: SubTaskNode,
         context: dict[str, Any],
     ) -> WorkerResult:
-        """Instantiate BaseWorkerAgent for node.agent_id and execute via LlmRouter."""
+        """Instantiate appropriate worker or specialized agent for node.agent_id and execute."""
         if self.session_factory is not None:
             async with self._db_lock:
                 with self.session_factory() as s:
@@ -360,11 +492,8 @@ class AgentDispatcher:
         else:
             agent_record = self._resolve_agent_record_sync(None, node.agent_id)
 
-        worker = BaseWorkerAgent(
-            agent=agent_record,
-            llm_router=self.llm_router,
-            session_factory=self.session_factory,
-        )
+        task_type = context.get("task_type")
+        worker = self._create_specialized_or_base_worker(agent_record, task_type=task_type)
         return await worker.execute(
             subtask=node,
             context=context,
@@ -448,6 +577,9 @@ class AgentDispatcher:
                         .first()
                     )
                     if existing is not None:
+                        if current_status == TaskStatus.APPROVED and existing.status == "completed":
+                            subtask_db_ids[node.id] = existing.id
+                            continue
                         existing.status = "pending"
                         existing.result = None
                         subtask_db_ids[node.id] = existing.id
@@ -456,6 +588,9 @@ class AgentDispatcher:
                     candidate_id = self._build_subtask_db_id(task_id, node.id)
                     existing_scoped = s.get(SubTask, candidate_id)
                     if existing_scoped is not None:
+                        if current_status == TaskStatus.APPROVED and existing_scoped.status == "completed":
+                            subtask_db_ids[node.id] = existing_scoped.id
+                            continue
                         existing_scoped.status = "pending"
                         existing_scoped.result = None
                         subtask_db_ids[node.id] = existing_scoped.id
@@ -606,6 +741,7 @@ class AgentDispatcher:
         t_start = time.perf_counter()
         base_context = dict(context or {})
         base_context["task_id"] = task_id
+        base_context["task_type"] = plan.task_type
         base_context["db_lock"] = self._db_lock
 
         subtask_db_ids = await self._prepare_task_and_subtasks(task_id, plan)
@@ -625,9 +761,44 @@ class AgentDispatcher:
         turn_logs: list[dict[str, Any]] = []
         outputs: dict[str, Any] = {}
         errors: dict[str, str] = {}
+        accumulated_artifact_ids: list[str] = []
+
+        # Initialize handoff_chain in task metadata with first node agent if absent
+        if self.session_factory is not None and plan.nodes and self.worker_fn is None:
+            async with self._db_lock:
+                with self.session_factory() as s:
+                    task_rec = s.get(Task, task_id)
+                    if task_rec is not None:
+                        meta = dict(task_rec.task_metadata or {})
+                        first_ag = self._resolve_agent_record_sync(s, plan.nodes[0].agent_id)
+                        if not meta.get("handoff_chain"):
+                            meta["handoff_chain"] = [first_ag.name]
+                            task_rec.task_metadata = meta
+                            s.commit()
 
         for wave_idx, wave_node_ids in enumerate(plan.waves):
             wave_nodes = [node_map[nid] for nid in wave_node_ids if nid in node_map]
+
+            # Check if all nodes in this wave are already completed in DB (HIL resume case)
+            wave_already_completed = False
+            if self.session_factory is not None and wave_node_ids:
+                async with self._db_lock:
+                    with self.session_factory() as s:
+                        done_count = 0
+                        for nid in wave_node_ids:
+                            st_db_id = subtask_db_ids.get(nid)
+                            st_row = s.get(SubTask, st_db_id) if st_db_id else None
+                            if st_row is not None and st_row.status == "completed":
+                                done_count += 1
+                                if st_row.result is not None:
+                                    outputs[nid] = st_row.result
+                                if nid not in completed_nodes:
+                                    completed_nodes.append(nid)
+                        if done_count == len(wave_node_ids):
+                            wave_already_completed = True
+
+            if wave_already_completed:
+                continue
 
             async def _execute_node(node: SubTaskNode) -> tuple[str, bool, Any, dict[str, Any]]:
                 st_db_id = subtask_db_ids.get(node.id)
@@ -649,10 +820,45 @@ class AgentDispatcher:
                     dep_outputs = {
                         dep: outputs[dep] for dep in node.depends_on if dep in outputs
                     }
+
+                    # Inter-agent handoff detection and execution
+                    if node.depends_on and self.session_factory is not None and self.worker_fn is None:
+                        dep_agents = [
+                            node_map[dep].agent_id for dep in node.depends_on if dep in node_map
+                        ]
+                        if dep_agents:
+                            src_agent_id = dep_agents[0]
+                            tgt_agent_id = node.agent_id
+                            async with self._db_lock:
+                                with self.session_factory() as s:
+                                    src_rec = self._resolve_agent_record_sync(s, src_agent_id)
+                                    tgt_rec = self._resolve_agent_record_sync(s, tgt_agent_id)
+                                    if src_rec.id.lower() != tgt_rec.id.lower():
+                                        try:
+                                            from app.orchestrator.handoff import HandoffManager
+                                            hm = HandoffManager(
+                                                max_depth=5, extra_secrets=self.extra_secrets
+                                            )
+                                            hm.execute_handoff(
+                                                db=s,
+                                                task_id=task_id,
+                                                from_agent=src_rec.name,
+                                                to_agent=tgt_rec.name,
+                                                payload={
+                                                    "instruction": node.instruction,
+                                                    "summary": f"Bàn giao từ {src_rec.name} sang {tgt_rec.name}",
+                                                    "dependency_outputs": dep_outputs,
+                                                },
+                                                artifact_ids=list(accumulated_artifact_ids),
+                                            )
+                                        except Exception:
+                                            pass
+
                     node_ctx = {
                         **base_context,
                         "wave_index": wave_idx,
                         "dependency_outputs": dep_outputs,
+                        "output_dir": (self.workspace_dir or get_settings().workspace_dir) / "artifacts" / task_id,
                     }
                     if self.worker_fn is not None:
                         return await self._invoke_callable(self.worker_fn, node, node_ctx)
@@ -725,6 +931,54 @@ class AgentDispatcher:
                         )
                         effective_ms = duration_ms
                         tool_name = "worker_fn" if self.worker_fn else "worker_agent"
+
+                    # Persist any generated artifacts to disk and database
+                    if hasattr(raw_res, "artifacts") and raw_res.artifacts and self.session_factory is not None:
+                        async with self._db_lock:
+                            with self.session_factory() as s:
+                                ws_dir = self.workspace_dir or get_settings().workspace_dir
+                                art_dir = ws_dir / "artifacts" / task_id
+                                art_dir.mkdir(parents=True, exist_ok=True)
+                                for art_out in raw_res.artifacts:
+                                    fname = art_out.filename
+                                    content = art_out.content
+                                    art_type = art_out.artifact_type or "html"
+                                    target_file = art_dir / fname
+
+                                    if art_type == "png" and isinstance(content, str) and Path(content).exists():
+                                        src_png = Path(content)
+                                        if src_png.resolve() != target_file.resolve():
+                                            import shutil
+                                            shutil.copyfile(src_png, target_file)
+                                    elif isinstance(content, (str, bytes)):
+                                        if isinstance(content, bytes):
+                                            target_file.write_bytes(content)
+                                        else:
+                                            target_file.write_text(content, encoding="utf-8")
+
+                                    art_id = f"art-{uuid.uuid4().hex[:12]}"
+                                    mime = (
+                                        "image/png"
+                                        if art_type == "png"
+                                        else (
+                                            "text/markdown"
+                                            if art_type == "markdown"
+                                            else "text/html"
+                                        )
+                                    )
+                                    row = Artifact(
+                                        id=art_id,
+                                        task_id=task_id,
+                                        subtask_id=st_db_id,
+                                        name=fname,
+                                        file_path=str(target_file),
+                                        file_type=art_type,
+                                        mime_type=mime,
+                                        created_at=datetime.now(timezone.utc),
+                                    )
+                                    s.add(row)
+                                    accumulated_artifact_ids.append(art_id)
+                                s.commit()
 
                     masked_out = self._mask(out_payload)
                     await self._set_subtask_status(st_db_id, "completed", masked_out)
@@ -874,6 +1128,44 @@ class AgentDispatcher:
             # Check HIL review gate after wave completion
             review_nodes = [n.id for n in wave_nodes if n.requires_review]
             if review_nodes:
+                if self.session_factory is not None:
+                    async with self._db_lock:
+                        with self.session_factory() as s:
+                            task = s.get(Task, task_id)
+                            now_utc = datetime.now(timezone.utc)
+                            existing_gate = (
+                                s.query(ReviewGate)
+                                .filter(
+                                    ReviewGate.task_id == task_id,
+                                    ReviewGate.status == "pending",
+                                )
+                                .first()
+                            )
+                            if existing_gate is None:
+                                rev_id = f"rev-{uuid.uuid4().hex[:12]}"
+                                rev_row = ReviewGate(
+                                    id=rev_id,
+                                    task_id=task_id,
+                                    gate_type="hil",
+                                    status="pending",
+                                    expires_at=now_utc + timedelta(hours=24),
+                                    created_at=now_utc,
+                                )
+                                s.add(rev_row)
+                                if task is not None:
+                                    meta = dict(task.task_metadata or {})
+                                    reviews_meta = dict(meta.get("reviews") or {})
+                                    reviews_meta[rev_id] = {
+                                        "summary": f"Review required for step(s): {', '.join(review_nodes)}",
+                                        "payload": {
+                                            "pending_nodes": review_nodes,
+                                            "wave_index": wave_idx,
+                                        },
+                                    }
+                                    meta["reviews"] = reviews_meta
+                                    task.task_metadata = meta
+                                s.commit()
+
                 await self._transition_task_final(
                     task_id, TaskStatus.WAITING_REVIEW, reason="hil_review_gate"
                 )

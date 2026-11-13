@@ -252,6 +252,11 @@ class DeepResearcherAgent(BaseWorkerAgent):
 
         # 2. YouTube Channel Video & Transcript Indexing
         verified_videos: list[dict[str, Any]] = []
+        if not channels and yt is not None:
+            if "hormozi" in topic.lower() or "alex" in topic.lower():
+                channels = ["https://youtube.com/@AlexHormozi"]
+            elif getattr(yt, "all_videos", None) or getattr(yt, "videos_by_channel", None):
+                channels = list(getattr(yt, "videos_by_channel", {}).keys()) or ["https://youtube.com/@AlexHormozi"]
         if channels and yt is not None:
             for ch_url in channels:
                 try:

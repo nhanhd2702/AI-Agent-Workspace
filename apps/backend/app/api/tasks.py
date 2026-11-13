@@ -44,7 +44,7 @@ class ParseTaskRequest(BaseModel):
     project_id: str = Field(default="proj-default", alias="projectId")
     prompt_text: str = Field(..., alias="promptText")
     attachment_ids: list[str] = Field(default_factory=list, alias="attachments")
-    mode: str = Field(default="copilot")
+    mode: str = Field(default="autopilot")
 
 
 class SubTaskNodeInput(BaseModel):
@@ -180,7 +180,12 @@ def _serialize_task(
     if turn_counts is not None:
         turn_count = turn_counts.get(task.id, 0)
     else:
-        turn_count = db.query(TurnLog).filter(TurnLog.task_id == task.id).count()
+        turn_count = (
+            db.query(TurnLog)
+            .filter(TurnLog.task_id == task.id)
+            .filter(TurnLog.action != "handoff")
+            .count()
+        )
     status_val = (
         task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
     )
@@ -200,6 +205,7 @@ def _serialize_task(
             "agentName": agent_name,
             "agent_display_name": agent_display_name,
             "metadata": task.task_metadata,
+            "task_metadata": task.task_metadata,
             "turn_count": turn_count,
             "started_at": _format_utc_iso(task.started_at),
             "completed_at": _format_utc_iso(task.completed_at),
@@ -443,6 +449,7 @@ def list_tasks(
         rows = (
             db.query(TurnLog.task_id, func.count(TurnLog.id))
             .filter(TurnLog.task_id.in_(task_ids))
+            .filter(TurnLog.action != "handoff")
             .group_by(TurnLog.task_id)
             .all()
         )
@@ -725,6 +732,13 @@ async def dispatch_task(
     ws_manager = getattr(request.app.state, "ws_manager", None)
     llm_router = getattr(request.app.state, "llm_router", None) or LlmRouter()
     extra_secrets = _get_extra_secrets(request)
+    worker_fn = getattr(request.app.state, "dispatcher_worker_fn", None) or getattr(request.app.state, "worker_fn", None)
+    yt_client = getattr(request.app.state, "yt_client", None)
+    browser = getattr(request.app.state, "browser", None)
+    retriever = getattr(request.app.state, "retriever", None)
+    brand_profile = getattr(request.app.state, "brand_profile", None)
+    settings_obj = getattr(request.app.state, "settings", None)
+    workspace_dir = settings_obj.workspace_dir if settings_obj else None
 
     dispatcher = AgentDispatcher(
         max_parallel=(payload.max_parallel if payload and payload.max_parallel else 3),
@@ -733,6 +747,12 @@ async def dispatch_task(
         ws_manager=ws_manager,
         llm_router=llm_router,
         extra_secrets=extra_secrets,
+        worker_fn=worker_fn,
+        yt_client=yt_client,
+        browser=browser,
+        retriever=retriever,
+        brand_profile=brand_profile,
+        workspace_dir=workspace_dir,
     )
     try:
         result = await dispatcher.dispatch(task_id=task_id, plan=plan)
@@ -766,6 +786,7 @@ def get_task_turns(
     turns = (
         db.query(TurnLog)
         .filter(TurnLog.task_id == task_id)
+        .filter(TurnLog.action != "handoff")
         .order_by(TurnLog.turn_number.asc(), TurnLog.created_at.asc())
         .all()
     )
