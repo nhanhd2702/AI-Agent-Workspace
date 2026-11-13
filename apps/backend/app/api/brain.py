@@ -11,8 +11,14 @@ from typing import Any, Optional
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
-from app.brain.ingest import DocumentIngestor, ScannedPdfError, UnsupportedFormatError
+from app.brain.ingest import (
+    DocumentIngestor,
+    DocumentParsingError,
+    ScannedPdfError,
+    UnsupportedFormatError,
+)
 from app.brain.retriever import BrainRetriever
+from app.config import get_settings
 from app.orchestrator.dispatcher import mask_secrets
 
 router = APIRouter(prefix="/api/v1/brain", tags=["brain"])
@@ -23,6 +29,34 @@ class SearchRequest(BaseModel):
     collections: list[str] = Field(default_factory=lambda: ["default"])
     top_k: int = Field(default=5, ge=1, le=50)
     min_similarity: float = Field(default=0.7, ge=0.0, le=1.0)
+
+
+def _resolve_and_validate_path(file_path_str: str, workspace_dir: Path) -> Path:
+    """Validates that file_path strictly resides within workspace_dir and exists as a regular file."""
+    workspace_resolved = workspace_dir.resolve()
+    target_path = Path(file_path_str)
+    resolved_path = (
+        target_path.resolve()
+        if target_path.is_absolute()
+        else (workspace_resolved / target_path).resolve()
+    )
+    try:
+        if not resolved_path.is_relative_to(workspace_resolved):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Từ chối truy cập: tệp nằm ngoài thư mục workspace",
+            )
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Từ chối truy cập: tệp nằm ngoài thư mục workspace",
+        )
+    if not resolved_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tệp không tồn tại: {target_path}",
+        )
+    return resolved_path
 
 
 @router.post("/documents")
@@ -40,6 +74,9 @@ async def ingest_document(
     target_path: Optional[Path] = None
     orig_name: Optional[str] = None
 
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    workspace_dir = settings.workspace_dir
+
     try:
         if "application/json" in content_type:
             body = await request.json()
@@ -49,18 +86,15 @@ async def ingest_document(
                     status_code=422,
                     detail="Thiếu tham số 'file_path'",
                 )
-            target_path = Path(req_file_path)
-            if not target_path.exists():
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Tệp không tồn tại: {target_path}",
-                )
+            target_path = _resolve_and_validate_path(req_file_path, workspace_dir)
             target_collection = body.get("collection") or target_collection
             orig_name = target_path.name
         elif file is not None and file.filename:
-            orig_name = file.filename
-            ext = Path(file.filename).suffix
-            # Verify extension before writing to disk
+            # Sanitize filename to prevent directory traversal
+            clean_filename = Path(file.filename).name
+            orig_name = clean_filename
+            ext = Path(clean_filename).suffix
+
             if ext.lower() not in DocumentIngestor.SUPPORTED_EXTENSIONS:
                 raise HTTPException(
                     status_code=422,
@@ -72,12 +106,7 @@ async def ingest_document(
                 temp_file_to_clean = Path(tmp.name)
             target_path = temp_file_to_clean
         elif file_path:
-            target_path = Path(file_path)
-            if not target_path.exists():
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Tệp không tồn tại: {target_path}",
-                )
+            target_path = _resolve_and_validate_path(file_path, workspace_dir)
             orig_name = target_path.name
         else:
             raise HTTPException(
@@ -85,8 +114,7 @@ async def ingest_document(
                 detail="Vui lòng tải lên tệp hoặc cung cấp file_path",
             )
 
-        settings = getattr(request.app.state, "settings", None)
-        chroma_dir = settings.resolved_chroma_dir if settings else None
+        chroma_dir = settings.resolved_chroma_dir
         ingestor = DocumentIngestor(chroma_dir=chroma_dir)
 
         result = ingestor.ingest_file(
@@ -98,7 +126,7 @@ async def ingest_document(
         res_dict = asdict(result) if is_dataclass(result) else result
         return mask_secrets(res_dict)
 
-    except ScannedPdfError as exc:
+    except (ScannedPdfError, DocumentParsingError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -127,8 +155,8 @@ async def list_documents(
     collection: Optional[str] = Query(None),
 ) -> Any:
     """Lists ingested documents, optionally filtered by collection."""
-    settings = getattr(request.app.state, "settings", None)
-    chroma_dir = settings.resolved_chroma_dir if settings else None
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    chroma_dir = settings.resolved_chroma_dir
     retriever = BrainRetriever(chroma_dir=chroma_dir)
     docs = retriever.list_documents(collection=collection)
     return mask_secrets(docs)
@@ -140,8 +168,8 @@ async def delete_document(
     doc_id: str,
 ) -> Any:
     """Deletes an ingested document and its vector chunks."""
-    settings = getattr(request.app.state, "settings", None)
-    chroma_dir = settings.resolved_chroma_dir if settings else None
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    chroma_dir = settings.resolved_chroma_dir
     retriever = BrainRetriever(chroma_dir=chroma_dir)
     deleted = retriever.delete_document(doc_id)
     if not deleted:
@@ -158,8 +186,8 @@ async def search_documents(
     payload: SearchRequest,
 ) -> Any:
     """Performs semantic vector search across specified collections."""
-    settings = getattr(request.app.state, "settings", None)
-    chroma_dir = settings.resolved_chroma_dir if settings else None
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    chroma_dir = settings.resolved_chroma_dir
     retriever = BrainRetriever(chroma_dir=chroma_dir)
 
     # Sanitize input query if it contains secret tokens

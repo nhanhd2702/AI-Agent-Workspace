@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Optional
 
-from app.brain.ingest import normalize_collection_name
+from app.brain.ingest import BRAIN_MANIFEST_LOCK, normalize_collection_name
 from app.config import get_settings
 
 
@@ -73,14 +73,20 @@ class BrainRetriever:
         """Performs semantic search across the given ChromaDB collections.
 
         Filters out any hit with score < min_similarity (or default_min_similarity).
-        Results are cached in-memory with a 5-minute TTL.
+        Results are cached in-memory with a 5-minute TTL scoped to the chroma_dir.
         """
         threshold = (
             min_similarity if min_similarity is not None else self.default_min_similarity
         )
         clean_query = query.strip()
         sorted_collections = tuple(sorted(collections))
-        cache_key = (clean_query, sorted_collections, top_k, round(threshold, 4))
+        cache_key = (
+            str(self.chroma_dir.resolve()),
+            clean_query,
+            sorted_collections,
+            top_k,
+            round(threshold, 4),
+        )
 
         # 1. Check TTL cache
         with self._cache_lock:
@@ -125,20 +131,18 @@ class BrainRetriever:
 
             ids = res["ids"][0]
             docs = res["documents"][0] if res.get("documents") else []
-            metas = res["metadatas"][0] if res.get("metadatas") else []
+            metadatas = res["metadatas"][0] if res.get("metadatas") else []
             distances = res["distances"][0] if res.get("distances") else []
 
             for idx, chunk_id in enumerate(ids):
                 dist = distances[idx] if idx < len(distances) else 1.0
-                # Chroma cosine distance is 1.0 - cosine_similarity.
-                # So similarity = 1.0 - distance, clamped to [0.0, 1.0].
                 score = max(0.0, min(1.0, 1.0 - dist))
 
                 # Strictly filter out hits below threshold
                 if score < threshold:
                     continue
 
-                meta = metas[idx] or {}
+                meta = metadatas[idx] or {}
                 doc_id = meta.get("doc_id", "")
                 doc_title = meta.get("doc_title", "")
                 collection = meta.get("collection", col_name)
@@ -169,56 +173,58 @@ class BrainRetriever:
 
     def list_documents(self, collection: Optional[str] = None) -> list[dict]:
         """Lists all ingested documents, optionally filtered by collection."""
-        if not self.manifest_path.exists():
-            return []
+        with BRAIN_MANIFEST_LOCK:
+            if not self.manifest_path.exists():
+                return []
 
-        try:
-            with open(self.manifest_path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
-        except Exception:
-            return []
+            try:
+                with open(self.manifest_path, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except Exception:
+                return []
 
-        docs_dict = manifest.get("documents", {})
-        if collection:
-            return [d for d in docs_dict.values() if d.get("collection") == collection]
-        return list(docs_dict.values())
+            docs_dict = manifest.get("documents", {})
+            if collection:
+                return [d for d in docs_dict.values() if d.get("collection") == collection]
+            return list(docs_dict.values())
 
     def delete_document(self, doc_id: str) -> bool:
         """Deletes a document and its chunks from ChromaDB and manifest.
 
         Invalidates query cache upon deletion.
         """
-        if not self.manifest_path.exists():
-            return False
+        with BRAIN_MANIFEST_LOCK:
+            if not self.manifest_path.exists():
+                return False
 
-        try:
-            with open(self.manifest_path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
-        except Exception:
-            return False
+            try:
+                with open(self.manifest_path, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except Exception:
+                return False
 
-        docs_dict = manifest.get("documents", {})
-        if doc_id not in docs_dict:
-            return False
+            docs_dict = manifest.get("documents", {})
+            if doc_id not in docs_dict:
+                return False
 
-        doc_item = docs_dict[doc_id]
-        col_name = doc_item.get("collection", "default")
-        chroma_col_name = normalize_collection_name(col_name)
+            doc_item = docs_dict[doc_id]
+            col_name = doc_item.get("collection", "default")
+            chroma_col_name = normalize_collection_name(col_name)
 
-        # Delete chunks from ChromaDB
-        try:
-            col = self.chroma_client.get_collection(name=chroma_col_name)
-            col.delete(where={"doc_id": doc_id})
-        except Exception:
-            pass
+            # Delete chunks from ChromaDB
+            try:
+                col = self.chroma_client.get_collection(name=chroma_col_name)
+                col.delete(where={"doc_id": doc_id})
+            except Exception:
+                pass
 
-        # Remove from manifest
-        del docs_dict[doc_id]
-        temp_path = self.manifest_path.with_suffix(".tmp")
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-        temp_path.replace(self.manifest_path)
+            # Remove from manifest
+            del docs_dict[doc_id]
+            temp_path = self.manifest_path.with_suffix(".tmp")
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            temp_path.replace(self.manifest_path)
 
-        # Invalidate query cache
-        self.clear_cache()
-        return True
+            # Invalidate query cache
+            self.clear_cache()
+            return True

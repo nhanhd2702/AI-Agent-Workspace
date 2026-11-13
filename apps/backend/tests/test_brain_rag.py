@@ -359,8 +359,10 @@ def test_secret_masking_in_search_results(tmp_path: Path):
 
 def test_brain_api_json_ingest_and_auth(tmp_path: Path):
     """Tests JSON body file_path ingestion and auth token enforcement."""
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
     settings = AppSettings(
-        workspace_dir=tmp_path / "workspace",
+        workspace_dir=workspace_dir,
         chroma_dir=tmp_path / "chroma",
         local_auth_token="secure-token",
     )
@@ -373,8 +375,8 @@ def test_brain_api_json_ingest_and_auth(tmp_path: Path):
 
     headers = {"X-Local-Auth-Token": "secure-token"}
 
-    # 2. Ingest via JSON file_path
-    local_doc = tmp_path / "local_policy.md"
+    # 2. Ingest via JSON file_path inside workspace_dir
+    local_doc = workspace_dir / "local_policy.md"
     local_doc.write_text("# Chính sách an toàn\nTuân thủ quy trình xác thực đa yếu tố.", encoding="utf-8")
 
     res_json = client.post(
@@ -395,11 +397,11 @@ def test_brain_api_json_ingest_and_auth(tmp_path: Path):
     )
     assert res_bad_json.status_code == 422
 
-    # 4. Non-existent file_path
+    # 4. Non-existent file_path inside workspace
     res_not_found = client.post(
         "/api/v1/brain/documents",
         headers=headers,
-        json={"file_path": str(tmp_path / "non_existent.md"), "collection": "policies"},
+        json={"file_path": str(workspace_dir / "non_existent.md"), "collection": "policies"},
     )
     assert res_not_found.status_code == 404
 
@@ -411,3 +413,95 @@ def test_brain_api_json_ingest_and_auth(tmp_path: Path):
     )
     assert search_empty.status_code == 200
     assert search_empty.json() == []
+
+
+def test_path_traversal_forbidden(tmp_path: Path):
+    """File path outside workspace_dir must be rejected with HTTP 403 Forbidden."""
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = tmp_path / "secret_system_file.txt"
+    outside_file.write_text("Dữ liệu nhạy cảm ngoài workspace", encoding="utf-8")
+
+    settings = AppSettings(
+        workspace_dir=workspace_dir,
+        chroma_dir=tmp_path / "chroma",
+        local_auth_token="secure-token",
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"X-Local-Auth-Token": "secure-token"}
+
+    # Attempt 1: Absolute path outside workspace
+    res_abs = client.post(
+        "/api/v1/brain/documents",
+        headers=headers,
+        json={"file_path": str(outside_file), "collection": "general"},
+    )
+    assert res_abs.status_code == 403
+    assert "Từ chối truy cập: tệp nằm ngoài thư mục workspace" in res_abs.json()["detail"]
+
+    # Attempt 2: Relative traversal path
+    res_rel = client.post(
+        "/api/v1/brain/documents",
+        headers=headers,
+        json={"file_path": "../secret_system_file.txt", "collection": "general"},
+    )
+    assert res_rel.status_code == 403
+    assert "Từ chối truy cập: tệp nằm ngoài thư mục workspace" in res_rel.json()["detail"]
+
+    # Attempt 3: Via form data
+    res_form = client.post(
+        "/api/v1/brain/documents",
+        headers=headers,
+        data={"file_path": str(outside_file), "collection": "general"},
+    )
+    assert res_form.status_code == 403
+
+
+def test_corrupted_document_returns_400(tmp_path: Path):
+    """Corrupted files that cannot be parsed must return HTTP 400 Bad Request."""
+    settings = AppSettings(
+        workspace_dir=tmp_path / "workspace",
+        chroma_dir=tmp_path / "chroma",
+        local_auth_token="secure-token",
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+    headers = {"X-Local-Auth-Token": "secure-token"}
+
+    # Upload invalid binary pretending to be PDF
+    corrupt_pdf_content = b"%PDF-1.4 corrupt header with invalid binary data \xff\xfe\x00"
+    res = client.post(
+        "/api/v1/brain/documents",
+        headers=headers,
+        files={"file": ("corrupt.pdf", io.BytesIO(corrupt_pdf_content), "application/pdf")},
+        data={"collection": "general"},
+    )
+    assert res.status_code == 400
+
+
+def test_normalize_collection_name_edge_cases():
+    """Validates robust normalization against ChromaDB naming rules."""
+    from app.brain.ingest import normalize_collection_name
+
+    cases = {
+        "hr": "hr_col",
+        "policies": "policies",
+        "192.168.1.1": "col_192.168.1.1",
+        "foo..bar": "foo_bar",
+        "test_": "test",
+        "...": "col",
+        "": "col",
+        "123": "col_123",
+        "a": "a_col",
+    }
+    for raw, expected in cases.items():
+        res = normalize_collection_name(raw)
+        assert res == expected
+        # Must be between 3 and 512 chars
+        assert 3 <= len(res) <= 512
+        # Must start and end with alnum
+        assert res[0].isalnum()
+        assert res[-1].isalnum()
+        # No consecutive dots
+        assert ".." not in res

@@ -26,19 +26,29 @@ import pypdf
 
 from app.config import get_settings
 
+# Module-level shared re-entrant lock for manifest operations across Ingestor & Retriever
+BRAIN_MANIFEST_LOCK = threading.RLock()
+
 
 def normalize_collection_name(name: str) -> str:
-    """Sanitizes and normalizes collection name for ChromaDB (requires 3-512 chars)."""
-    clean = re.sub(r"[^a-zA-Z0-9._-]", "_", name.strip())
-    if not clean:
-        clean = "default"
-    if len(clean) < 3:
+    """Sanitizes and normalizes collection name for ChromaDB (3-512 chars).
+
+    Ensures name starts with alpha (avoids IPv4 regex), contains no consecutive dots,
+    and ends with an alphanumeric character.
+    """
+    clean = name.strip()
+    clean = re.sub(r"[^a-zA-Z0-9._-]", "_", clean)
+    clean = re.sub(r"\.{2,}", "_", clean)
+    if not clean or not clean[0].isalpha():
         clean = f"col_{clean}"
-    if not clean[0].isalnum():
-        clean = f"c{clean}"
-    if not clean[-1].isalnum():
-        clean = f"{clean}c"
-    return clean[:512]
+    clean = clean[:512]
+    clean = clean.rstrip("._-")
+    if len(clean) < 3:
+        clean = f"{clean}_col"[:512]
+    clean = clean.rstrip("._-")
+    if len(clean) < 3:
+        clean = "col_default"
+    return clean
 
 
 class ScannedPdfError(Exception):
@@ -47,6 +57,10 @@ class ScannedPdfError(Exception):
 
 class UnsupportedFormatError(ValueError):
     """Raised when a document format is not supported."""
+
+
+class DocumentParsingError(ValueError):
+    """Raised when a document cannot be parsed or is corrupted."""
 
 
 @dataclass
@@ -100,7 +114,6 @@ class DocumentIngestor:
     """Parses, chunks, deduplicates, and stores documents in ChromaDB vector store."""
 
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv"}
-    _manifest_lock = threading.Lock()
 
     def __init__(
         self,
@@ -124,7 +137,7 @@ class DocumentIngestor:
         self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_dir))
 
     def _load_manifest(self) -> dict:
-        with self._manifest_lock:
+        with BRAIN_MANIFEST_LOCK:
             if not self.manifest_path.exists():
                 return {"documents": {}}
             try:
@@ -134,7 +147,7 @@ class DocumentIngestor:
                 return {"documents": {}}
 
     def _save_manifest(self, manifest: dict) -> None:
-        with self._manifest_lock:
+        with BRAIN_MANIFEST_LOCK:
             temp_path = self.manifest_path.with_suffix(".tmp")
             with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -142,18 +155,23 @@ class DocumentIngestor:
 
     def _extract_pdf(self, file_path: Path) -> list[tuple[str, int]]:
         """Extracts text page by page from PDF. Raises ScannedPdfError if empty."""
-        reader = pypdf.PdfReader(str(file_path))
-        pages_chunks: list[tuple[str, int]] = []
-        total_text = ""
+        try:
+            reader = pypdf.PdfReader(str(file_path))
+            pages_chunks: list[tuple[str, int]] = []
+            total_text = ""
 
-        for page_idx, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            total_text += page_text
-            clean = page_text.strip()
-            if clean:
-                sub_chunks = chunk_text(clean, chunk_size=2000, overlap=200)
-                for chunk in sub_chunks:
-                    pages_chunks.append((chunk, page_idx + 1))
+            for page_idx, page in enumerate(reader.pages):
+                page_text = page.extract_text() or ""
+                total_text += page_text
+                clean = page_text.strip()
+                if clean:
+                    sub_chunks = chunk_text(clean, chunk_size=2000, overlap=200)
+                    for chunk in sub_chunks:
+                        pages_chunks.append((chunk, page_idx + 1))
+        except ScannedPdfError:
+            raise
+        except Exception as exc:
+            raise DocumentParsingError(f"Tệp PDF không hợp lệ hoặc bị lỗi: {exc}") from exc
 
         if not total_text.strip():
             raise ScannedPdfError("PDF dạng ảnh hoặc không chứa văn bản có thể trích xuất")
@@ -162,37 +180,46 @@ class DocumentIngestor:
 
     def _extract_docx(self, file_path: Path) -> list[tuple[str, Optional[int]]]:
         """Extracts text from .docx paragraphs and tables."""
-        doc = docx.Document(str(file_path))
-        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        table_lines = []
-        for table in doc.tables:
-            for row in table.rows:
-                cells_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-                if cells_text:
-                    table_lines.append(cells_text)
-        full_text = "\n\n".join(paragraphs + table_lines)
-        chunks = chunk_text(full_text, chunk_size=2000, overlap=200)
-        return [(c, None) for c in chunks]
+        try:
+            doc = docx.Document(str(file_path))
+            paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            table_lines = []
+            for table in doc.tables:
+                for row in table.rows:
+                    cells_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                    if cells_text:
+                        table_lines.append(cells_text)
+            full_text = "\n\n".join(paragraphs + table_lines)
+            chunks = chunk_text(full_text, chunk_size=2000, overlap=200)
+            return [(c, None) for c in chunks]
+        except Exception as exc:
+            raise DocumentParsingError(f"Tệp DOCX không hợp lệ hoặc bị lỗi: {exc}") from exc
 
     def _extract_csv(self, file_path: Path) -> list[tuple[str, Optional[int]]]:
         """Extracts tabular text from .csv files."""
-        lines = []
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                line = ", ".join(row).strip()
-                if line:
-                    lines.append(line)
-        full_text = "\n".join(lines)
-        chunks = chunk_text(full_text, chunk_size=2000, overlap=200)
-        return [(c, None) for c in chunks]
+        try:
+            lines = []
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    line = ", ".join(row).strip()
+                    if line:
+                        lines.append(line)
+            full_text = "\n".join(lines)
+            chunks = chunk_text(full_text, chunk_size=2000, overlap=200)
+            return [(c, None) for c in chunks]
+        except Exception as exc:
+            raise DocumentParsingError(f"Tệp CSV không hợp lệ hoặc bị lỗi: {exc}") from exc
 
     def _extract_text(self, file_path: Path) -> list[tuple[str, Optional[int]]]:
         """Extracts text from .txt and .md files."""
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            full_text = f.read()
-        chunks = chunk_text(full_text, chunk_size=2000, overlap=200)
-        return [(c, None) for c in chunks]
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                full_text = f.read()
+            chunks = chunk_text(full_text, chunk_size=2000, overlap=200)
+            return [(c, None) for c in chunks]
+        except Exception as exc:
+            raise DocumentParsingError(f"Không thể đọc tệp văn bản: {exc}") from exc
 
     def ingest_file(
         self,
@@ -253,7 +280,6 @@ class DocumentIngestor:
             chunks_with_pages = self._extract_text(path)
 
         if not chunks_with_pages:
-            # Fallback if document had no text
             chunks_with_pages = [("", None)]
 
         doc_id = f"doc_{uuid.uuid4().hex[:12]}"
