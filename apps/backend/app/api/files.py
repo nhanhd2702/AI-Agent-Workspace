@@ -325,7 +325,7 @@ def export_files_zip(
 
         if target_path:
             resolved = target_path.resolve()
-            if resolved.is_file():
+            if resolved.is_file() and resolved.is_relative_to(workspace_resolved):
                 resolved_paths.append(resolved)
 
     if not resolved_paths:
@@ -391,11 +391,12 @@ def delete_file(
             detail=f"File with ID '{file_id}' not found",
         )
 
-    # Delete physical file on disk if exists
+    # Delete physical file on disk if exists and within workspace
     if target_record.file_path:
         p = Path(target_record.file_path)
+        workspace_resolved = active_settings.workspace_dir.resolve()
         resolved = p if p.is_absolute() else (active_settings.workspace_dir / p).resolve()
-        if resolved.exists() and resolved.is_file():
+        if resolved.exists() and resolved.is_file() and resolved.is_relative_to(workspace_resolved):
             try:
                 resolved.unlink()
             except OSError:
