@@ -97,6 +97,23 @@ pnpm --filter desktop tauri dev
 
 ---
 
+### 4. Triển Khai Trên Máy Chủ VPS / Linux Cloud Server ☁️
+
+Hệ thống hỗ trợ triển khai nhanh chóng lên VPS Ubuntu/Debian với **1 dòng lệnh duy nhất**:
+
+```bash
+# Đăng nhập vào VPS và chạy script cài đặt tự động:
+curl -sSL https://raw.githubusercontent.com/nhanhd2702/AI-Agent-Workspace/main/scripts/deploy_vps.sh | sudo bash
+```
+
+Hoặc triển khai cô lập qua Docker Compose:
+```bash
+docker compose up -d --build
+```
+> 📖 Xem hướng dẫn chi tiết toàn tập tại: [docs/VPS_DEPLOYMENT_GUIDE.md](docs/VPS_DEPLOYMENT_GUIDE.md).
+
+---
+
 ## 🧪 Chạy Kiểm Thử (Run Tests)
 
 Dự án sở hữu độ bao phủ kiểm thử toàn diện với **664 bài test tự động (100% Green)**.

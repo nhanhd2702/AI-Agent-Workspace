@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+    container_name: ai-agent-backend
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - BACKEND_PORT=8765
+      - LOCAL_AUTH_TOKEN=${LOCAL_AUTH_TOKEN:-dev-local-token}
+      - WORKSPACE_DIR=/app/workspace
+    volumes:
+      - ai_workspace_data:/app/workspace
+    networks:
+      - ai-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/desktop/Dockerfile
+      args:
+        - NEXT_PUBLIC_LOCAL_AUTH_TOKEN=${LOCAL_AUTH_TOKEN:-dev-local-token}
+    container_name: ai-agent-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - ai-network
+
+volumes:
+  ai_workspace_data:
+    driver: local
+
+networks:
+  ai-network:
+    driver: bridge

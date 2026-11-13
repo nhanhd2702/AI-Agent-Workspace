@@ -69,10 +69,18 @@ export class ApiClient {
       (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_LOCAL_AUTH_TOKEN)
     );
 
+    const defaultHostUrl =
+      typeof window !== "undefined" &&
+      window.location.hostname &&
+      window.location.hostname !== "localhost" &&
+      window.location.hostname !== "127.0.0.1"
+        ? `${window.location.protocol}//${window.location.hostname}:8765`
+        : "http://127.0.0.1:8765";
+
     this.baseUrl = (
       config?.baseUrl ||
       (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_API_URL) ||
-      "http://127.0.0.1:8765"
+      defaultHostUrl
     ).replace(/\/$/, "");
 
     this.token = config?.token;

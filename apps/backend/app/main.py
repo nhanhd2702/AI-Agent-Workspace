@@ -78,7 +78,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(settings_router)
     app.include_router(ws_router)
 
-    # CORS configuration for desktop Next.js / Tauri shell
+    # CORS configuration for desktop Next.js / Tauri shell & remote VPS hosts
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -87,6 +87,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "tauri://localhost",
             "http://tauri.localhost",
         ],
+        allow_origin_regex=r"^https?://.*$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
