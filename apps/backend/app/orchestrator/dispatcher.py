@@ -940,7 +940,7 @@ class AgentDispatcher:
                                 art_dir = ws_dir / "artifacts" / task_id
                                 art_dir.mkdir(parents=True, exist_ok=True)
                                 for art_out in raw_res.artifacts:
-                                    fname = art_out.filename
+                                    fname = Path(art_out.filename).name
                                     content = art_out.content
                                     art_type = art_out.artifact_type or "html"
                                     target_file = art_dir / fname
@@ -966,6 +966,15 @@ class AgentDispatcher:
                                             else "text/html"
                                         )
                                     )
+                                    file_size = (
+                                        target_file.stat().st_size
+                                        if target_file.exists()
+                                        else (
+                                            len(content)
+                                            if isinstance(content, (str, bytes))
+                                            else 0
+                                        )
+                                    )
                                     row = Artifact(
                                         id=art_id,
                                         task_id=task_id,
@@ -974,6 +983,7 @@ class AgentDispatcher:
                                         file_path=str(target_file),
                                         file_type=art_type,
                                         mime_type=mime,
+                                        size_bytes=file_size,
                                         created_at=datetime.now(timezone.utc),
                                     )
                                     s.add(row)

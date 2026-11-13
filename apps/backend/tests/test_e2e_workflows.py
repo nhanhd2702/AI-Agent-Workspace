@@ -904,3 +904,92 @@ def test_e2e_inbox_engagement_and_human_takeover(
     assert "agent" in sender_types
     assert "system" in sender_types
     assert "human" in sender_types
+
+
+def test_e2e_content_pipeline_artifact_size_and_library_export(
+    client_with_db: TestClient,
+    mock_all_externals: dict[str, Any],
+) -> None:
+    """Verify that Content Pipeline artifacts populate positive size_bytes and can be listed and exported via File Library."""
+    parse_resp = client_with_db.post(
+        "/api/v1/tasks/parse",
+        json={"prompt_text": "Nghiên cứu Alex Hormozi rồi viết bài FB kèm ảnh 1080x1080"},
+    )
+    assert parse_resp.status_code == 200
+    task_id = parse_resp.json()["data"]["task_id"]
+
+    dispatch_resp = client_with_db.post(f"/api/v1/tasks/{task_id}/dispatch")
+    assert dispatch_resp.status_code == 200
+
+    # Query DB for artifacts
+    factory = client_with_db.app.state.session_factory
+    with factory() as session:
+        artifacts = session.query(Artifact).filter_by(task_id=task_id).all()
+        assert len(artifacts) >= 2
+        for art in artifacts:
+            assert art.size_bytes > 0, f"Artifact {art.name} size_bytes should be > 0"
+            assert Path(art.file_path).exists()
+
+        art_ids = [art.id for art in artifacts]
+
+    # Query File Library endpoint
+    files_resp = client_with_db.get("/api/v1/files")
+    assert files_resp.status_code == 200
+    files_data = files_resp.json()
+    listed_ids = [f["id"] for f in files_data["data"]]
+    for aid in art_ids:
+        assert aid in listed_ids
+
+    # Export artifacts to ZIP
+    export_resp = client_with_db.post("/api/v1/files/export", json={"file_ids": art_ids})
+    assert export_resp.status_code == 200
+    assert export_resp.headers["content-type"] == "application/zip"
+    assert len(export_resp.content) > 100
+
+
+def test_e2e_funnel_pipeline_hil_rejection_and_feedback(
+    client_with_db: TestClient,
+    mock_all_externals: dict[str, Any],
+) -> None:
+    """Verify that HIL review gate rejection records feedback and stops execution."""
+    parse_resp = client_with_db.post(
+        "/api/v1/tasks/parse",
+        json={
+            "prompt_text": "Xây dựng chiến lược phễu 7 bước cho sản phẩm Coaching Giảm Cân 5M",
+            "mode": "copilot",
+        },
+    )
+    assert parse_resp.status_code == 200
+    task_id = parse_resp.json()["data"]["task_id"]
+
+    # First dispatch -> hits HIL review gate
+    dispatch1 = client_with_db.post(f"/api/v1/tasks/{task_id}/dispatch")
+    assert dispatch1.status_code == 200
+    assert dispatch1.json()["data"]["status"] == "waiting_review"
+
+    # Get the review gate
+    rev_resp = client_with_db.get(f"/api/v1/reviews?taskId={task_id}")
+    assert rev_resp.status_code == 200
+    reviews_data = rev_resp.json()["data"]
+    assert len(reviews_data) >= 1
+    gate_id = reviews_data[0]["id"]
+
+    # Reject with feedback
+    reject_resp = client_with_db.patch(
+        f"/api/v1/reviews/{gate_id}/decide",
+        json={
+            "decision": "reject",
+            "feedback_text": "Cần bổ sung cam kết hoàn tiền 30 ngày rõ ràng hơn",
+        },
+    )
+    assert reject_resp.status_code == 200
+    assert reject_resp.json()["data"]["status"] == "rejected"
+
+    # Verify task state in DB reflects rejection
+    factory = client_with_db.app.state.session_factory
+    with factory() as session:
+        gate = session.query(ReviewGate).filter_by(id=gate_id).first()
+        assert gate is not None
+        assert gate.status == "rejected"
+        assert gate.feedback_text == "Cần bổ sung cam kết hoàn tiền 30 ngày rõ ràng hơn"
+
