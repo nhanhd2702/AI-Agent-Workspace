@@ -156,28 +156,48 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
-# Service Frontend (Static HTTP Server qua Python hoặc serve)
-cat <<EOF > /etc/systemd/system/ai-agent-frontend.service
-[Unit]
-Description=AI Agent Workspace Frontend Web
-After=network.target ai-agent-backend.service
+# Cấu hình Nginx làm máy chủ Frontend và API Reverse Proxy
+cat <<EOF > /etc/nginx/sites-available/ai-workspace
+server {
+    listen $FRONTEND_PORT default_server;
+    server_name _;
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$APP_DIR/apps/desktop/out
-ExecStart=/usr/bin/python3.12 -m http.server $FRONTEND_PORT --bind 0.0.0.0
-Restart=always
-RestartSec=5
+    root $APP_DIR/apps/desktop/out;
+    index index.html;
 
-[Install]
-WantedBy=multi-user.target
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+    location / {
+        try_files \$uri \$uri.html \$uri/ /index.html =404;
+    }
+
+    location /_next/ {
+        alias $APP_DIR/apps/desktop/out/_next/;
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:$BACKEND_PORT/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
 EOF
+
+ln -sf /etc/nginx/sites-available/ai-workspace /etc/nginx/sites-enabled/ai-workspace
+nginx -t
+systemctl restart nginx
 
 systemctl daemon-reload
 systemctl enable ai-agent-backend.service
 systemctl restart ai-agent-backend.service
-systemctl enable ai-agent-frontend.service
 systemctl restart ai-agent-frontend.service
 
 # 8. Mở tường lửa (UFW Firewall)
