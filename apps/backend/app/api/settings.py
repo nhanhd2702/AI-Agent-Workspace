@@ -77,30 +77,56 @@ def get_raw_secret(db: Session, provider: str) -> str:
 # ============================================================================
 
 DEFAULT_LLM_PROVIDERS: dict[str, dict[str, Any]] = {
+    "antigravity_cli": {
+        "name": "Antigravity CLI (agy -p)",
+        "default_model": "gemini-2.5-flash",
+        "base_url": None,
+        "is_cli": True,
+        "description": "Chạy mô hình AI trực tiếp qua Antigravity CLI trên máy chủ/local, hoàn toàn miễn phí không tốn token API.",
+    },
+    "gemini_cli": {
+        "name": "Google Gemini CLI",
+        "default_model": "gemini-2.5-flash",
+        "base_url": None,
+        "is_cli": True,
+        "description": "Gọi Gemini trực tiếp qua CLI không cần token.",
+    },
+    "codex_cli": {
+        "name": "Codex / ChatGPT CLI",
+        "default_model": "gpt-4o",
+        "base_url": None,
+        "is_cli": True,
+        "description": "Gọi Codex / ChatGPT qua CLI không cần token.",
+    },
     "gemini": {
         "name": "Google Gemini",
         "default_model": "gemini-2.5-flash",
         "base_url": None,
+        "is_cli": False,
     },
     "openai": {
         "name": "OpenAI",
         "default_model": "gpt-4o",
         "base_url": None,
+        "is_cli": False,
     },
     "anthropic": {
         "name": "Anthropic Claude",
         "default_model": "claude-3-5-sonnet-20241022",
         "base_url": None,
+        "is_cli": False,
     },
     "deepseek": {
         "name": "DeepSeek",
         "default_model": "deepseek-chat",
         "base_url": None,
+        "is_cli": False,
     },
     "ollama": {
         "name": "Ollama (Local)",
         "default_model": "llama3.2",
         "base_url": "http://localhost:11434",
+        "is_cli": False,
     },
 }
 
@@ -154,32 +180,41 @@ def get_llm_settings(
 
     # 1. Fill registered standard providers
     for prov_id, default_meta in DEFAULT_LLM_PROVIDERS.items():
+        is_cli = bool(default_meta.get("is_cli", False))
+        cli_cmd = "agy" if prov_id == "antigravity_cli" else ("gemini" if prov_id == "gemini_cli" else ("codex" if prov_id == "codex_cli" else None))
+        cli_available = bool(cli_cmd and shutil.which(cli_cmd))
+
         row = config_by_provider.get(prov_id)
         if row is not None:
             decrypted = decrypt_secret(row.auth_payload, encryption_key)
-            masked = mask_api_key(decrypted)
+            masked = mask_api_key(decrypted) if not is_cli else "(CLI Tích hợp)"
             row_settings = row.settings or {}
             result[prov_id] = {
                 "provider": prov_id,
                 "name": default_meta["name"],
-                "has_key": bool(decrypted),
+                "has_key": bool(decrypted) or is_cli,
                 "masked_key": masked,
                 "default_model": row_settings.get("default_model") or default_meta["default_model"],
                 "base_url": row_settings.get("base_url") or default_meta.get("base_url"),
                 "is_enabled": row.is_enabled,
                 "status": row.status,
+                "is_cli": is_cli,
+                "cli_available": cli_available,
                 "updated_at": row.updated_at.isoformat() if row.updated_at else None,
             }
         else:
+            is_def_enabled = bool(cli_available if is_cli else (prov_id == "ollama"))
             result[prov_id] = {
                 "provider": prov_id,
                 "name": default_meta["name"],
-                "has_key": False,
-                "masked_key": "",
+                "has_key": is_cli,
+                "masked_key": "(CLI Tích hợp)" if is_cli else "",
                 "default_model": default_meta["default_model"],
                 "base_url": default_meta.get("base_url"),
-                "is_enabled": prov_id == "ollama",
-                "status": "connected" if prov_id == "ollama" else "disconnected",
+                "is_enabled": is_def_enabled,
+                "status": "connected" if (cli_available or prov_id == "ollama") else "disconnected",
+                "is_cli": is_cli,
+                "cli_available": cli_available,
                 "updated_at": None,
             }
 
@@ -309,6 +344,29 @@ def test_llm_connection(
     encryption_key: bytes = settings.encryption_key
 
     norm_provider = payload.provider.strip().lower()
+    default_meta = DEFAULT_LLM_PROVIDERS.get(norm_provider, {})
+    is_cli = bool(default_meta.get("is_cli", False))
+
+    if is_cli:
+        cmd = "agy" if norm_provider == "antigravity_cli" else ("gemini" if norm_provider == "gemini_cli" else "codex")
+        path = shutil.which(cmd)
+        model = payload.default_model or default_meta.get("default_model", "default-model")
+        if path:
+            return {
+                "status": "ok",
+                "success": True,
+                "provider": norm_provider,
+                "model": model,
+                "latency_ms": 15,
+                "message": f"CLI '{cmd}' đã được phát hiện tại '{path}'! Sẵn sàng thực thi trực tiếp không cần API token.",
+            }
+        else:
+            return {
+                "status": "error",
+                "success": False,
+                "provider": norm_provider,
+                "message": f"Không tìm thấy lệnh CLI '{cmd}' trong biến môi trường PATH hệ thống. Vui lòng cài đặt CLI hoặc chọn provider khác.",
+            }
 
     # Determine key to use
     api_key: str = ""

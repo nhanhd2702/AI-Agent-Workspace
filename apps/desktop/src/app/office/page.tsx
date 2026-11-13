@@ -20,6 +20,7 @@ import {
   X,
 } from "lucide-react";
 import { SidebarNav } from "@/components/layout/SidebarNav";
+import { Office3DCanvas } from "@/components/office/Office3DCanvas";
 import { ApiClient } from "@/lib/apiClient";
 import type { Agent, Department } from "@/lib/types";
 
@@ -75,6 +76,7 @@ export default function OfficePage() {
   const [loadedFromBackend, setLoadedFromBackend] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"3d" | "cards">("3d");
 
   // Add/Assign agent modal state
   const [targetDept, setTargetDept] = useState<OfficeDepartment | null>(null);
@@ -361,6 +363,51 @@ export default function OfficePage() {
             <div className="text-xs text-gray-400">Đang tải sơ đồ văn phòng AI...</div>
           ) : (
             <div className="space-y-6 max-w-7xl mx-auto">
+              {/* View Switcher Bar */}
+              <div className="flex items-center justify-between p-3 rounded-2xl bg-gray-900 border border-gray-800">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("3d")}
+                    className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                      viewMode === "3d"
+                        ? "bg-sky-500 text-white shadow-md shadow-sky-500/20"
+                        : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+                    }`}
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>🏢 Mô hình Văn Phòng Ảo 3D</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("cards")}
+                    className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                      viewMode === "cards"
+                        ? "bg-sky-500 text-white shadow-md shadow-sky-500/20"
+                        : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+                    }`}
+                  >
+                    <Users className="w-3.5 h-3.5" />
+                    <span>📋 Thẻ Phòng Ban & Nhân Sự (2D)</span>
+                  </button>
+                </div>
+                <span className="text-[11px] text-gray-500 hidden sm:inline">
+                  {viewMode === "3d"
+                    ? "Góc nhìn Isometric 4 phòng ban & 12 Agent"
+                    : "Quản lý chi tiết vai trò & mô hình từng Agent"}
+                </span>
+              </div>
+
+              {/* 3D Office Canvas View */}
+              {viewMode === "3d" && (
+                <div className="space-y-4">
+                  <Office3DCanvas />
+                </div>
+              )}
+
+              {/* Department Cards Grid (shown in cards mode, or overview below 3D) */}
+              {(viewMode === "cards" || viewMode === "3d") && (
+                <div className="space-y-6">
               {departmentGroups.map((group) => {
                 const Icon = getDepartmentIcon(group.name);
                 const isSyntheticDept =
@@ -472,6 +519,8 @@ export default function OfficePage() {
                   </section>
                 );
               })}
+                </div>
+              )}
             </div>
           )}
         </div>

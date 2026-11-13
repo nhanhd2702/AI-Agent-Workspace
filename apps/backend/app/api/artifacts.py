@@ -33,6 +33,47 @@ from app.db.session import get_db
 router = APIRouter(prefix="/api/v1/artifacts", tags=["artifacts"])
 files_router = APIRouter(prefix="/api/v1/files", tags=["files"])
 
+
+@router.get("", status_code=status.HTTP_200_OK)
+def list_artifacts(
+    task_id: Optional[str] = Query(default=None),
+    category: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """List artifacts with optional filtering by task_id and category."""
+    query = db.query(Artifact)
+    if task_id:
+        query = query.filter(Artifact.task_id == task_id)
+    if category:
+        query = query.filter(Artifact.category == category)
+    artifacts = query.order_by(Artifact.created_at.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "status": "success",
+        "data": [
+            {
+                "id": a.id,
+                "task_id": a.task_id,
+                "subtask_id": a.subtask_id,
+                "created_by_agent_id": a.created_by_agent_id,
+                "name": a.name,
+                "title": a.name,
+                "file_path": a.file_path,
+                "file_type": a.file_type,
+                "mime_type": a.mime_type,
+                "artifact_type": a.file_type,
+                "size_bytes": a.size_bytes,
+                "category": a.category,
+                "metadata": a.artifact_metadata or {},
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "updated_at": a.updated_at.isoformat() if a.updated_at else None,
+            }
+            for a in artifacts
+        ],
+    }
+
 MEDIA_MIME_TYPES: dict[str, str] = {
     ".mp4": "video/mp4",
     ".m4v": "video/mp4",

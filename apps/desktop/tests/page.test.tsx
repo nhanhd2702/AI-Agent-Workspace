@@ -18,7 +18,7 @@ describe("HomePage Integration Tests", () => {
 
     expect(screen.getByText("Văn Phòng AI (AI Agent Workspace)")).toBeInTheDocument();
     expect(screen.getByText("Tạo task mới")).toBeInTheDocument();
-    expect(screen.getByText("Văn phòng AI")).toBeInTheDocument();
+    expect(screen.getAllByText(/Tổng hành dinh/i).length).toBeGreaterThan(0);
     expect(screen.getByText("Hôm nay bạn muốn hoàn thành việc gì?")).toBeInTheDocument();
 
     await waitFor(() => {

@@ -27,7 +27,16 @@ export interface LlmConfigFormProps {
   isLoading?: boolean;
 }
 
-const PROVIDER_ORDER = ["gemini", "openai", "anthropic", "deepseek", "ollama"];
+const PROVIDER_ORDER = [
+  "gemini",
+  "openai",
+  "anthropic",
+  "deepseek",
+  "ollama",
+  "antigravity_cli",
+  "gemini_cli",
+  "codex_cli",
+];
 
 export function LlmConfigForm({
   providers,
@@ -248,7 +257,11 @@ export function LlmConfigForm({
                 <div className="mt-4 pt-3 border-t border-gray-800/80 flex flex-wrap items-center justify-between text-xs text-gray-400 gap-2">
                   <div className="flex items-center gap-2">
                     <span className="text-gray-500">Khóa API:</span>
-                    {config.has_key ? (
+                    {key.endsWith("_cli") ? (
+                      <span className="font-semibold text-emerald-400 bg-emerald-950/60 px-2.5 py-1 rounded border border-emerald-800/60">
+                        ⚡ CLI Trực tiếp (Miễn phí / Không cần token)
+                      </span>
+                    ) : config.has_key ? (
                       <span className="font-mono bg-gray-950 px-2.5 py-1 rounded border border-gray-800 text-gray-200">
                         {config.masked_key}
                       </span>

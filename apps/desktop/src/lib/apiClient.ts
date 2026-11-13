@@ -386,8 +386,9 @@ export class ApiClient {
       params.append("offset", String(filters.offset));
 
     const qs = params.toString() ? `?${params.toString()}` : "";
-    const rawTasks = await this.request<any[]>(`/api/v1/tasks${qs}`);
-    return (rawTasks || []).map((raw) => this.normalizeTask(raw));
+    const rawTasks = await this.request<any>(`/api/v1/tasks${qs}`);
+    const list = Array.isArray(rawTasks) ? rawTasks : Array.isArray(rawTasks?.data) ? rawTasks.data : [];
+    return list.map((raw: any) => this.normalizeTask(raw));
   }
 
   /**
@@ -468,6 +469,55 @@ export class ApiClient {
       entities: raw.entities || {},
       plan: raw.plan || null,
     };
+  }
+
+  /**
+   * Dispatch DAG execution for a task.
+   */
+  async dispatchTask(
+    taskId: string,
+    options?: { mode?: ExecutionMode; timeoutSeconds?: number; maxParallel?: number }
+  ): Promise<any> {
+    return await this.request<any>(
+      `/api/v1/tasks/${encodeURIComponent(taskId)}/dispatch`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          mode: options?.mode,
+          timeoutSeconds: options?.timeoutSeconds,
+          maxParallel: options?.maxParallel,
+        }),
+      }
+    );
+  }
+
+  /**
+   * Fetch a single task by ID.
+   */
+  async getTask(taskId: string): Promise<BoardTask> {
+    const raw = await this.request<any>(`/api/v1/tasks/${encodeURIComponent(taskId)}`);
+    return this.normalizeTask(raw);
+  }
+
+  /**
+   * List artifacts generated for tasks.
+   */
+  async listArtifacts(filters?: { taskId?: string; category?: string }): Promise<any[]> {
+    const params = new URLSearchParams();
+    if (filters?.taskId) params.append("task_id", filters.taskId);
+    if (filters?.category) params.append("category", filters.category);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const raw = await this.request<any>(`/api/v1/artifacts${qs}`);
+    if (Array.isArray(raw)) return raw;
+    if (raw && Array.isArray(raw.data)) return raw.data;
+    return [];
+  }
+
+  /**
+   * Render or fetch artifact content.
+   */
+  async renderArtifact(artifactId: string): Promise<any> {
+    return await this.request<any>(`/api/v1/artifacts/${encodeURIComponent(artifactId)}/render`);
   }
 
   /**

@@ -251,11 +251,12 @@ describe("CommanderPromptBox & Workspace Shell Tests", () => {
       expect(onNewTask).toHaveBeenCalled();
 
       // Navigation items
-      expect(screen.getByText("Văn phòng AI")).toBeInTheDocument();
-      expect(screen.getByText("Tự động")).toBeInTheDocument();
-      expect(screen.getByText("Thư viện")).toBeInTheDocument();
-      expect(screen.getByText("Brain")).toBeInTheDocument();
-      expect(screen.getByText("Hội thoại khách")).toBeInTheDocument();
+      expect(screen.getByText(/Tổng hành dinh/i)).toBeInTheDocument();
+      expect(screen.getByText(/Bảng công việc/i)).toBeInTheDocument();
+      expect(screen.getByText(/Phòng ban & 12 Agent/i)).toBeInTheDocument();
+      expect(screen.getByText(/Kho tri thức/i)).toBeInTheDocument();
+      expect(screen.getByText(/Hộp thư khách/i)).toBeInTheDocument();
+      expect(screen.getByText(/Thư viện xuất file/i)).toBeInTheDocument();
 
       // Time groups
       expect(screen.getByText("Hôm nay")).toBeInTheDocument();
