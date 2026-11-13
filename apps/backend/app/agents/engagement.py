@@ -393,7 +393,7 @@ class SupportAgent(_BaseEngagementAgent):
             temperature=0.3,
             max_tokens=2048,
         )
-        cols = collections or ["knowledge", "policies", "faqs", "manuals"]
+        cols = collections or ["brand_profile", "policies", "faqs", "default"]
         super().__init__(
             agent=synth_agent,
             retriever=retriever,
@@ -418,6 +418,7 @@ class SupportAgent(_BaseEngagementAgent):
         """Draft a support reply with RAG grounding, citations, and escalation checks."""
         extra_list = list(extra_secrets or [])
         clean_msg = str(mask_secrets(customer_msg or "", extra_secrets=extra_list)).strip()
+        clean_history = mask_secrets(conversation_history, extra_secrets=extra_list)
         msg_lower = clean_msg.lower()
 
         # 1. Search knowledge base
@@ -428,8 +429,11 @@ class SupportAgent(_BaseEngagementAgent):
             min_similarity=0.0,
         )
 
-        top_score = float(hits[0].score) if hits else 0.0
+        top_score = float(getattr(hits[0], "score", 0.0) or 0.0) if hits else 0.0
         confidence_score = round(top_score, 4)
+        valid_hits = [
+            h for h in hits if float(getattr(h, "score", 0.0) or 0.0) >= self.default_min_similarity
+        ]
 
         # 2. Check escalation triggers
         reasons: list[str] = []
@@ -464,9 +468,9 @@ class SupportAgent(_BaseEngagementAgent):
         escalate_to_human = len(reasons) > 0
         escalation_reason = " ".join(reasons) if reasons else None
 
-        # 3. Build citations
+        # 3. Build citations (from verified valid_hits >= default_min_similarity only)
         citations: list[dict[str, Any]] = []
-        for h in hits:
+        for h in valid_hits:
             doc_title = getattr(h, "doc_title", "") or ""
             text = getattr(h, "text", "") or ""
             citations.append(
@@ -475,7 +479,7 @@ class SupportAgent(_BaseEngagementAgent):
                     "doc_id": str(getattr(h, "doc_id", "")),
                     "doc_title": str(mask_secrets(doc_title, extra_secrets=extra_list)),
                     "collection": str(getattr(h, "collection", "")),
-                    "score": round(float(getattr(h, "score", 0.0)), 4),
+                    "score": round(float(getattr(h, "score", 0.0) or 0.0), 4),
                     "text": str(mask_secrets(text, extra_secrets=extra_list)),
                     "page": getattr(h, "page", None),
                 }
@@ -484,7 +488,7 @@ class SupportAgent(_BaseEngagementAgent):
         # 4. Draft reply text via LLM or fallback
         prompt_messages = self._build_prompt(
             customer_msg=clean_msg,
-            conversation_history=conversation_history,
+            conversation_history=clean_history,
             citations=citations,
             escalate_to_human=escalate_to_human,
             escalation_reason=escalation_reason,
@@ -516,6 +520,7 @@ class SupportAgent(_BaseEngagementAgent):
                 "Khảo sát mức độ hài lòng",
                 "Đóng phiếu hỗ trợ khi hoàn tất",
             ]
+        suggested_actions = list(mask_secrets(suggested_actions, extra_secrets=extra_list))
 
         return EngagementReply(
             reply_text=reply_text,
@@ -656,6 +661,7 @@ class SalesAgent(_BaseEngagementAgent):
         """Draft a consultative sales reply grounded in catalog with escalation triggers."""
         extra_list = list(extra_secrets or [])
         clean_msg = str(mask_secrets(customer_msg or "", extra_secrets=extra_list)).strip()
+        clean_history = mask_secrets(conversation_history, extra_secrets=extra_list)
         msg_lower = clean_msg.lower()
 
         # 1. Search product catalog & brand knowledge base
@@ -666,8 +672,11 @@ class SalesAgent(_BaseEngagementAgent):
             min_similarity=0.0,
         )
 
-        top_score = float(hits[0].score) if hits else 0.0
+        top_score = float(getattr(hits[0], "score", 0.0) or 0.0) if hits else 0.0
         confidence_score = round(top_score, 4)
+        valid_hits = [
+            h for h in hits if float(getattr(h, "score", 0.0) or 0.0) >= self.default_min_similarity
+        ]
 
         # 2. Check escalation triggers
         reasons: list[str] = []
@@ -704,9 +713,9 @@ class SalesAgent(_BaseEngagementAgent):
         escalate_to_human = len(reasons) > 0
         escalation_reason = " ".join(reasons) if reasons else None
 
-        # 3. Build citations
+        # 3. Build citations (from verified valid_hits >= default_min_similarity only)
         citations: list[dict[str, Any]] = []
-        for h in hits:
+        for h in valid_hits:
             doc_title = getattr(h, "doc_title", "") or ""
             text = getattr(h, "text", "") or ""
             citations.append(
@@ -715,7 +724,7 @@ class SalesAgent(_BaseEngagementAgent):
                     "doc_id": str(getattr(h, "doc_id", "")),
                     "doc_title": str(mask_secrets(doc_title, extra_secrets=extra_list)),
                     "collection": str(getattr(h, "collection", "")),
-                    "score": round(float(getattr(h, "score", 0.0)), 4),
+                    "score": round(float(getattr(h, "score", 0.0) or 0.0), 4),
                     "text": str(mask_secrets(text, extra_secrets=extra_list)),
                     "page": getattr(h, "page", None),
                 }
@@ -724,7 +733,7 @@ class SalesAgent(_BaseEngagementAgent):
         # 4. Draft reply text via LLM or fallback
         prompt_messages = self._build_prompt(
             customer_msg=clean_msg,
-            conversation_history=conversation_history,
+            conversation_history=clean_history,
             citations=citations,
             escalate_to_human=escalate_to_human,
             escalation_reason=escalation_reason,
@@ -769,6 +778,7 @@ class SalesAgent(_BaseEngagementAgent):
                 "Mời đăng ký trải nghiệm thử miễn phí",
                 "Đề xuất đặt lịch tư vấn chuyên sâu 1:1",
             ]
+        suggested_actions = list(mask_secrets(suggested_actions, extra_secrets=extra_list))
 
         return EngagementReply(
             reply_text=reply_text,

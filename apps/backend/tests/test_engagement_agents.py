@@ -347,3 +347,129 @@ def test_reexport_in_agents_package():
     assert SA is SalesAgent
     assert SupA is SupportAgent
     assert ER is EngagementReply
+
+
+# ============================================================================
+# Regression Tests (Task 4.5 Review Findings)
+# ============================================================================
+
+
+def test_support_agent_default_collections_match_spec():
+    """Verify default collections are ['brand_profile', 'policies', 'faqs', 'default']."""
+    agent = SupportAgent()
+    assert agent.collections == ["brand_profile", "policies", "faqs", "default"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_secret_scrubbed(mock_retriever_high_score, mock_llm):
+    """Pass secret in conversation_history and verify prompt received by LLM has secret masked."""
+    agent = SupportAgent(retriever=mock_retriever_high_score, llm=mock_llm)
+    secret_key = "sk-proj-historysecret1234567890abcdef"
+    extra_secret = "EXTRA_CONFIDENTIAL_HISTORY_TOKEN"
+
+    history = [
+        {"role": "user", "content": f"My secret API key is {secret_key}"},
+        {"role": "assistant", "content": f"Acknowledged token: {extra_secret}"},
+    ]
+
+    await agent.draft_reply(
+        conv_id="conv-hist-sec",
+        customer_msg="Cho em hỏi chính sách hoàn tiền?",
+        conversation_history=history,
+        extra_secrets=[extra_secret],
+    )
+
+    assert len(mock_llm.calls) > 0
+    prompt_str = str(mock_llm.calls[-1]["messages"])
+    assert secret_key not in prompt_str
+    assert extra_secret not in prompt_str
+    assert "sk-***REDACTED***" in prompt_str
+    assert "***REDACTED***" in prompt_str
+
+
+@pytest.mark.asyncio
+async def test_sub_threshold_chunks_do_not_leak_into_citations_or_prompt(mock_llm):
+    """Verify chunks with score < 0.70 do not appear in reply.citations or prompt messages."""
+    high_chunk = ChunkHit(
+        chunk_id="chunk-valid",
+        doc_id="doc-valid",
+        doc_title="Valid Knowledge Doc",
+        collection="policies",
+        text="This is valid policy text that should be cited.",
+        score=0.85,
+        page=1,
+    )
+    sub_threshold_chunk = ChunkHit(
+        chunk_id="chunk-sub",
+        doc_id="doc-sub",
+        doc_title="Sub Threshold Internal Draft",
+        collection="default",
+        text="Sub-threshold text that must NEVER leak into citations or prompt.",
+        score=0.65,
+        page=2,
+    )
+    retriever = MockRetriever(hits=[high_chunk, sub_threshold_chunk])
+    agent = SupportAgent(retriever=retriever, llm=mock_llm)
+
+    reply = await agent.draft_reply(
+        conv_id="conv-sub-test",
+        customer_msg="Hỗ trợ chính sách giúp tôi",
+    )
+
+    # 1. Citations must only contain valid_hits >= 0.70
+    assert len(reply.citations) == 1
+    assert reply.citations[0]["doc_title"] == "Valid Knowledge Doc"
+    assert reply.citations[0]["score"] == 0.85
+
+    # 2. Sub-threshold chunk must NOT appear in reply.citations
+    for citation in reply.citations:
+        assert citation["doc_title"] != "Sub Threshold Internal Draft"
+        assert citation["score"] >= 0.70
+
+    # 3. Sub-threshold chunk must NOT leak into the LLM prompt messages
+    assert len(mock_llm.calls) > 0
+    prompt_str = str(mock_llm.calls[-1]["messages"])
+    assert "Sub Threshold Internal Draft" not in prompt_str
+    assert "Sub-threshold text that must NEVER leak" not in prompt_str
+    assert "Valid Knowledge Doc" in prompt_str
+
+    # 4. Verify case where all chunks are below threshold
+    all_sub_retriever = MockRetriever(hits=[sub_threshold_chunk])
+    agent_sub = SupportAgent(retriever=all_sub_retriever, llm=mock_llm)
+    reply_sub = await agent_sub.draft_reply(
+        conv_id="conv-all-sub",
+        customer_msg="Cho tôi hỏi thông tin?",
+    )
+    assert reply_sub.escalate_to_human is True
+    assert reply_sub.confidence_score == 0.65
+    assert len(reply_sub.citations) == 0
+    prompt_str_sub = str(mock_llm.calls[-1]["messages"])
+    assert "Sub Threshold Internal Draft" not in prompt_str_sub
+
+
+@pytest.mark.asyncio
+async def test_suggested_actions_secret_scrubbed(mock_retriever_high_score, mock_llm):
+    """Verify suggested_actions are masked."""
+    secret_term = "chuyên viên"
+    agent = SupportAgent(retriever=mock_retriever_high_score, llm=mock_llm)
+
+    # Escalated state includes "Chuyển chuyên viên hỗ trợ cấp cao"
+    reply_escalated = await agent.draft_reply(
+        conv_id="conv-act-esc",
+        customer_msg="Tôi muốn kiện công ty",
+        extra_secrets=[secret_term],
+    )
+    assert reply_escalated.escalate_to_human is True
+    assert len(reply_escalated.suggested_actions) > 0
+    assert any("***REDACTED***" in act for act in reply_escalated.suggested_actions)
+    assert not any(secret_term in act for act in reply_escalated.suggested_actions)
+
+    # Non-escalated state includes "Gửi hướng dẫn chi tiết"
+    reply_normal = await agent.draft_reply(
+        conv_id="conv-act-norm",
+        customer_msg="Cho em hỏi chính sách hoàn tiền?",
+        extra_secrets=["hướng dẫn"],
+    )
+    assert reply_normal.escalate_to_human is False
+    assert any("***REDACTED***" in act for act in reply_normal.suggested_actions)
+    assert not any("hướng dẫn" in act for act in reply_normal.suggested_actions)
