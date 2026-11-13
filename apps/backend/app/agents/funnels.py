@@ -39,6 +39,7 @@ __all__ = [
     "AgentResult",
     "FunnelsAgent",
     "GrowthAdvisorAgent",
+    "UIDesignerAgent",
 ]
 
 
@@ -202,10 +203,60 @@ def _extract_extra_secrets(task_ctx: dict[str, Any]) -> list[str]:
     return extra_secrets
 
 
+def _parse_numeric_price(val: Any) -> float:
+    """Safely parse numbers, currency strings (VND, đ, k), or malformed inputs into float."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    if not isinstance(val, str):
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+
+    s = val.strip()
+    if not s:
+        return 0.0
+
+    # Handle suffix "K" / "k" (e.g. 200k, 200K)
+    if s.lower().endswith("k"):
+        num_clean = re.sub(r"[^\d.,]", "", s[:-1])
+        try:
+            return float(num_clean.replace(".", "").replace(",", ".")) * 1000.0
+        except (ValueError, TypeError):
+            pass
+
+    # Strip currency symbols and whitespace
+    s = re.sub(r"[₫đĐVNDvnd\s]", "", s)
+    if not s:
+        return 0.0
+
+    if "." in s and "," in s:
+        # e.g. 200.000,50 -> 200000.50
+        s = s.replace(".", "").replace(",", ".")
+    elif "." in s:
+        parts = s.split(".")
+        if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+            s = s.replace(".", "")
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
+
+    try:
+        clean_num = re.sub(r"[^\d.]", "", s)
+        return float(clean_num) if clean_num else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def _format_currency(amount: Any) -> str:
     """Format numeric values as Vietnamese Dong currency string."""
     try:
-        val = float(amount)
+        val = _parse_numeric_price(amount)
         return f"{val:,.0f} ₫".replace(",", ".")
     except (ValueError, TypeError):
         return str(amount) if amount is not None else "0 ₫"
@@ -425,7 +476,7 @@ class FunnelsAgent(BaseWorkerAgent):
             if isinstance(item, dict):
                 p_copy = dict(item)
                 name = str(p_copy.get("name") or f"Sản phẩm {idx + 1}")
-                price = float(p_copy.get("price") or 0.0)
+                price = _parse_numeric_price(p_copy.get("price"))
                 p_copy["name"] = name
                 p_copy["price"] = price
                 p_copy["formatted_price"] = _format_currency(price)
@@ -1186,6 +1237,8 @@ class GrowthAdvisorAgent(BaseWorkerAgent):
         total_customers = low_ticket + mid_ticket + high_ticket
         cac = round(ad_spend / total_customers, 2) if total_customers > 0 else 0.0
         roas = round(revenue / ad_spend, 2) if ad_spend > 0 else 0.0
+        aov = round(revenue / total_customers, 2) if total_customers > 0 else 0.0
+        churn = float(m.get("churn") or m.get("churn_rate") or 0.0)
 
         return {
             "traffic": int(traffic),
@@ -1201,6 +1254,8 @@ class GrowthAdvisorAgent(BaseWorkerAgent):
             "high_ticket_cvr": high_ticket_cvr,
             "cac": cac,
             "roas": roas,
+            "aov": aov,
+            "churn": churn,
         }
 
     def _identify_bottlenecks(
@@ -1570,3 +1625,1297 @@ class GrowthAdvisorAgent(BaseWorkerAgent):
 </body>
 </html>
 """
+
+
+# ============================================================================
+# UIDesignerAgent
+# ============================================================================
+
+
+class UIDesignerAgent(BaseWorkerAgent):
+    """Worker Agent that crafts offline, responsive, prototype landing pages with simulated checkout.
+
+    Generates single-page conversion landing pages with:
+    - Mandatory prototype approval banner: "BẢN THIẾT KẾ ĐỂ DUYỆT — KHÔNG PHẢI TRANG BÁN HÀNG THẬT"
+    - Zero external CDN dependencies, self-contained CSS, responsive grid with @media rules
+    - Inline SVG placeholders (product cover, trust badges, guarantee shield, rating stars)
+    - Simulated checkout modal (order summary, name/phone/address inputs, simulated payment, confirmation modal)
+    - High-converting conversion sections: Hero, Pain, Solution, Deliverables, Testimonials, Pricing, Guarantee, FAQ
+    - Sanitized offline HTML with strict CSP and secret masking
+    """
+
+    def __init__(
+        self,
+        agent: Optional[Agent] = None,
+        llm: Optional[Any] = None,
+        llm_router: Optional[LlmRouter] = None,
+        brand_profile: Optional[BrandProfile | dict[str, Any]] = None,
+        session_factory: Optional[Any] = None,
+        db: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        synth_agent = agent or Agent(
+            id="agent-ui-designer",
+            name="UIDesignerAgent",
+            display_name="UI Landing Page Designer",
+            role="UI/UX Prototype Designer",
+            default_model="gemini-2.5-flash",
+            temperature=0.7,
+            max_tokens=4096,
+        )
+        router = llm_router or (llm if isinstance(llm, LlmRouter) else None)
+        super().__init__(
+            agent=synth_agent,
+            llm_router=router,
+            session_factory=session_factory,
+            db=db,
+            **kwargs,
+        )
+        self.brand_profile = brand_profile
+        self.llm = llm or router
+
+    async def run(self, task_ctx: dict[str, Any]) -> AgentResult:
+        """Generate offline responsive landing page HTML prototype with simulated checkout."""
+        t0 = time.perf_counter()
+
+        product_name = str(
+            task_ctx.get("product_name")
+            or task_ctx.get("name")
+            or "Tài liệu tự học & biểu mẫu thực chiến"
+        ).strip()
+        raw_price = task_ctx.get("price") if "price" in task_ctx else 200000
+        price_num = _parse_numeric_price(raw_price)
+        formatted_price = _format_currency(price_num)
+        if price_num == 0.0 and isinstance(raw_price, str) and (
+            "miễn phí" in raw_price.lower() or "free" in raw_price.lower()
+        ):
+            formatted_price = "Miễn phí"
+
+        domain = str(task_ctx.get("domain", "general_business")).strip()
+        funnel_strategy = task_ctx.get("funnel_strategy") or {}
+        llm = task_ctx.get("llm") or self.llm
+        extra_secrets = _extract_extra_secrets(task_ctx)
+
+        # 1. Resolve brand profile
+        bp = task_ctx.get("brand_profile") or self.brand_profile
+        if bp is not None and not isinstance(bp, dict):
+            brand_name = getattr(bp, "brand_name", None) or "AI Agent Workspace"
+            tagline = getattr(bp, "tagline", None) or "Hệ sinh thái tự động hóa và tăng tốc chuyển đổi"
+            brand_colors = getattr(bp, "brand_colors", None) or ["#2563eb", "#1d4ed8", "#10b981"]
+        elif isinstance(bp, dict):
+            brand_name = bp.get("brand_name") or "AI Agent Workspace"
+            tagline = bp.get("tagline") or "Hệ sinh thái tự động hóa và tăng tốc chuyển đổi"
+            brand_colors = bp.get("brand_colors") or ["#2563eb", "#1d4ed8", "#10b981"]
+        else:
+            brand_name = "AI Agent Workspace"
+            tagline = "Hệ sinh thái tự động hóa và tăng tốc chuyển đổi"
+            brand_colors = ["#2563eb", "#1d4ed8", "#10b981"]
+
+        primary_color = (
+            brand_colors[0]
+            if isinstance(brand_colors, list) and len(brand_colors) > 0
+            else "#2563eb"
+        )
+        secondary_color = (
+            brand_colors[1]
+            if isinstance(brand_colors, list) and len(brand_colors) > 1
+            else "#1d4ed8"
+        )
+        accent_color = (
+            brand_colors[2]
+            if isinstance(brand_colors, list) and len(brand_colors) > 2
+            else "#10b981"
+        )
+
+        # 2. Compliance disclaimer detection
+        compliance_disclaimer = (
+            funnel_strategy.get("compliance_disclaimer")
+            if isinstance(funnel_strategy, dict)
+            else None
+        )
+        if not compliance_disclaimer:
+            comp_type = _detect_compliance_domain(
+                domain, f"{product_name} {domain} {task_ctx.get('instruction', '')}"
+            )
+            compliance_disclaimer = _get_compliance_disclaimer(comp_type)
+
+        # 3. Generate copywriting via LLM or deterministic fallback
+        copy_data = await self._generate_copy(
+            llm=llm,
+            product_name=product_name,
+            formatted_price=formatted_price,
+            domain=domain,
+            brand_name=brand_name,
+            tagline=tagline,
+            funnel_strategy=funnel_strategy,
+            disclaimer=compliance_disclaimer,
+        )
+
+        # 4. Structured data payload
+        structured_data: dict[str, Any] = {
+            "title": f"Bản thiết kế Landing Page: {product_name}",
+            "product_name": product_name,
+            "price": price_num,
+            "formatted_price": formatted_price,
+            "domain": domain,
+            "brand_name": brand_name,
+            "tagline": tagline,
+            "primary_color": primary_color,
+            "compliance_disclaimer": compliance_disclaimer,
+            "copywriting": copy_data,
+            "funnel_strategy": funnel_strategy if funnel_strategy else None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # 5. Render offline responsive HTML
+        raw_html = self._render_landing_page_html(
+            product_name=product_name,
+            price_num=price_num,
+            formatted_price=formatted_price,
+            domain=domain,
+            brand_name=brand_name,
+            tagline=tagline,
+            primary_color=primary_color,
+            secondary_color=secondary_color,
+            accent_color=accent_color,
+            compliance_disclaimer=compliance_disclaimer,
+            copy_data=copy_data,
+        )
+
+        sanitized_html, _ = sanitize_offline_html(raw_html)
+        masked_html = mask_secrets(sanitized_html, extra_secrets=extra_secrets)
+
+        html_artifact = ArtifactOutput(
+            filename="landing_page.html",
+            content=str(masked_html),
+            artifact_type="html",
+            title=f"Bản Thiết Kế Landing Page - {product_name}",
+            metadata={
+                "domain": domain,
+                "product_name": product_name,
+                "price": price_num,
+                "primary_color": primary_color,
+            },
+        )
+
+        masked_structured_data = mask_secrets(
+            structured_data, extra_secrets=extra_secrets
+        )
+        duration_ms = max(1, int((time.perf_counter() - t0) * 1000))
+
+        return AgentResult(
+            subtask_id=str(task_ctx.get("subtask_id", "ui_landing_page_design")),
+            agent_id=self.agent.id,
+            status="completed",
+            output=masked_structured_data,
+            content=(
+                f"Đã thiết kế thành công Landing Page Prototype cho '{product_name}' ({formatted_price}). "
+                f"Tích hợp banner duyệt mẫu, popup thanh toán mô phỏng client-side và layout chuẩn responsive."
+            ),
+            structured_data=masked_structured_data,
+            artifacts=[html_artifact],
+            duration_ms=duration_ms,
+        )
+
+    async def execute(
+        self,
+        subtask: Any,
+        context: Optional[dict[str, Any]] = None,
+        db_session_factory: Optional[Any] = None,
+    ) -> WorkerResult:
+        """Adapter method for BaseWorkerAgent orchestrator dispatch."""
+        ctx = dict(context or {})
+        task_ctx: dict[str, Any] = {}
+        if isinstance(subtask, dict):
+            task_ctx.update(subtask.get("metadata") or {})
+            task_ctx.setdefault("instruction", subtask.get("instruction", ""))
+            task_ctx["subtask_id"] = subtask.get("id", "subtask")
+        else:
+            meta = getattr(subtask, "metadata", None) or {}
+            task_ctx.update(meta)
+            task_ctx.setdefault("instruction", getattr(subtask, "instruction", ""))
+            task_ctx["subtask_id"] = getattr(subtask, "id", "subtask")
+
+        task_ctx.update(ctx)
+        return await self.run(task_ctx)
+
+    async def _generate_copy(
+        self,
+        llm: Any,
+        product_name: str,
+        formatted_price: str,
+        domain: str,
+        brand_name: str,
+        tagline: str,
+        funnel_strategy: dict[str, Any],
+        disclaimer: str,
+    ) -> dict[str, Any]:
+        """Synthesize high-converting landing page copywriting or return deterministic defaults."""
+        default_copy: dict[str, Any] = {
+            "headline": f"Giải Pháp Thực Chiến: {product_name}",
+            "subheadline": f"Sở hữu bộ công cụ và quy trình chuẩn mực giúp tối ưu hiệu suất, chỉ với {formatted_price}.",
+            "pain_points": [
+                "Lúng túng không biết bắt đầu từ đâu, mất quá nhiều thời gian thử sai và mò mẫm thủ công",
+                "Quy trình thủ công rườm rà, lặp đi lặp lại khiến năng suất trì trệ và chi phí tăng cao",
+                "Thiếu biểu mẫu chuẩn hóa và lộ trình triển khai chi tiết, dễ bỏ cuộc giữa chừng",
+            ],
+            "solutions": [
+                "Lộ trình tinh gọn từng bước: Tối giản lý thuyết, tập trung 100% vào thực hành ứng dụng",
+                "Bộ biểu mẫu và tài nguyên sẵn dùng: Chỉ cần tải về và áp dụng ngay cho dự án của bạn",
+                "Phương pháp chuẩn hóa kiểm chứng: Được đúc kết từ hàng trăm ca ứng dụng thực tế thành công",
+            ],
+            "deliverables": [
+                f"Tài liệu hướng dẫn chuyên sâu {product_name} định dạng PDF chất lượng cao",
+                "Kho biểu mẫu và checklist tự động hóa tối ưu chuyển đổi",
+                "Video hướng dẫn thiết lập và triển khai nhanh trong 30 phút",
+                "Quyền tham gia cộng đồng hỗ trợ và nhận cập nhật tài liệu định kỳ",
+            ],
+            "testimonials": [
+                {
+                    "name": "Hoàng Minh Tuấn",
+                    "role": "Founder, E-commerce Lab",
+                    "comment": "Tài liệu cực kỳ súc tích và thực tế. Nhóm tôi tiết kiệm được ít nhất 20 giờ làm việc mỗi tuần.",
+                    "rating": 5,
+                },
+                {
+                    "name": "Lê Thu Hà",
+                    "role": "Operations Manager",
+                    "comment": "Chỉ với chi phí rất nhỏ nhưng giá trị mang lại vượt xa kỳ vọng. Biểu mẫu dùng được ngay.",
+                    "rating": 5,
+                },
+            ],
+            "guarantee": "Cam kết hoàn tiền 100% trong vòng 30 ngày nếu bạn áp dụng nhưng không thấy tài liệu hữu ích cho công việc.",
+            "faqs": [
+                {
+                    "question": "Tôi sẽ nhận tài liệu bằng hình thức nào sau khi đăng ký?",
+                    "answer": "Hệ thống sẽ gửi link truy cập tài liệu và bộ biểu mẫu trực tiếp về email của bạn ngay lập tức.",
+                },
+                {
+                    "question": "Người mới bắt đầu có áp dụng được nội dung này không?",
+                    "answer": "Hoàn toàn phù hợp! Nội dung được biên soạn từ cơ bản đến nâng cao với ví dụ minh họa trực quan.",
+                },
+                {
+                    "question": "Tôi có được cập nhật khi tài liệu có phiên bản mới không?",
+                    "answer": "Có, mọi cập nhật bổ sung trong tương lai đều được cung cấp hoàn toàn miễn phí trọn đời.",
+                },
+            ],
+        }
+
+        if llm is None:
+            return default_copy
+
+        prompt_system = (
+            "Bạn là chuyên gia thiết kế nội dung Landing Page tỷ lệ chuyển đổi cao (High-Converting Copywriter). "
+            "Hãy tạo nội dung landing page đầy đủ các phần: headline, subheadline, pain_points (3 điểm), "
+            "solutions (3 điểm), deliverables (3-4 điểm), testimonials (2 người), faqs (2-3 câu), guarantee. "
+            "Trả về JSON hợp lệ với cấu trúc tương ứng."
+        )
+        user_prompt = (
+            f"Tên sản phẩm: {product_name}\n"
+            f"Giá bán: {formatted_price}\n"
+            f"Lĩnh vực: {domain}\n"
+            f"Thương hiệu: {brand_name} ({tagline})\n"
+            f"Tuyên bố tuân thủ: {disclaimer}"
+        )
+
+        messages = [
+            {"role": "system", "content": prompt_system},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        raw_llm = await _invoke_llm(llm, messages, agent=self.agent)
+        if raw_llm:
+            try:
+                clean_json = raw_llm.strip()
+                if "```json" in clean_json:
+                    clean_json = clean_json.split("```json")[1].split("```")[0]
+                elif "```" in clean_json:
+                    clean_json = clean_json.split("```")[1].split("```")[0]
+                parsed = json.loads(clean_json.strip())
+                if isinstance(parsed, dict) and "headline" in parsed:
+                    merged = dict(default_copy)
+                    merged.update(parsed)
+                    return merged
+            except Exception as e:
+                logger.debug("Could not parse LLM landing page copy: %s", e)
+
+        return default_copy
+
+    def _render_landing_page_html(
+        self,
+        product_name: str,
+        price_num: float,
+        formatted_price: str,
+        domain: str,
+        brand_name: str,
+        tagline: str,
+        primary_color: str,
+        secondary_color: str,
+        accent_color: str,
+        compliance_disclaimer: str,
+        copy_data: dict[str, Any],
+    ) -> str:
+        """Render self-contained, responsive landing page with offline prototype banner and simulated checkout."""
+        headline = html.escape(str(copy_data.get("headline") or f"Giải Pháp Thực Chiến: {product_name}"))
+        subheadline = html.escape(str(copy_data.get("subheadline") or ""))
+        guarantee_text = html.escape(str(copy_data.get("guarantee") or "Cam kết hoàn tiền 100% trong vòng 30 ngày nếu không hài lòng."))
+
+        # Pain points
+        pain_items_html = ""
+        for p in copy_data.get("pain_points") or []:
+            pain_items_html += f"""
+            <div class="card pain-card">
+                <div class="card-icon alert-icon">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#ef4444" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="12" y1="8" x2="12" y2="12"/>
+                        <line x1="12" y1="16" x2="12.01" y2="16"/>
+                    </svg>
+                </div>
+                <p class="card-text">{html.escape(str(p))}</p>
+            </div>
+            """
+
+        # Solutions
+        solution_items_html = ""
+        for s in copy_data.get("solutions") or []:
+            solution_items_html += f"""
+            <div class="card solution-card">
+                <div class="card-icon check-icon">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#10b981" stroke-width="2.5">
+                        <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                </div>
+                <p class="card-text">{html.escape(str(s))}</p>
+            </div>
+            """
+
+        # Deliverables
+        deliverables_html = ""
+        for d in copy_data.get("deliverables") or []:
+            deliverables_html += f"""
+            <li class="deliverable-item">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--primary)" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                    <line x1="16" y1="13" x2="8" y2="13"/>
+                    <line x1="16" y1="17" x2="8" y2="17"/>
+                    <polyline points="10 9 9 9 8 9"/>
+                </svg>
+                <span>{html.escape(str(d))}</span>
+            </li>
+            """
+
+        # Testimonials
+        testimonials_html = ""
+        for t in copy_data.get("testimonials") or []:
+            t_name = html.escape(str(t.get("name", "Khách hàng thân thiết")))
+            t_role = html.escape(str(t.get("role", "Học viên")))
+            t_comment = html.escape(str(t.get("comment", "")))
+            testimonials_html += f"""
+            <div class="testimonial-card">
+                <div class="star-rating">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="#f59e0b"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="#f59e0b"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="#f59e0b"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="#f59e0b"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="#f59e0b"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                </div>
+                <p class="testimonial-comment">"{t_comment}"</p>
+                <div class="testimonial-author">
+                    <strong>{t_name}</strong> &bull; <span class="author-role">{t_role}</span>
+                </div>
+            </div>
+            """
+
+        # FAQs
+        faqs_html = ""
+        for idx, f in enumerate(copy_data.get("faqs") or []):
+            q_text = html.escape(str(f.get("question", "")))
+            a_text = html.escape(str(f.get("answer", "")))
+            faqs_html += f"""
+            <div class="faq-item" id="faq-{idx}">
+                <div class="faq-question" onclick="toggleFaq('faq-{idx}')">
+                    <span>{q_text}</span>
+                    <span class="faq-toggle-icon">+</span>
+                </div>
+                <div class="faq-answer">
+                    <p>{a_text}</p>
+                </div>
+            </div>
+            """
+
+        # Calculation for strike-through regular price
+        regular_price_val = price_num * 2.5 if price_num > 0 else 500000
+        formatted_regular_price = _format_currency(regular_price_val)
+
+        return f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{html.escape(product_name)} — {html.escape(brand_name)}</title>
+    <style>
+        :root {{
+            --primary: {primary_color};
+            --primary-dark: {secondary_color};
+            --accent: {accent_color};
+            --bg-main: #f8fafc;
+            --surface: #ffffff;
+            --surface-alt: #f1f5f9;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+            --warning-bg: #fef3c7;
+            --warning-border: #f59e0b;
+            --warning-text: #92400e;
+        }}
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-main);
+            color: var(--text-main);
+            line-height: 1.6;
+        }}
+        .prototype-banner {{
+            background-color: var(--warning-bg);
+            border-bottom: 2px solid var(--warning-border);
+            color: var(--warning-text);
+            padding: 10px 16px;
+            text-align: center;
+            font-weight: 700;
+            font-size: 13px;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }}
+        .navbar {{
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }}
+        .nav-brand {{
+            display: flex;
+            flex-direction: column;
+        }}
+        .brand-title {{
+            font-size: 20px;
+            font-weight: 800;
+            color: var(--primary);
+        }}
+        .brand-tagline {{
+            font-size: 12px;
+            color: var(--text-muted);
+        }}
+        .nav-cta {{
+            background: var(--primary);
+            color: #ffffff;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 18px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        .nav-cta:hover {{
+            background: var(--primary-dark);
+        }}
+        .container {{
+            max-width: 1040px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }}
+        .hero-section {{
+            display: grid;
+            grid-template-columns: 1.2fr 0.8fr;
+            gap: 40px;
+            align-items: center;
+            margin-bottom: 60px;
+        }}
+        .hero-headline {{
+            font-size: 36px;
+            font-weight: 800;
+            line-height: 1.25;
+            color: var(--text-main);
+            margin-bottom: 16px;
+        }}
+        .hero-subheadline {{
+            font-size: 18px;
+            color: var(--text-muted);
+            margin-bottom: 24px;
+        }}
+        .hero-cta-btn {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--primary);
+            color: #ffffff;
+            font-size: 18px;
+            font-weight: 700;
+            padding: 16px 32px;
+            border-radius: 12px;
+            border: none;
+            cursor: pointer;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.3);
+            transition: transform 0.15s ease, background 0.2s ease;
+        }}
+        .hero-cta-btn:hover {{
+            transform: translateY(-2px);
+            background: var(--primary-dark);
+        }}
+        .trust-badges {{
+            display: flex;
+            gap: 20px;
+            margin-top: 24px;
+            font-size: 13px;
+            color: var(--text-muted);
+        }}
+        .trust-item {{
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .hero-mockup-wrap {{
+            background: var(--surface);
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+        }}
+        .section-header {{
+            text-align: center;
+            margin-bottom: 32px;
+        }}
+        .section-tag {{
+            text-transform: uppercase;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            color: var(--primary);
+            margin-bottom: 8px;
+            display: inline-block;
+        }}
+        .section-title {{
+            font-size: 26px;
+            font-weight: 800;
+            color: var(--text-main);
+        }}
+        .cards-grid {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            margin-bottom: 60px;
+        }}
+        .card {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+        .pain-card {{
+            border-top: 4px solid #ef4444;
+        }}
+        .solution-card {{
+            border-top: 4px solid var(--accent);
+        }}
+        .deliverables-box {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 32px;
+            margin-bottom: 60px;
+        }}
+        .deliverables-list {{
+            list-style: none;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }}
+        .deliverable-item {{
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            font-size: 15px;
+            font-weight: 500;
+        }}
+        .testimonials-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+            margin-bottom: 60px;
+        }}
+        .testimonial-card {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }}
+        .star-rating {{
+            display: flex;
+            gap: 4px;
+            margin-bottom: 12px;
+        }}
+        .testimonial-comment {{
+            font-style: italic;
+            font-size: 15px;
+            margin-bottom: 16px;
+            color: #334155;
+        }}
+        .testimonial-author {{
+            font-size: 14px;
+        }}
+        .author-role {{
+            color: var(--text-muted);
+        }}
+        .pricing-wrap {{
+            max-width: 520px;
+            margin: 0 auto 60px auto;
+        }}
+        .pricing-card {{
+            background: var(--surface);
+            border: 2px solid var(--primary);
+            border-radius: 20px;
+            padding: 36px 32px;
+            text-align: center;
+            box-shadow: 0 15px 30px -10px rgba(37, 99, 235, 0.15);
+            position: relative;
+        }}
+        .pricing-badge {{
+            position: absolute;
+            top: -14px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--primary);
+            color: #ffffff;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 4px 16px;
+            border-radius: 9999px;
+            letter-spacing: 0.5px;
+        }}
+        .price-original {{
+            font-size: 16px;
+            color: var(--text-muted);
+            text-decoration: line-through;
+            margin-top: 12px;
+        }}
+        .price-deal {{
+            font-size: 44px;
+            font-weight: 900;
+            color: var(--primary);
+            margin: 4px 0 16px 0;
+        }}
+        .pricing-cta-btn {{
+            width: 100%;
+            background: var(--primary);
+            color: #ffffff;
+            font-size: 18px;
+            font-weight: 700;
+            padding: 16px;
+            border-radius: 12px;
+            border: none;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        .pricing-cta-btn:hover {{
+            background: var(--primary-dark);
+        }}
+        .guarantee-box {{
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 16px;
+            padding: 24px;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .guarantee-icon {{
+            flex-shrink: 0;
+        }}
+        .guarantee-title {{
+            font-size: 17px;
+            font-weight: 700;
+            color: #166534;
+            margin-bottom: 4px;
+        }}
+        .guarantee-desc {{
+            font-size: 14px;
+            color: #15803d;
+            margin: 0;
+        }}
+        .compliance-disclaimer-box {{
+            background-color: var(--warning-bg);
+            border: 1px solid var(--warning-border);
+            color: var(--warning-text);
+            padding: 16px 20px;
+            border-radius: 12px;
+            font-size: 13px;
+            line-height: 1.5;
+            margin-bottom: 60px;
+        }}
+        .faq-accordion {{
+            max-width: 800px;
+            margin: 0 auto 60px auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+        .faq-item {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+        }}
+        .faq-question {{
+            padding: 18px 24px;
+            font-weight: 700;
+            font-size: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+        }}
+        .faq-toggle-icon {{
+            font-size: 20px;
+            font-weight: 400;
+            color: var(--text-muted);
+        }}
+        .faq-answer {{
+            display: none;
+            padding: 0 24px 18px 24px;
+            font-size: 15px;
+            color: #334155;
+        }}
+        .footer {{
+            border-top: 1px solid var(--border);
+            padding: 32px 20px;
+            text-align: center;
+            font-size: 13px;
+            color: var(--text-muted);
+            background: var(--surface);
+        }}
+        /* Simulated Checkout Modal */
+        .checkout-modal-overlay {{
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(15, 23, 42, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            padding: 16px;
+        }}
+        .checkout-modal-box {{
+            background: #ffffff;
+            border-radius: 16px;
+            max-width: 500px;
+            width: 100%;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2);
+            padding: 28px 24px;
+            position: relative;
+        }}
+        .modal-close-btn {{
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            background: transparent;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: var(--text-muted);
+        }}
+        .modal-header {{
+            margin-bottom: 20px;
+        }}
+        .modal-title {{
+            font-size: 20px;
+            font-weight: 800;
+            color: var(--text-main);
+            margin-bottom: 4px;
+        }}
+        .modal-sub {{
+            font-size: 13px;
+            color: var(--text-muted);
+        }}
+        .order-summary-card {{
+            background: var(--surface-alt);
+            border-radius: 10px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }}
+        .summary-row {{
+            display: flex;
+            justify-content: space-between;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }}
+        .summary-total {{
+            border-top: 1px dashed var(--border);
+            padding-top: 8px;
+            margin-top: 8px;
+            font-weight: 800;
+            font-size: 16px;
+            color: var(--primary);
+        }}
+        .form-group {{
+            margin-bottom: 16px;
+        }}
+        .form-group label {{
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: var(--text-main);
+        }}
+        .form-input {{
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 14px;
+            outline: none;
+        }}
+        .form-input:focus {{
+            border-color: var(--primary);
+        }}
+        .payment-method-selector {{
+            margin: 18px 0;
+        }}
+        .payment-label {{
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }}
+        .payment-options {{
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }}
+        .payment-option {{
+            background: var(--surface-alt);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .checkout-submit-btn {{
+            width: 100%;
+            background: var(--primary);
+            color: #ffffff;
+            font-size: 16px;
+            font-weight: 700;
+            padding: 14px;
+            border-radius: 10px;
+            border: none;
+            cursor: pointer;
+            margin-top: 10px;
+        }}
+        .checkout-submit-btn:hover {{
+            background: var(--primary-dark);
+        }}
+        .security-note {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            margin-top: 12px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }}
+        .checkout-success-view {{
+            text-align: center;
+            padding: 20px 0;
+        }}
+        .success-icon-wrap {{
+            width: 72px;
+            height: 72px;
+            background: #dcfce7;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px auto;
+        }}
+        .success-title {{
+            font-size: 20px;
+            font-weight: 800;
+            color: #166534;
+            margin-bottom: 8px;
+        }}
+        .success-desc {{
+            font-size: 14px;
+            color: var(--text-muted);
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }}
+        .success-order-box {{
+            background: var(--surface-alt);
+            border-radius: 8px;
+            padding: 14px;
+            font-size: 13px;
+            text-align: left;
+            margin-bottom: 24px;
+        }}
+        .success-order-box p {{
+            margin-bottom: 4px;
+        }}
+        .success-close-btn {{
+            background: var(--text-main);
+            color: #ffffff;
+            padding: 12px 24px;
+            border-radius: 8px;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+        }}
+        /* Responsive Media Queries */
+        @media (max-width: 768px) {{
+            .hero-section {{
+                grid-template-columns: 1fr;
+                gap: 30px;
+                text-align: center;
+            }}
+            .trust-badges {{
+                justify-content: center;
+            }}
+            .cards-grid {{
+                grid-template-columns: 1fr;
+            }}
+            .deliverables-list {{
+                grid-template-columns: 1fr;
+            }}
+            .testimonials-grid {{
+                grid-template-columns: 1fr;
+            }}
+            .hero-headline {{
+                font-size: 28px;
+            }}
+        }}
+        @media (max-width: 480px) {{
+            .hero-headline {{
+                font-size: 24px;
+            }}
+            .checkout-modal-box {{
+                padding: 18px 14px;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="prototype-banner">
+        <span>⚠️</span>
+        <span>BẢN THIẾT KẾ ĐỂ DUYỆT — KHÔNG PHẢI TRANG BÁN HÀNG THẬT</span>
+    </div>
+
+    <nav class="navbar">
+        <div class="nav-brand">
+            <span class="brand-title">{html.escape(brand_name)}</span>
+            <span class="brand-tagline">{html.escape(tagline)}</span>
+        </div>
+        <button type="button" class="nav-cta" onclick="openCheckout()">ĐẶT MUA NGAY</button>
+    </nav>
+
+    <div class="container">
+        <!-- Hero Section -->
+        <section class="hero-section" id="hero">
+            <div class="hero-content">
+                <span class="section-tag">PHIÊN BẢN ĐẶC BIỆT DÀNH CHO BẠN</span>
+                <h1 class="hero-headline">{headline}</h1>
+                <p class="hero-subheadline">{subheadline}</p>
+                <button type="button" class="hero-cta-btn" onclick="openCheckout()">
+                    SỞ HỮU NGAY — CHỈ {html.escape(formatted_price)}
+                </button>
+                <div class="trust-badges">
+                    <div class="trust-item">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                        <span>Cam kết 30 ngày hoàn phí</span>
+                    </div>
+                    <div class="trust-item">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                        <span>Nhận tài nguyên tức thì</span>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-mockup-wrap">
+                <svg class="hero-mockup-svg" viewBox="0 0 400 300" width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                        <linearGradient id="coverGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="{primary_color}" />
+                            <stop offset="100%" stop-color="{secondary_color}" />
+                        </linearGradient>
+                    </defs>
+                    <rect x="40" y="20" width="320" height="260" rx="16" fill="url(#coverGrad)" />
+                    <rect x="65" y="45" width="270" height="18" rx="9" fill="rgba(255,255,255,0.4)" />
+                    <rect x="65" y="75" width="190" height="12" rx="6" fill="rgba(255,255,255,0.25)" />
+                    <circle cx="200" cy="150" r="45" fill="rgba(255,255,255,0.15)" />
+                    <polygon points="190,130 190,170 225,150" fill="#ffffff" />
+                    <rect x="65" y="235" width="150" height="20" rx="10" fill="{accent_color}" />
+                    <text x="140" y="249" fill="#ffffff" font-size="11" font-weight="bold" text-anchor="middle" font-family="sans-serif">OFFLINE PROTOTYPE</text>
+                </svg>
+            </div>
+        </section>
+
+        <!-- Pain Agitation Section -->
+        <div class="section-header">
+            <span class="section-tag">THÁCH THỨC & NỖI ĐAU</span>
+            <h2 class="section-title">Bạn Có Đang Mắc Kẹt Trong Những Vấn Đề Này?</h2>
+        </div>
+        <section class="cards-grid pain-section" id="pain">
+            {pain_items_html}
+        </section>
+
+        <!-- Solution Section -->
+        <div class="section-header">
+            <span class="section-tag">GIẢI PHÁP ĐỘT PHÁ</span>
+            <h2 class="section-title">Chuyển Đổi Vận Hành Với Bộ Giải Pháp Toàn Diện</h2>
+        </div>
+        <section class="cards-grid solution-section" id="solution">
+            {solution_items_html}
+        </section>
+
+        <!-- Deliverables List Section -->
+        <section class="deliverables-box deliverables-section" id="deliverables">
+            <div class="section-header" style="text-align: left; margin-bottom: 24px;">
+                <span class="section-tag">TRỌN GÓI NỘI DUNG</span>
+                <h2 class="section-title">Bạn Sẽ Nhận Được Gì Khi Đăng Ký Hôm Nay?</h2>
+            </div>
+            <ul class="deliverables-list">
+                {deliverables_html}
+            </ul>
+        </section>
+
+        <!-- Testimonials Section -->
+        <div class="section-header">
+            <span class="section-tag">MINH CHỨNG THỰC TẾ</span>
+            <h2 class="section-title">Học Viên & Đối Tác Nói Gì Về Chúng Tôi</h2>
+        </div>
+        <section class="testimonials-grid testimonials-section" id="testimonials">
+            {testimonials_html}
+        </section>
+
+        <!-- Pricing Card Section -->
+        <section class="pricing-wrap pricing-section" id="pricing">
+            <div class="pricing-card">
+                <span class="pricing-badge">ƯU ĐÃI ĐẶC BIỆT HÔM NAY</span>
+                <h3 style="font-size: 22px; font-weight: 800; margin-top: 8px;">{html.escape(product_name)}</h3>
+                <div class="price-original">Giá gốc niêm yết: {html.escape(formatted_regular_price)}</div>
+                <div class="price-deal">{html.escape(formatted_price)}</div>
+                <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 24px;">
+                    Thanh toán một lần &bull; Sở hữu trọn đời &bull; Cập nhật miễn phí
+                </p>
+                <button type="button" class="pricing-cta-btn" onclick="openCheckout()">
+                    TIẾP TỤC ĐẶT HÀNG (MÔ PHỎNG)
+                </button>
+            </div>
+        </section>
+
+        <!-- Guarantee Section -->
+        <section class="guarantee-box guarantee-section" id="guarantee">
+            <div class="guarantee-icon">
+                <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#16a34a" stroke-width="2">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    <polyline points="9 12 11 14 15 10"/>
+                </svg>
+            </div>
+            <div>
+                <h4 class="guarantee-title">Cam Kết Hoàn Tiền 100% Trong 30 Ngày</h4>
+                <p class="guarantee-desc">{guarantee_text}</p>
+            </div>
+        </section>
+
+        <!-- Compliance Disclaimer Notice -->
+        <div class="compliance-disclaimer-box">
+            <strong>Tuyên bố tuân thủ & bảo vệ người tiêu dùng:</strong><br>
+            {html.escape(compliance_disclaimer)}
+        </div>
+
+        <!-- FAQ Accordion Section -->
+        <div class="section-header">
+            <span class="section-tag">GIẢI ĐÁP THẮC MẮC</span>
+            <h2 class="section-title">Câu Hỏi Thường Gặp (FAQ)</h2>
+        </div>
+        <section class="faq-accordion faq-section" id="faq">
+            {faqs_html}
+        </section>
+    </div>
+
+    <!-- Simulated Checkout Modal -->
+    <div id="checkout-modal" class="checkout-modal checkout-modal-overlay" style="display:none;">
+        <div class="checkout-modal-box">
+            <button type="button" class="modal-close-btn" onclick="closeCheckout()">&times;</button>
+
+            <div id="checkout-form-view">
+                <div class="modal-header">
+                    <h3 class="modal-title">Xác Nhận Đơn Hàng (Mô Phỏng)</h3>
+                    <span class="modal-sub">Hoàn tất thông tin để kiểm thử luồng chuyển đổi khách hàng</span>
+                </div>
+
+                <div class="order-summary-card">
+                    <div class="summary-row">
+                        <span class="summary-label">Sản phẩm:</span>
+                        <strong id="summary-prod-name">{html.escape(product_name)}</strong>
+                    </div>
+                    <div class="summary-row">
+                        <span class="summary-label">Đơn giá:</span>
+                        <span id="summary-prod-price">{html.escape(formatted_price)}</span>
+                    </div>
+                    <div class="summary-row summary-total">
+                        <span>Tổng thanh toán mô phỏng:</span>
+                        <span>{html.escape(formatted_price)}</span>
+                    </div>
+                </div>
+
+                <form id="simulated-checkout-form" onsubmit="return handleSimulatedCheckout(event);">
+                    <div class="form-group">
+                        <label for="checkout-name">Họ và tên của bạn:</label>
+                        <input type="text" id="checkout-name" name="customer_name" class="form-input" placeholder="Ví dụ: Nguyễn Văn A" value="Khách Hàng Thử Nghiệm" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="checkout-phone">Số điện thoại (Zalo nhận tài liệu):</label>
+                        <input type="tel" id="checkout-phone" name="customer_phone" class="form-input" placeholder="Ví dụ: 0912 345 678" value="0988888888" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="checkout-address">Email hoặc Địa chỉ nhận tài nguyên:</label>
+                        <input type="text" id="checkout-address" name="customer_address" class="form-input" placeholder="Ví dụ: khachhang@email.com" value="test@prototype.local" required>
+                    </div>
+
+                    <div class="payment-method-selector">
+                        <span class="payment-label">Phương thức thanh toán mô phỏng:</span>
+                        <div class="payment-options">
+                            <label class="payment-option selected">
+                                <input type="radio" name="pay_method" value="qr" checked> Chuyển khoản QR Ngân Hàng (Mô phỏng)
+                            </label>
+                            <label class="payment-option">
+                                <input type="radio" name="pay_method" value="wallet"> Ví điện tử Momo / VNPay (Mô phỏng)
+                            </label>
+                        </div>
+                    </div>
+
+                    <button type="submit" id="simulated-checkout-btn" class="checkout-submit-btn">
+                        XÁC NHẬN THANH TOÁN (MÔ PHỎNG)
+                    </button>
+
+                    <div class="security-note">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                        <span>Môi trường Sandbox an toàn — Không phát sinh giao dịch tiền tệ thực tế</span>
+                    </div>
+                </form>
+            </div>
+
+            <div id="checkout-success" style="display:none;" class="checkout-success-view">
+                <div class="success-icon-wrap">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                </div>
+                <h3 class="success-title">ĐẶT HÀNG MÔ PHỎNG THÀNH CÔNG!</h3>
+                <p class="success-desc">
+                    Cảm ơn bạn, <strong id="success-customer-name">Khách Hàng</strong>! Luồng tương tác và thu thập thông tin khách hàng tiềm năng đã hoạt động chuẩn xác theo kịch bản thiết kế.
+                </p>
+                <div class="success-order-box">
+                    <p><strong>Sản phẩm:</strong> {html.escape(product_name)}</p>
+                    <p><strong>Số tiền mô phỏng:</strong> {html.escape(formatted_price)}</p>
+                    <p><strong>Mã đơn thử nghiệm:</strong> #SIM-{int(time.time()) % 1000000}</p>
+                </div>
+                <button type="button" class="success-close-btn" onclick="closeCheckout()">
+                    ĐÓNG & TIẾP TỤC TRẢI NGHIỆM BẢN VẼ
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <p>Bản quyền thiết kế &copy; {html.escape(brand_name)}. Được xuất tự động và bảo mật ngoại tuyến (Offline Safe).</p>
+        <p style="margin-top: 6px; font-size: 11px;">Mọi hành động trên trang này chỉ nhằm mục đích kiểm duyệt giao diện (Prototype Review).</p>
+    </footer>
+
+    <script>
+        function openCheckout() {{
+            var modal = document.getElementById('checkout-modal');
+            var formView = document.getElementById('checkout-form-view');
+            var successView = document.getElementById('checkout-success');
+            if (modal) modal.style.display = 'flex';
+            if (formView) formView.style.display = 'block';
+            if (successView) successView.style.display = 'none';
+        }}
+
+        function closeCheckout() {{
+            var modal = document.getElementById('checkout-modal');
+            if (modal) modal.style.display = 'none';
+        }}
+
+        function handleSimulatedCheckout(event) {{
+            if (event) event.preventDefault();
+            var nameInput = document.getElementById('checkout-name');
+            var phoneInput = document.getElementById('checkout-phone');
+            var name = nameInput ? nameInput.value.trim() : 'Khách Hàng';
+            var phone = phoneInput ? phoneInput.value.trim() : '';
+
+            if (!name || !phone) {{
+                alert('Vui lòng nhập họ tên và số điện thoại mô phỏng.');
+                return false;
+            }}
+
+            var formView = document.getElementById('checkout-form-view');
+            var successView = document.getElementById('checkout-success');
+            var nameDisplay = document.getElementById('success-customer-name');
+
+            if (formView) formView.style.display = 'none';
+            if (successView) successView.style.display = 'block';
+            if (nameDisplay) nameDisplay.textContent = name;
+            return false;
+        }}
+
+        function simulatePayment(event) {{
+            return handleSimulatedCheckout(event);
+        }}
+
+        function confirmCheckout(event) {{
+            return handleSimulatedCheckout(event);
+        }}
+
+        function toggleFaq(id) {{
+            var item = document.getElementById(id);
+            if (!item) return;
+            var answer = item.querySelector('.faq-answer');
+            var icon = item.querySelector('.faq-toggle-icon');
+            if (!answer) return;
+            if (answer.style.display === 'block') {{
+                answer.style.display = 'none';
+                if (icon) icon.textContent = '+';
+            }} else {{
+                answer.style.display = 'block';
+                if (icon) icon.textContent = '−';
+            }}
+        }}
+    </script>
+</body>
+</html>
+"""
+
