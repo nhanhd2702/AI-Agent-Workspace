@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import React from "react";
 import { ThreadPanel } from "./ThreadPanel";
 import InboxPage from "@/app/inbox/page";
@@ -15,6 +15,7 @@ vi.mock("@/lib/apiClient", () => ({
     releaseConversation: vi.fn(),
     sendOperatorReply: vi.fn(),
     getConnectorsStatus: vi.fn(),
+    getInboxWebSocketUrl: vi.fn(() => "ws://localhost:8000/api/v1/inbox/ws?token=mock-token"),
   },
 }));
 
@@ -209,6 +210,114 @@ describe("InboxComponents Unit & Integration Tests", () => {
 
       // Verify QR re-auth banner appears when session needs re-auth
       expect(screen.getByText(/kết nối Zalo OA cần quét lại mã QR/i)).toBeInTheDocument();
+    });
+
+    it("handles real-time WebSocket events for message arrival, AI typing indicator, and takeover", async () => {
+      let activeWsInstance: any = null;
+
+      class MockWebSocket {
+        url: string;
+        close = vi.fn();
+        onmessage: ((e: { data: string }) => void) | null = null;
+        onerror: (() => void) | null = null;
+        constructor(url: string) {
+          this.url = url;
+          activeWsInstance = this;
+        }
+      }
+
+      const originalWs = global.WebSocket;
+      (global as unknown as { WebSocket: typeof WebSocket }).WebSocket =
+        MockWebSocket as unknown as typeof WebSocket;
+
+      try {
+        vi.mocked(defaultApiClient.getConversations).mockResolvedValue([
+          mockConvWaiting,
+          mockConvHuman,
+        ]);
+        vi.mocked(defaultApiClient.getConnectorsStatus).mockResolvedValue(mockConnectors);
+        vi.mocked(defaultApiClient.getConversationMessages).mockResolvedValue(mockMessages);
+
+        render(<InboxPage />);
+
+        await waitFor(() => {
+          expect(screen.getByRole("heading", { name: "Nguyễn Văn A", level: 2 })).toBeInTheDocument();
+        });
+
+        expect(activeWsInstance).not.toBeNull();
+
+        // 1. Send inbox.ai_start event
+        act(() => {
+          activeWsInstance.onmessage?.({
+            data: JSON.stringify({
+              type: "inbox.ai_start",
+              conversation_id: "conv-1",
+            }),
+          });
+        });
+
+        await waitFor(() => {
+          expect(screen.getByText(/Agent đang trả lời cuộc này/i)).toBeInTheDocument();
+        });
+
+        // 2. Send inbox.ai_done event
+        act(() => {
+          activeWsInstance.onmessage?.({
+            data: JSON.stringify({
+              type: "inbox.ai_done",
+              conversation_id: "conv-1",
+            }),
+          });
+        });
+
+        await waitFor(() => {
+          expect(screen.queryByText(/Agent đang trả lời cuộc này/i)).not.toBeInTheDocument();
+        });
+
+        // 3. Send inbox.message event
+        act(() => {
+          activeWsInstance.onmessage?.({
+            data: JSON.stringify({
+              type: "inbox.message",
+              conversation_id: "conv-1",
+              message: {
+                id: "msg-ws-live-1",
+                conversation_id: "conv-1",
+                sender_type: "customer",
+                sender_name: "Nguyễn Văn A",
+                content: "Áo có size L không shop?",
+                created_at: new Date().toISOString(),
+              },
+            }),
+          });
+        });
+
+        await waitFor(() => {
+          expect(screen.getAllByText("Áo có size L không shop?").length).toBeGreaterThanOrEqual(1);
+        });
+
+        // 4. Send inbox.takeover event
+        act(() => {
+          activeWsInstance.onmessage?.({
+            data: JSON.stringify({
+              type: "inbox.takeover",
+              conversation_id: "conv-1",
+              is_human_takeover: true,
+              conversation: {
+                ...mockConvWaiting,
+                is_human_takeover: true,
+                status: "in_progress",
+              },
+            }),
+          });
+        });
+
+        await waitFor(() => {
+          expect(screen.getByText(/Bạn đang trực tiếp trả lời/i)).toBeInTheDocument();
+        });
+      } finally {
+        global.WebSocket = originalWs;
+      }
     });
   });
 });

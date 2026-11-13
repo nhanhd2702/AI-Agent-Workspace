@@ -9,13 +9,14 @@ Exposes:
 - POST /api/v1/inbox/conversations/{conv_id}/reply
 - POST /api/v1/inbox/webhook/{channel}
 - GET /api/v1/inbox/connectors/status
-- WebSocket /api/v1/inbox/ws
+- WebSocket /api/v1/inbox/ws (authenticated via token query param or X-Local-Auth-Token header)
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import secrets
 from typing import Any, Optional
 import uuid
 
@@ -24,6 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db.models import ConnectorConfig, Conversation, Message
 from app.db.session import get_db
 from app.mcp.messaging_bridge import (
@@ -33,20 +35,21 @@ from app.mcp.messaging_bridge import (
     TelegramChannelAdapter,
     ZaloChannelAdapter,
 )
+from app.orchestrator.dispatcher import mask_secrets
 
 router = APIRouter(prefix="/api/v1/inbox", tags=["inbox"])
 
 
 class OperatorReplyRequest(BaseModel):
-    content: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1, max_length=10000)
     attachments: Optional[list[dict[str, Any]]] = None
 
 
 class WebhookPayload(BaseModel):
-    sender_id: str = Field(..., min_length=1)
-    sender_name: Optional[str] = None
-    content: str = Field(..., min_length=1)
-    client_message_id: Optional[str] = None
+    sender_id: str = Field(..., min_length=1, max_length=128)
+    sender_name: Optional[str] = Field(None, max_length=256)
+    content: str = Field(..., min_length=1, max_length=10000)
+    client_message_id: Optional[str] = Field(None, max_length=256)
     attachments: Optional[list[dict[str, Any]]] = None
 
 
@@ -67,33 +70,48 @@ class InboxWebSocketManager:
             self._connections.discard(websocket)
 
     async def broadcast(self, event: dict[str, Any]) -> None:
+        safe_event = mask_secrets(event)
         async with self._lock:
             clients = list(self._connections)
         for client in clients:
             try:
-                await client.send_json(event)
+                await client.send_json(safe_event)
             except Exception:
                 pass
 
 
 inbox_ws_manager = InboxWebSocketManager()
 
-# Global bridge instance cache to share race-safety generation state across requests
+# Global bridge persistent singleton to maintain state (generation, rate limiter, dedup) across HTTP requests
 _bridge_instance: Optional[MessagingBridge] = None
 
 
-def get_bridge(db: Session, channel: str = "mock") -> MessagingBridge:
+def get_bridge(db: Optional[Session] = None, channel: str = "mock") -> MessagingBridge:
+    """Return persistent singleton MessagingBridge, preserving state across requests."""
     global _bridge_instance
-    if _bridge_instance is None or _bridge_instance.db is not db:
-        adapter: BaseChannelAdapter
-        if channel == "zalo":
-            adapter = ZaloChannelAdapter(account_id="zalo-oa-default")
-        elif channel == "telegram":
-            adapter = TelegramChannelAdapter(account_id="telegram-bot-default")
-        else:
-            adapter = MockChannelAdapter(channel=channel, account_id="acc-default")
-        _bridge_instance = MessagingBridge(db=db, adapter=adapter, event_bus=inbox_ws_manager)
+    if _bridge_instance is None:
+        _bridge_instance = MessagingBridge(
+            db=db,
+            event_bus=inbox_ws_manager,
+        )
+        _bridge_instance.register_adapter("zalo", ZaloChannelAdapter(account_id="zalo-oa-default"))
+        _bridge_instance.register_adapter("telegram", TelegramChannelAdapter(account_id="telegram-bot-default"))
+        _bridge_instance.register_adapter("internal", MockChannelAdapter(channel="internal", account_id="acc-default"))
+        _bridge_instance.register_adapter("mock", MockChannelAdapter(channel="mock", account_id="acc-default"))
+    elif db is not None and _bridge_instance.db is None:
+        _bridge_instance.db = db
+
+    if channel:
+        adapter = _bridge_instance.get_adapter(channel)
+        if adapter:
+            _bridge_instance.adapter = adapter
     return _bridge_instance
+
+
+def reset_bridge() -> None:
+    """Reset singleton bridge instance for test isolation."""
+    global _bridge_instance
+    _bridge_instance = None
 
 
 def _format_conv(conv: Conversation) -> dict[str, Any]:
@@ -106,7 +124,7 @@ def _format_conv(conv: Conversation) -> dict[str, Any]:
                 "id": lm.id,
                 "sender_type": lm.sender_type,
                 "sender_name": lm.sender_name,
-                "content": lm.content,
+                "content": mask_secrets(lm.content),
                 "created_at": lm.created_at.isoformat() if lm.created_at else None,
             }
 
@@ -132,8 +150,8 @@ def _format_msg(msg: Message) -> dict[str, Any]:
         "sender_type": msg.sender_type,
         "sender_id": msg.sender_id,
         "sender_name": msg.sender_name,
-        "content": msg.content,
-        "attachments": msg.attachments or [],
+        "content": mask_secrets(msg.content),
+        "attachments": mask_secrets(msg.attachments or []),
         "metadata": msg.message_metadata or {},
         "created_at": msg.created_at.isoformat() if msg.created_at else None,
     }
@@ -212,7 +230,7 @@ async def takeover_conversation(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     bridge = get_bridge(db, channel=conv.channel)
-    updated_conv = bridge.human_takeover(conv_id)
+    updated_conv = bridge.human_takeover(conv_id, db=db)
     if not updated_conv:
         raise HTTPException(status_code=404, detail="Failed to takeover conversation")
 
@@ -237,7 +255,7 @@ async def release_conversation(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     bridge = get_bridge(db, channel=conv.channel)
-    updated_conv = bridge.human_release(conv_id)
+    updated_conv = bridge.human_release(conv_id, db=db)
     if not updated_conv:
         raise HTTPException(status_code=404, detail="Failed to release conversation")
 
@@ -257,10 +275,13 @@ async def send_operator_reply(
     payload: OperatorReplyRequest,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Human operator sends a direct text reply to the customer."""
+    """Human operator sends a direct text reply to the customer with secret redaction."""
     conv = db.get(Conversation, conv_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+
+    clean_content = mask_secrets(payload.content)
+    clean_attachments = mask_secrets(payload.attachments) if payload.attachments else []
 
     msg = Message(
         id=f"msg-{uuid.uuid4().hex[:8]}",
@@ -268,8 +289,8 @@ async def send_operator_reply(
         sender_type="human",
         sender_id="operator-human",
         sender_name="Nhân viên hỗ trợ",
-        content=payload.content,
-        attachments=payload.attachments or [],
+        content=clean_content,
+        attachments=clean_attachments,
         created_at=datetime.now(timezone.utc),
     )
     db.add(msg)
@@ -278,13 +299,14 @@ async def send_operator_reply(
     db.commit()
     db.refresh(msg)
 
-    # Dispatch to channel adapter if external
+    # Dispatch to channel adapter if external (with redacted secrets)
     bridge = get_bridge(db, channel=conv.channel)
+    adapter = bridge.get_adapter(conv.channel)
     try:
-        await bridge.adapter.send_message(
+        await adapter.send_message(
             conv_id=conv_id,
-            content=payload.content,
-            attachments=payload.attachments,
+            content=clean_content,
+            attachments=clean_attachments,
         )
     except Exception:
         pass
@@ -304,10 +326,14 @@ async def handle_channel_webhook(
     payload: WebhookPayload,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Receive incoming webhook payload from Zalo, Telegram, or internal channels."""
+    """Receive incoming webhook payload from Zalo, Telegram, or internal channels with secret redaction."""
     ch = channel.lower()
     if ch not in ("zalo", "telegram", "internal"):
         raise HTTPException(status_code=400, detail=f"Unsupported channel: {channel}")
+
+    clean_content = mask_secrets(payload.content)
+    clean_sender_name = mask_secrets(payload.sender_name) if payload.sender_name else None
+    clean_attachments = mask_secrets(payload.attachments) if payload.attachments else None
 
     # Find existing conversation or create new
     conv = (
@@ -321,8 +347,8 @@ async def handle_channel_webhook(
             project_id="proj-default",
             channel=ch,
             channel_conv_id=payload.sender_id,
-            title=f"Khách {ch.capitalize()} - {payload.sender_name or payload.sender_id}",
-            participant_name=payload.sender_name or f"Khách {ch.capitalize()}",
+            title=f"Khách {ch.capitalize()} - {clean_sender_name or payload.sender_id}",
+            participant_name=clean_sender_name or f"Khách {ch.capitalize()}",
             status="open",
             is_human_takeover=False,
         )
@@ -333,12 +359,13 @@ async def handle_channel_webhook(
     bridge = get_bridge(db, channel=ch)
     result = await bridge.process_incoming_with_ai(
         conv_id=conv.id,
-        customer_msg=payload.content,
+        customer_msg=clean_content,
         client_message_id=payload.client_message_id,
         delay_s=0.0,
         sender_id=payload.sender_id,
-        sender_name=payload.sender_name,
-        attachments=payload.attachments,
+        sender_name=clean_sender_name,
+        attachments=clean_attachments,
+        db=db,
     )
 
     await inbox_ws_manager.broadcast({
@@ -393,9 +420,42 @@ def get_connectors_status(
     return items
 
 
+def _extract_inbox_ws_token(websocket: WebSocket) -> Optional[str]:
+    header_token = websocket.headers.get("X-Local-Auth-Token")
+    if header_token:
+        return header_token
+    query_token = websocket.query_params.get("token")
+    if query_token:
+        return query_token
+    return None
+
+
+def _is_valid_inbox_token(provided: Optional[str], expected: str) -> bool:
+    if not provided or not expected:
+        return False
+    return secrets.compare_digest(
+        provided.encode("utf-8"),
+        expected.encode("utf-8"),
+    )
+
+
 @router.websocket("/ws")
 async def inbox_websocket_stream(websocket: WebSocket) -> None:
-    """Live WebSocket feed for inbox message arrivals and human takeover events."""
+    """Live WebSocket feed for inbox message arrivals and human takeover events.
+
+    Requires valid X-Local-Auth-Token header or ?token= query parameter matching local_auth_token.
+    Rejects with 1008 Policy Violation on invalid or missing auth token.
+    """
+    settings = getattr(websocket.app.state, "settings", None) or get_settings()
+    provided_token = _extract_inbox_ws_token(websocket)
+
+    if not _is_valid_inbox_token(provided_token, settings.local_auth_token):
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="Invalid or missing local auth token",
+        )
+        return
+
     await inbox_ws_manager.connect(websocket)
     try:
         while True:

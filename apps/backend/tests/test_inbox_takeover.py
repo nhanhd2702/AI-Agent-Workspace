@@ -9,8 +9,10 @@ from typing import Any
 import uuid
 
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
+from app.api.inbox import get_bridge, reset_bridge
 from app.config import AppSettings
 from app.db.models import ConnectorConfig, Conversation, Message
 from app.db.session import init_db, seed_defaults
@@ -91,6 +93,7 @@ def mock_channel_adapter():
 @pytest.fixture
 def client_env(tmp_path: Path):
     """Provide a configured TestClient with valid auth token and seeded inbox data."""
+    reset_bridge()
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / "inbox_app.db"
@@ -390,3 +393,225 @@ def test_api_connectors_status(client_env):
     assert zalo_conn is not None
     assert zalo_conn["status"] == "needs_reauth"
     assert "qr_code_url" in zalo_conn
+
+
+# --- Fix Round 1: New Rigorous Verification Tests ---
+
+def test_cross_request_singleton_state_persists(tmp_path: Path):
+    """Verify get_bridge() maintains generation, rate limiter, and deduplication across multiple HTTP requests with distinct DB sessions."""
+    reset_bridge()
+    db_path1 = tmp_path / "req1.db"
+    db_path2 = tmp_path / "req2.db"
+    f1 = init_db(db_path1, cache=False)
+    f2 = init_db(db_path2, cache=False)
+
+    with f1() as s1, f2() as s2:
+        bridge1 = get_bridge(s1, channel="mock")
+        bridge2 = get_bridge(s2, channel="mock")
+
+        # 1. Must be the exact same persistent singleton instance
+        assert bridge1 is bridge2
+
+        # 2. Rate limiter state persists
+        assert bridge1.rate_limiter.acquire("acc-persists", tokens=10) is True
+        # Consumption on bridge1 is visible on bridge2
+        assert bridge2.rate_limiter._tokens["acc-persists"] == 20.0  # 30 - 10
+
+        # 3. Deduplication state persists
+        assert bridge1._record_client_id("client-msg-persistent-001") is True
+        assert "client-msg-persistent-001" in bridge2.processed_client_ids
+        assert bridge2._record_client_id("client-msg-persistent-001") is False
+
+        # 4. Takeover generation persists across requests
+        bridge1.takeover_generation["conv-persist-1"] = 5
+        assert bridge2.takeover_generation.get("conv-persist-1") == 5
+
+
+@pytest.mark.asyncio
+async def test_cross_request_human_takeover_cancels_ai(client_env):
+    """Simulate concurrent HTTP requests: Request 1 starts processing with delay and Request 2 calls /takeover; verify AI draft is discarded."""
+    client, app, factory = client_env
+    reset_bridge()
+
+    # Request 1 starts processing with 0.1s simulated delay
+    with factory() as session1:
+        bridge = get_bridge(session1, channel="zalo")
+        mock_adapter = MockChannelAdapter(channel="zalo", account_id="acc-zalo-1")
+        bridge.adapter = mock_adapter
+
+        ai_task = asyncio.create_task(
+            bridge.process_incoming_with_ai(
+                conv_id="conv-zalo-1",
+                customer_msg="Cho mình hỏi giá và cách mua hàng?",
+                delay_s=0.1,
+                db=session1,
+            )
+        )
+
+        # Brief pause to ensure Request 1 is in-flight (waiting in sleep)
+        await asyncio.sleep(0.02)
+
+        # Request 2 arrives via HTTP POST /takeover with its own DB session
+        res_takeover = client.post("/api/v1/inbox/conversations/conv-zalo-1/takeover")
+        assert res_takeover.status_code == 200
+        assert res_takeover.json()["conversation"]["is_human_takeover"] is True
+
+        # Wait for Request 1 to complete
+        result1 = await ai_task
+
+        # Verify AI draft was cancelled by takeover
+        assert result1["status"] == "cancelled_by_takeover"
+        assert len(mock_adapter.sent_messages) == 0
+
+        # Verify in DB conversation is in human takeover
+        with factory() as verify_session:
+            conv = verify_session.get(Conversation, "conv-zalo-1")
+            assert conv.is_human_takeover is True
+            # Verify no AI message was stored in DB
+            ai_messages = (
+                verify_session.query(Message)
+                .filter(Message.conversation_id == "conv-zalo-1", Message.sender_type == "agent")
+                .all()
+            )
+            assert len(ai_messages) == 0
+
+
+def test_websocket_auth_enforced(client_env):
+    """Verify /api/v1/inbox/ws rejects connections without valid token (1008) and accepts valid token."""
+    _, app, _ = client_env
+    anon_client = TestClient(app)
+
+    # 1. Missing token -> rejected with WS 1008 policy violation
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with anon_client.websocket_connect("/api/v1/inbox/ws") as ws:
+            ws.send_text("ping")
+    assert exc.value.code == 1008
+
+    # 2. Invalid token in query param -> rejected with WS 1008 policy violation
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with anon_client.websocket_connect("/api/v1/inbox/ws?token=invalid-secret-xyz") as ws:
+            ws.send_text("ping")
+    assert exc.value.code == 1008
+
+    # 3. Valid token in query param -> Connected, ping responds with pong
+    with anon_client.websocket_connect("/api/v1/inbox/ws?token=secret-inbox-token-123") as ws:
+        ws.send_text("ping")
+        assert ws.receive_text() == "pong"
+
+    # 4. Valid token in X-Local-Auth-Token header -> Connected
+    with anon_client.websocket_connect("/api/v1/inbox/ws", headers={"X-Local-Auth-Token": "secret-inbox-token-123"}) as ws:
+        ws.send_text("ping")
+        assert ws.receive_text() == "pong"
+
+
+def test_secret_masking_in_inbox_messages(client_env):
+    """Verify secrets (API keys, bearer tokens) are masked in DB, operator replies, and broadcast events."""
+    client, app, factory = client_env
+    reset_bridge()
+
+    # 1. Webhook with customer message containing secrets
+    raw_secret_key = "sk-proj-1234567890abcdef12345678"
+    raw_customer_msg = f"Tôi lỡ gửi nhầm key: {raw_secret_key} và password=mypassword123 shop hỗ trợ xoá giúp"
+
+    res_wh = client.post(
+        "/api/v1/inbox/webhook/zalo",
+        json={
+            "sender_id": "zalo-cust-secrets",
+            "sender_name": "Khách Bảo Mật",
+            "content": raw_customer_msg,
+            "client_message_id": "wh-secret-001",
+        },
+    )
+    assert res_wh.status_code in (200, 201)
+    conv_id = res_wh.json()["conversation_id"]
+
+    # Verify customer message in DB has redacted content
+    with factory() as session:
+        cust_msg = (
+            session.query(Message)
+            .filter(Message.conversation_id == conv_id, Message.sender_type == "customer")
+            .first()
+        )
+        assert cust_msg is not None
+        assert raw_secret_key not in cust_msg.content
+        assert "sk-***REDACTED***" in cust_msg.content
+
+    # 2. Operator reply containing sensitive token
+    raw_op_token = "Bearer secret-super-token-999"
+    res_reply = client.post(
+        f"/api/v1/inbox/conversations/{conv_id}/reply",
+        json={"content": f"Vâng em đã xoá rồi ạ, đây là token tạm thời: {raw_op_token}"},
+    )
+    assert res_reply.status_code == 200
+    reply_data = res_reply.json()
+    assert raw_op_token not in reply_data["content"]
+    assert "***REDACTED***" in reply_data["content"]
+
+    # Verify operator message in DB has redacted content
+    with factory() as session:
+        op_msg = (
+            session.query(Message)
+            .filter(Message.conversation_id == conv_id, Message.sender_type == "human")
+            .first()
+        )
+        assert op_msg is not None
+        assert raw_op_token not in op_msg.content
+        assert "***REDACTED***" in op_msg.content
+
+
+def test_rate_limiter_thread_safety_and_bounded_cache():
+    """Verify thread safety under concurrent acquire calls and bounded cache eviction for deduplication."""
+    import concurrent.futures
+
+    # 1. Thread safety on TokenBucketRateLimiter
+    limiter = TokenBucketRateLimiter(rate_per_min=100.0, capacity=100.0)
+    acc = "acc-threaded-test"
+
+    def _worker():
+        return limiter.acquire(acc, tokens=1.0)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(_worker) for _ in range(120)]
+        results = [f.result() for f in futures]
+
+    # Exactly 100 acquires should succeed, 20 fail
+    success_count = sum(1 for r in results if r is True)
+    failure_count = sum(1 for r in results if r is False)
+    assert success_count == 100
+    assert failure_count == 20
+
+    # 2. Bounded deduplication cache on MessagingBridge
+    bridge = MessagingBridge(max_dedup_size=5)
+    for i in range(10):
+        assert bridge._record_client_id(f"client-id-{i}") is True
+
+    # Total set size should never exceed max_dedup_size (5)
+    assert len(bridge.processed_client_ids) == 5
+    # Oldest entries 0-4 must have been evicted
+    assert "client-id-0" not in bridge.processed_client_ids
+    assert "client-id-4" not in bridge.processed_client_ids
+    # Newest entries 5-9 must be present
+    for i in range(5, 10):
+        assert f"client-id-{i}" in bridge.processed_client_ids
+
+
+def test_webhook_and_reply_payload_bounds(client_env):
+    """Verify payload bounds (max_length) reject oversized inputs with 422 Unprocessable Entity."""
+    client, _, _ = client_env
+
+    # Oversized content > 10000 chars
+    huge_content = "A" * 10001
+    res = client.post(
+        "/api/v1/inbox/webhook/zalo",
+        json={"sender_id": "cust-1", "content": huge_content},
+    )
+    assert res.status_code == 422
+
+    # Oversized sender_id > 128 chars
+    huge_sender = "x" * 129
+    res_sender = client.post(
+        "/api/v1/inbox/webhook/zalo",
+        json={"sender_id": huge_sender, "content": "hello"},
+    )
+    assert res_sender.status_code == 422
+

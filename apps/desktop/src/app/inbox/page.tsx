@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   MessageSquare,
   Search,
@@ -81,6 +81,115 @@ export default function InboxPage() {
       setMessages([]);
     }
   }, [selectedConvId, loadMessages]);
+
+  const selectedConvIdRef = useRef<string | null>(selectedConvId);
+  selectedConvIdRef.current = selectedConvId;
+
+  // Real-time WebSocket connection for live inbox updates
+  useEffect(() => {
+    if (typeof WebSocket === "undefined") return;
+    let ws: WebSocket | null = null;
+    let isMounted = true;
+
+    try {
+      const wsUrl = defaultApiClient.getInboxWebSocketUrl();
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        if (!isMounted) return;
+        try {
+          const data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+          if (!data || !data.type) return;
+
+          if (data.type === "inbox.message") {
+            const msg = data.message;
+            const convId = data.conversation_id;
+            if (msg && convId) {
+              if (selectedConvIdRef.current === convId) {
+                setMessages((prev) => {
+                  if (prev.some((m) => m.id === msg.id)) return prev;
+                  return [...prev, msg];
+                });
+              }
+
+              setConversations((prev) =>
+                prev.map((c) =>
+                  c.id === convId
+                    ? {
+                        ...c,
+                        status: c.is_human_takeover ? "in_progress" : c.status,
+                        last_message: {
+                          id: msg.id,
+                          sender_type: msg.sender_type,
+                          sender_name: msg.sender_name,
+                          content: msg.content,
+                          created_at: msg.created_at,
+                        },
+                        updated_at: msg.created_at || new Date().toISOString(),
+                      }
+                    : c
+                )
+              );
+            }
+          } else if (data.type === "inbox.takeover") {
+            const convId = data.conversation_id;
+            if (selectedConvIdRef.current === convId) {
+              setIsAiGenerating(false);
+            }
+            if (data.conversation) {
+              setConversations((prev) =>
+                prev.map((c) => (c.id === convId ? data.conversation : c))
+              );
+            } else {
+              setConversations((prev) =>
+                prev.map((c) =>
+                  c.id === convId
+                    ? { ...c, is_human_takeover: true, status: "in_progress" }
+                    : c
+                )
+              );
+            }
+          } else if (data.type === "inbox.release") {
+            const convId = data.conversation_id;
+            if (data.conversation) {
+              setConversations((prev) =>
+                prev.map((c) => (c.id === convId ? data.conversation : c))
+              );
+            } else {
+              setConversations((prev) =>
+                prev.map((c) =>
+                  c.id === convId ? { ...c, is_human_takeover: false } : c
+                )
+              );
+            }
+          } else if (data.type === "inbox.ai_start") {
+            if (selectedConvIdRef.current === data.conversation_id) {
+              setIsAiGenerating(true);
+            }
+          } else if (data.type === "inbox.ai_done") {
+            if (selectedConvIdRef.current === data.conversation_id) {
+              setIsAiGenerating(false);
+            }
+          }
+        } catch {
+          // ignore parsing error
+        }
+      };
+
+      ws.onerror = () => {
+        // ws error fallback
+      };
+    } catch {
+      // ws creation error fallback
+    }
+
+    return () => {
+      isMounted = false;
+      if (ws) {
+        ws.close();
+      }
+    };
+  }, []);
 
   const selectedConversation = useMemo(() => {
     return conversations.find((c) => c.id === selectedConvId) || null;

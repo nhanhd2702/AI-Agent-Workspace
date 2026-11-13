@@ -891,6 +891,15 @@ export class ApiClient {
   public async getConnectorsStatus(): Promise<ConnectorStatus[]> {
     return this.request<ConnectorStatus[]>("/api/v1/inbox/connectors/status");
   }
+
+  /**
+   * Build authenticated WebSocket URL for live inbox events (/api/v1/inbox/ws).
+   */
+  public getInboxWebSocketUrl(): string {
+    const wsBase = this.baseUrl.replace(/^http/i, "ws");
+    const token = encodeURIComponent(this.resolveToken());
+    return `${wsBase}/api/v1/inbox/ws?token=${token}`;
+  }
 }
 
 export const defaultApiClient = new ApiClient();
