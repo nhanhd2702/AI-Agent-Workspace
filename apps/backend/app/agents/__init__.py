@@ -12,6 +12,9 @@ __all__ = [
     "FunnelsAgent",
     "GrowthAdvisorAgent",
     "UIDesignerAgent",
+    "EngagementReply",
+    "SalesAgent",
+    "SupportAgent",
 ]
 
 
@@ -28,4 +31,16 @@ def __getattr__(name: str) -> Any:
         val = getattr(funnels_module, name)
         globals()[name] = val
         return val
+
+    if name in {
+        "EngagementReply",
+        "SalesAgent",
+        "SupportAgent",
+    }:
+        import app.agents.engagement as engagement_module
+
+        val = getattr(engagement_module, name)
+        globals()[name] = val
+        return val
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
