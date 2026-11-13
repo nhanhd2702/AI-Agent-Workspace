@@ -351,3 +351,100 @@ async def test_funnels_and_ui_designer_safe_numeric_price_parsing(mock_llm: Mock
     assert res.structured_data["price"] == 350000.0
     assert "350.000 ₫" in res.structured_data["formatted_price"]
 
+
+@pytest.mark.asyncio
+async def test_ui_designer_brand_color_xss_injection_sanitization(mock_llm: MockLlm) -> None:
+    """Verify malicious brand_colors containing XSS/HTML injection are replaced by safe fallback."""
+    from app.agents.funnels import _safe_hex_color
+
+    xss_payload = "</style><script>alert('xss')</script>"
+
+    # 1. Test helper function directly
+    assert _safe_hex_color(xss_payload, "#2563eb") == "#2563eb"
+    assert _safe_hex_color("red; background: url(x)", "#1d4ed8") == "#1d4ed8"
+    assert _safe_hex_color("#3b82f6", "#2563eb") == "#3b82f6"
+    assert _safe_hex_color("#fff", "#2563eb") == "#fff"
+
+    # 2. Test agent execution with malicious brand_profile
+    agent = UIDesignerAgent(llm=mock_llm)
+    res = await agent.run({
+        "product_name": "Tài liệu Bảo mật",
+        "price": 200000,
+        "brand_profile": {
+            "brand_name": "CyberSec Pro",
+            "brand_colors": [xss_payload, xss_payload, xss_payload],
+        },
+    })
+
+    assert res.status == "completed"
+    assert res.structured_data["primary_color"] == "#2563eb"
+    html = res.artifacts[0].content
+    assert "<script>alert('xss')</script>" not in html
+    assert "--primary: #2563eb;" in html
+
+
+@pytest.mark.asyncio
+async def test_ui_designer_handles_string_list_testimonials_and_faqs() -> None:
+    """Verify safe rendering when LLM generates string lists instead of dicts for testimonials and faqs."""
+    canned_copy = json.dumps({
+        "headline": "Khóa Học Thực Chiến Siêu Tốc",
+        "subheadline": "Chinh phục kỹ năng mới chỉ sau 7 ngày",
+        "testimonials": [
+            "Khóa học rất hay và hữu ích!",
+            "Giảng viên giải thích cực kỳ chi tiết, dễ hiểu.",
+        ],
+        "faqs": [
+            "Khóa học này dành cho ai?",
+            "Tôi có cần biết lập trình trước không?",
+        ],
+    })
+    custom_mock_llm = MockLlm(canned_response=canned_copy)
+    agent = UIDesignerAgent(llm=custom_mock_llm)
+    res = await agent.run({
+        "product_name": "Khóa Học Thực Chiến",
+        "price": 300000,
+    })
+    assert res.status == "completed"
+    html = res.artifacts[0].content
+    assert "Khóa học rất hay và hữu ích!" in html
+    assert "Giảng viên giải thích cực kỳ chi tiết" in html
+    assert "Khóa học này dành cho ai?" in html
+    assert "Tôi có cần biết lập trình trước không?" in html
+    assert "Khách hàng thân thiết" in html
+
+
+def test_growth_advisor_handles_percentage_churn_string() -> None:
+    """Verify GrowthAdvisorAgent parses percentage churn strings safely without ValueError."""
+    from app.agents.funnels import GrowthAdvisorAgent
+
+    agent = GrowthAdvisorAgent()
+
+    # Pass {"churn": "5%"}
+    res1 = agent._compute_metrics({"traffic": 1000, "leads": 100, "churn": "5%"})
+    assert res1["churn"] == 0.05
+
+    # Pass {"churn_rate": "4.5%"}
+    res2 = agent._compute_metrics({"traffic": 1000, "leads": 100, "churn_rate": "4.5%"})
+    assert res2["churn"] == 0.045
+
+    # Pass float or int
+    res3 = agent._compute_metrics({"traffic": 1000, "leads": 100, "churn": 0.03})
+    assert res3["churn"] == 0.03
+
+    # Pass invalid string gracefully
+    res4 = agent._compute_metrics({"traffic": 1000, "leads": 100, "churn": "invalid_churn"})
+    assert res4["churn"] == 0.0
+
+
+def test_parse_numeric_price_negative_clamping() -> None:
+    """Verify _parse_numeric_price clamps negative numbers or strings to 0.0."""
+    from app.agents.funnels import _parse_numeric_price
+
+    assert _parse_numeric_price(-500) == 0.0
+    assert _parse_numeric_price("-500") == 0.0
+    assert _parse_numeric_price("-500.000đ") == 0.0
+    assert _parse_numeric_price("-200k") == 0.0
+    assert _parse_numeric_price(0) == 0.0
+    assert _parse_numeric_price(200000) == 200000.0
+
+

@@ -203,8 +203,20 @@ def _extract_extra_secrets(task_ctx: dict[str, Any]) -> list[str]:
     return extra_secrets
 
 
-def _parse_numeric_price(val: Any) -> float:
-    """Safely parse numbers, currency strings (VND, đ, k), or malformed inputs into float."""
+_HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+
+def _safe_hex_color(color: Any, fallback: str) -> str:
+    """Validate that color strictly matches hex color pattern, returning fallback if invalid."""
+    if isinstance(color, str):
+        c = color.strip()
+        if _HEX_COLOR_RE.match(c):
+            return c
+    return fallback
+
+
+def _parse_churn(val: Any) -> float:
+    """Safely parse churn rate from float, int, percentage string (e.g. '5%', '4.5%'), or malformed input."""
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
@@ -219,11 +231,39 @@ def _parse_numeric_price(val: Any) -> float:
     if not s:
         return 0.0
 
-    # Handle suffix "K" / "k" (e.g. 200k, 200K)
-    if s.lower().endswith("k"):
-        num_clean = re.sub(r"[^\d.,]", "", s[:-1])
+    is_percent = "%" in s
+    clean = s.replace("%", "").strip().replace(",", ".")
+    try:
+        num = float(clean)
+        return num / 100.0 if is_percent else num
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _parse_numeric_price(val: Any) -> float:
+    """Safely parse numbers, currency strings (VND, đ, k), or malformed inputs into float clamped to non-negative."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return max(0.0, float(val))
+    if not isinstance(val, str):
         try:
-            return float(num_clean.replace(".", "").replace(",", ".")) * 1000.0
+            return max(0.0, float(val))
+        except (ValueError, TypeError):
+            return 0.0
+
+    s = val.strip()
+    if not s:
+        return 0.0
+
+    is_negative = s.startswith("-")
+
+    # Handle suffix "K" / "k" (e.g. 200k, 200K, -200k)
+    if s.lower().endswith("k"):
+        num_clean = re.sub(r"[^\d.,-]", "", s[:-1])
+        try:
+            parsed = float(num_clean.replace(".", "").replace(",", ".")) * 1000.0
+            return max(0.0, parsed)
         except (ValueError, TypeError):
             pass
 
@@ -231,6 +271,8 @@ def _parse_numeric_price(val: Any) -> float:
     s = re.sub(r"[₫đĐVNDvnd\s]", "", s)
     if not s:
         return 0.0
+    if s.startswith("-"):
+        is_negative = True
 
     if "." in s and "," in s:
         # e.g. 200.000,50 -> 200000.50
@@ -247,8 +289,13 @@ def _parse_numeric_price(val: Any) -> float:
             s = s.replace(",", ".")
 
     try:
-        clean_num = re.sub(r"[^\d.]", "", s)
-        return float(clean_num) if clean_num else 0.0
+        clean_num = re.sub(r"[^\d.-]", "", s)
+        if not clean_num or clean_num == "-":
+            return 0.0
+        parsed = float(clean_num)
+        if is_negative and parsed > 0:
+            parsed = -parsed
+        return max(0.0, parsed)
     except (ValueError, TypeError):
         return 0.0
 
@@ -1238,7 +1285,8 @@ class GrowthAdvisorAgent(BaseWorkerAgent):
         cac = round(ad_spend / total_customers, 2) if total_customers > 0 else 0.0
         roas = round(revenue / ad_spend, 2) if ad_spend > 0 else 0.0
         aov = round(revenue / total_customers, 2) if total_customers > 0 else 0.0
-        churn = float(m.get("churn") or m.get("churn_rate") or 0.0)
+        churn_raw = m.get("churn") if m.get("churn") is not None else m.get("churn_rate")
+        churn = _parse_churn(churn_raw)
 
         return {
             "traffic": int(traffic),
@@ -1698,34 +1746,44 @@ class UIDesignerAgent(BaseWorkerAgent):
 
         # 1. Resolve brand profile
         bp = task_ctx.get("brand_profile") or self.brand_profile
+        brand_name = "AI Agent Workspace"
+        tagline = "Hệ sinh thái tự động hóa và tăng tốc chuyển đổi"
+        brand_colors = None
+
         if bp is not None and not isinstance(bp, dict):
-            brand_name = getattr(bp, "brand_name", None) or "AI Agent Workspace"
-            tagline = getattr(bp, "tagline", None) or "Hệ sinh thái tự động hóa và tăng tốc chuyển đổi"
-            brand_colors = getattr(bp, "brand_colors", None) or ["#2563eb", "#1d4ed8", "#10b981"]
+            brand_name = getattr(bp, "brand_name", None) or brand_name
+            tagline = getattr(bp, "tagline", None) or tagline
+            brand_colors = getattr(bp, "brand_colors", None)
         elif isinstance(bp, dict):
-            brand_name = bp.get("brand_name") or "AI Agent Workspace"
-            tagline = bp.get("tagline") or "Hệ sinh thái tự động hóa và tăng tốc chuyển đổi"
-            brand_colors = bp.get("brand_colors") or ["#2563eb", "#1d4ed8", "#10b981"]
-        else:
-            brand_name = "AI Agent Workspace"
-            tagline = "Hệ sinh thái tự động hóa và tăng tốc chuyển đổi"
+            brand_name = bp.get("brand_name") or brand_name
+            tagline = bp.get("tagline") or tagline
+            brand_colors = bp.get("brand_colors")
+
+        if not brand_colors and "brand_colors" in task_ctx:
+            brand_colors = task_ctx.get("brand_colors")
+
+        if not isinstance(brand_colors, list):
             brand_colors = ["#2563eb", "#1d4ed8", "#10b981"]
 
-        primary_color = (
+        raw_primary = (
             brand_colors[0]
-            if isinstance(brand_colors, list) and len(brand_colors) > 0
+            if len(brand_colors) > 0
             else "#2563eb"
         )
-        secondary_color = (
+        raw_secondary = (
             brand_colors[1]
-            if isinstance(brand_colors, list) and len(brand_colors) > 1
+            if len(brand_colors) > 1
             else "#1d4ed8"
         )
-        accent_color = (
+        raw_accent = (
             brand_colors[2]
-            if isinstance(brand_colors, list) and len(brand_colors) > 2
+            if len(brand_colors) > 2
             else "#10b981"
         )
+
+        primary_color = _safe_hex_color(raw_primary, "#2563eb")
+        secondary_color = _safe_hex_color(raw_secondary, "#1d4ed8")
+        accent_color = _safe_hex_color(raw_accent, "#10b981")
 
         # 2. Compliance disclaimer detection
         compliance_disclaimer = (
@@ -1956,6 +2014,10 @@ class UIDesignerAgent(BaseWorkerAgent):
         copy_data: dict[str, Any],
     ) -> str:
         """Render self-contained, responsive landing page with offline prototype banner and simulated checkout."""
+        primary_color = _safe_hex_color(primary_color, "#2563eb")
+        secondary_color = _safe_hex_color(secondary_color, "#1d4ed8")
+        accent_color = _safe_hex_color(accent_color, "#10b981")
+
         headline = html.escape(str(copy_data.get("headline") or f"Giải Pháp Thực Chiến: {product_name}"))
         subheadline = html.escape(str(copy_data.get("subheadline") or ""))
         guarantee_text = html.escape(str(copy_data.get("guarantee") or "Cam kết hoàn tiền 100% trong vòng 30 ngày nếu không hài lòng."))
@@ -2009,9 +2071,14 @@ class UIDesignerAgent(BaseWorkerAgent):
         # Testimonials
         testimonials_html = ""
         for t in copy_data.get("testimonials") or []:
-            t_name = html.escape(str(t.get("name", "Khách hàng thân thiết")))
-            t_role = html.escape(str(t.get("role", "Học viên")))
-            t_comment = html.escape(str(t.get("comment", "")))
+            if isinstance(t, dict):
+                t_name = html.escape(str(t.get("name", "Khách hàng thân thiết")))
+                t_role = html.escape(str(t.get("role", "Học viên")))
+                t_comment = html.escape(str(t.get("comment", "")))
+            else:
+                t_name = "Khách hàng thân thiết"
+                t_role = "Học viên"
+                t_comment = html.escape(str(t))
             testimonials_html += f"""
             <div class="testimonial-card">
                 <div class="star-rating">
@@ -2031,8 +2098,12 @@ class UIDesignerAgent(BaseWorkerAgent):
         # FAQs
         faqs_html = ""
         for idx, f in enumerate(copy_data.get("faqs") or []):
-            q_text = html.escape(str(f.get("question", "")))
-            a_text = html.escape(str(f.get("answer", "")))
+            if isinstance(f, dict):
+                q_text = html.escape(str(f.get("question", "")))
+                a_text = html.escape(str(f.get("answer", "")))
+            else:
+                q_text = html.escape(str(f))
+                a_text = ""
             faqs_html += f"""
             <div class="faq-item" id="faq-{idx}">
                 <div class="faq-question" onclick="toggleFaq('faq-{idx}')">
