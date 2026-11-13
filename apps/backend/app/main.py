@@ -99,9 +99,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if request.method == "OPTIONS":
             return await call_next(request)
 
-        # Enforce X-Local-Auth-Token on /api/v1/* endpoints (exempting webhooks)
+        # Enforce X-Local-Auth-Token on /api/v1/* endpoints (exempting webhooks and healthcheck)
         if request.url.path.startswith("/api/v1"):
-            if request.url.path.startswith("/api/v1/inbox/webhook"):
+            if request.url.path.startswith("/api/v1/inbox/webhook") or request.url.path == "/api/v1/health":
                 return await call_next(request)
             token = request.headers.get("X-Local-Auth-Token")
             if not token or not secrets.compare_digest(

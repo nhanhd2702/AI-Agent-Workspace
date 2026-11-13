@@ -115,6 +115,10 @@ EOF
   echo -e "${GREEN}✓ Đã tạo file .env cho Backend với Fernet encryption key an toàn.${NC}"
 fi
 mkdir -p "$APP_DIR/apps/backend/workspace"
+chmod -R 775 "$APP_DIR"
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  chown -R "$SUDO_USER:$SUDO_USER" "$APP_DIR"
+fi
 
 # 6. Cấu hình Frontend (Build Next.js Static Export)
 echo -e "\n${BLUE}[6/8] Cài đặt dependencies và Build Frontend...${NC}"
