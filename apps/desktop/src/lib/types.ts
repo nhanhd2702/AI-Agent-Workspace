@@ -276,3 +276,90 @@ export class ApiError extends Error {
     this.detail = detail;
   }
 }
+
+// -----------------------------------------------------------------------------
+// Brain, Brand Profile & Product Catalog Domain Types (Task 4.2)
+// -----------------------------------------------------------------------------
+
+export interface BrandTemplate {
+  id: string;
+  name: string;
+  tagline?: string;
+  tone_of_voice: string;
+  legal_boundaries: string;
+  target_audience?: string;
+  brand_colors?: string[];
+  fonts?: string[];
+}
+
+export interface BrandProfile {
+  id: string;
+  project_id?: string;
+  brand_name: string;
+  tagline?: string | null;
+  target_audience?: string | null;
+  tone_of_voice?: string | null;
+  brand_colors?: string[];
+  fonts?: string[];
+  legal_boundaries?: string | null;
+  logo_asset_id?: string | null;
+  is_active?: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface PriceHistoryItem {
+  price_vnd: number;
+  recorded_at: string;
+  reason: "initial" | "update" | string;
+}
+
+export interface ProductItem {
+  id: string;
+  project_id?: string;
+  sku: string;
+  name: string;
+  price_vnd: number;
+  tier_type?: string | null;
+  short_desc?: string | null;
+  full_desc?: string | null;
+  deliverables?: string[];
+  faqs?: Array<{ q?: string; a?: string; question?: string; answer?: string }>;
+  policies?: string[];
+  price_history?: PriceHistoryItem[];
+  is_active?: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface CsvImportError {
+  row: number;
+  sku: string;
+  error: string;
+}
+
+export interface CsvImportResult {
+  imported_count: number;
+  errors: CsvImportError[];
+}
+
+export interface BrainDocumentItem {
+  doc_id: string;
+  filename: string;
+  collection: string;
+  chunk_count: number;
+  total_chars?: number;
+  sha256?: string;
+  ingested_at?: string;
+}
+
+export interface SemanticSearchHit {
+  chunk_id: string;
+  doc_id: string;
+  doc_title: string;
+  collection: string;
+  text: string;
+  score: number;
+  page?: number | null;
+}
+

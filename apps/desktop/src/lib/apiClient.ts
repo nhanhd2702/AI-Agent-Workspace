@@ -3,13 +3,20 @@ import {
   ApiError,
   ApiResponse,
   BoardTask,
+  BrainDocumentItem,
+  BrandProfile,
+  BrandTemplate,
+  CsvImportResult,
   Department,
   ExecutionMode,
   ParsedTask,
+  PriceHistoryItem,
+  ProductItem,
   Project,
   ReviewDecidePayload,
   ReviewDecision,
   ReviewGate,
+  SemanticSearchHit,
   StoryboardData,
   StoryboardSceneData,
   TaskLogEntry,
@@ -677,6 +684,146 @@ export class ApiClient {
       updatedAt: raw.updatedAt || raw.updated_at,
       updated_at: raw.updated_at || raw.updatedAt,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Brain, Brand Profile, Product Catalog & Knowledge Management (Task 4.2)
+  // ---------------------------------------------------------------------------
+
+  public async getBrandProfile(
+    projectId: string = "proj-default"
+  ): Promise<{ profile: BrandProfile; templates: BrandTemplate[] }> {
+    return this.request<{ profile: BrandProfile; templates: BrandTemplate[] }>(
+      `/api/v1/brain/brand-profile?project_id=${encodeURIComponent(projectId)}`
+    );
+  }
+
+  public async updateBrandProfile(payload: Partial<BrandProfile>): Promise<BrandProfile> {
+    return this.request<BrandProfile>("/api/v1/brain/brand-profile", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async getProducts(
+    projectId: string = "proj-default",
+    activeOnly: boolean = false
+  ): Promise<ProductItem[]> {
+    return this.request<ProductItem[]>(
+      `/api/v1/brain/products?project_id=${encodeURIComponent(projectId)}&active_only=${activeOnly}`
+    );
+  }
+
+  public async upsertProduct(payload: Partial<ProductItem>): Promise<ProductItem> {
+    return this.request<ProductItem>("/api/v1/brain/products", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async deleteProduct(productId: string): Promise<{ status: string; product_id: string }> {
+    return this.request<{ status: string; product_id: string }>(
+      `/api/v1/brain/products/${encodeURIComponent(productId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  public async getProductPriceHistory(productId: string): Promise<PriceHistoryItem[]> {
+    return this.request<PriceHistoryItem[]>(
+      `/api/v1/brain/products/${encodeURIComponent(productId)}/history`
+    );
+  }
+
+  public async importProductsCsv(
+    fileOrContent: File | string,
+    projectId: string = "proj-default"
+  ): Promise<CsvImportResult> {
+    const url = `/api/v1/brain/products/import-csv?project_id=${encodeURIComponent(projectId)}`;
+    if (typeof fileOrContent === "string") {
+      return this.request<CsvImportResult>(url, {
+        method: "POST",
+        body: JSON.stringify({ csv_content: fileOrContent }),
+      });
+    }
+
+    const formData = new FormData();
+    formData.append("file", fileOrContent);
+    const headers: Record<string, string> = {};
+    const token = this.resolveToken();
+    if (token) {
+      headers["X-Local-Auth-Token"] = token;
+    }
+    const resp = await fetch(`${this.baseUrl}${url}`, {
+      method: "POST",
+      headers,
+      body: formData,
+    });
+    if (!resp.ok) {
+      const errJson = await resp.json().catch(() => null);
+      throw new ApiError(
+        errJson?.detail || "Import CSV thất bại",
+        resp.status,
+        errJson
+      );
+    }
+    return resp.json();
+  }
+
+  public async listBrainDocuments(collection?: string): Promise<BrainDocumentItem[]> {
+    const query = collection ? `?collection=${encodeURIComponent(collection)}` : "";
+    return this.request<BrainDocumentItem[]>(`/api/v1/brain/documents${query}`);
+  }
+
+  public async deleteBrainDocument(docId: string): Promise<{ status: string; doc_id: string }> {
+    return this.request<{ status: string; doc_id: string }>(
+      `/api/v1/brain/documents/${encodeURIComponent(docId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  public async searchBrain(
+    query: string,
+    collections: string[] = ["default"],
+    topK: number = 5,
+    minSimilarity: number = 0.7
+  ): Promise<SemanticSearchHit[]> {
+    return this.request<SemanticSearchHit[]>("/api/v1/brain/search", {
+      method: "POST",
+      body: JSON.stringify({
+        query,
+        collections,
+        top_k: topK,
+        min_similarity: minSimilarity,
+      }),
+    });
+  }
+
+  public async uploadBrainDocument(file: File, collection: string = "default"): Promise<any> {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("collection", collection);
+
+    const headers: Record<string, string> = {};
+    const token = this.resolveToken();
+    if (token) {
+      headers["X-Local-Auth-Token"] = token;
+    }
+
+    const resp = await fetch(`${this.baseUrl}/api/v1/brain/documents`, {
+      method: "POST",
+      headers,
+      body: formData,
+    });
+
+    if (!resp.ok) {
+      const errJson = await resp.json().catch(() => null);
+      throw new ApiError(
+        errJson?.detail || "Tải tài liệu thất bại",
+        resp.status,
+        errJson
+      );
+    }
+    return resp.json();
   }
 }
 
