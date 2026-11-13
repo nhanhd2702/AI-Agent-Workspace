@@ -12,6 +12,7 @@ from app.api.inbox import router as inbox_router
 from app.api.monitoring import router as monitoring_router
 from app.api.projects import router as projects_router
 from app.api.reviews import router as reviews_router
+from app.api.settings import get_raw_secret, router as settings_router
 from app.api.tasks import router as tasks_router
 from app.api.ws import TaskWebSocketManager, router as ws_router
 from app.config import AppSettings, get_settings
@@ -59,6 +60,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         extra_secrets=[resolved_settings.local_auth_token]
     )
     app.state.recovered_tasks_count = 0
+    app.state.get_raw_secret = get_raw_secret
 
     # Mount API & WebSocket routers
     app.include_router(projects_router)
@@ -71,6 +73,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(inbox_router)
     app.include_router(monitoring_router)
     app.include_router(reviews_router)
+    app.include_router(settings_router)
     app.include_router(ws_router)
 
     # CORS configuration for desktop Next.js / Tauri shell

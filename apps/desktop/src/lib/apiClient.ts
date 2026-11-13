@@ -7,14 +7,19 @@ import {
   BrandProfile,
   BrandTemplate,
   ConnectorStatus,
+  ConnectorHealthItem,
   CsvImportResult,
   Department,
   ExecutionMode,
   InboxConversation,
   InboxMessage,
+  LlmProviderConfig,
+  LlmProviderUpdatePayload,
+  LlmTestResult,
   ParsedTask,
   PriceHistoryItem,
   ProductItem,
+  ProfileUpdatePayload,
   Project,
   ReviewDecidePayload,
   ReviewDecision,
@@ -23,6 +28,7 @@ import {
   StoryboardData,
   StoryboardSceneData,
   TaskLogEntry,
+  UserProfileSettings,
 } from "./types";
 
 export interface ApiClientConfig {
@@ -899,6 +905,72 @@ export class ApiClient {
     const wsBase = this.baseUrl.replace(/^http/i, "ws");
     const token = encodeURIComponent(this.resolveToken());
     return `${wsBase}/api/v1/inbox/ws?token=${token}`;
+  }
+
+  // --- Task 5.1: Encrypted Settings, LLM Providers, Health & Profile ---
+
+  /**
+   * Retrieve configured LLM providers with masked keys.
+   */
+  public async getLlmSettings(): Promise<Record<string, LlmProviderConfig>> {
+    const res = await this.request<ApiResponse<Record<string, LlmProviderConfig>>>("/api/v1/settings/llm");
+    return res.data;
+  }
+
+  /**
+   * Configure or update an LLM provider with encryption at rest.
+   */
+  public async updateLlmProvider(payload: LlmProviderUpdatePayload): Promise<LlmProviderConfig> {
+    const res = await this.request<ApiResponse<LlmProviderConfig>>("/api/v1/settings/llm", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    return res.data;
+  }
+
+  /**
+   * Test connection ping to an LLM provider.
+   */
+  public async testLlmConnection(
+    provider: string,
+    params?: { api_key?: string; default_model?: string; base_url?: string }
+  ): Promise<LlmTestResult> {
+    return this.request<LlmTestResult>("/api/v1/settings/llm/test", {
+      method: "POST",
+      body: JSON.stringify({
+        provider,
+        api_key: params?.api_key,
+        default_model: params?.default_model,
+        base_url: params?.base_url,
+      }),
+    });
+  }
+
+  /**
+   * Retrieve health checks for runtimes (FFmpeg, Playwright, Shell, ChromaDB) and external connectors.
+   */
+  public async getConnectorsHealth(): Promise<ConnectorHealthItem[]> {
+    const res = await this.request<ApiResponse<ConnectorHealthItem[]>>("/api/v1/settings/connectors/health");
+    return res.data;
+  }
+
+  /**
+   * Retrieve user profile settings and quota limits.
+   */
+  public async getUserProfile(): Promise<UserProfileSettings> {
+    const res = await this.request<ApiResponse<UserProfileSettings>>("/api/v1/settings/profile");
+    return res.data;
+  }
+
+  /**
+   * Update user profile settings, theme, and spending quota limits.
+   */
+  public async updateUserProfile(payload: ProfileUpdatePayload): Promise<UserProfileSettings> {
+    const res = await this.request<ApiResponse<UserProfileSettings>>("/api/v1/settings/profile", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    return res.data;
   }
 }
 

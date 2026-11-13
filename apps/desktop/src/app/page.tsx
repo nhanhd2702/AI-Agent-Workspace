@@ -147,6 +147,7 @@ export default function HomePage() {
             else if (navId === "board") window.location.assign("/board");
             else if (navId === "brain") window.location.assign("/brain");
             else if (navId === "customer_chat" || navId === "inbox") window.location.assign("/inbox");
+            else if (navId === "settings") window.location.assign("/settings");
           }
         }}
       />

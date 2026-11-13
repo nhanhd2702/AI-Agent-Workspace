@@ -406,4 +406,67 @@ export interface ConnectorStatus {
   qr_code_url?: string | null;
 }
 
+// --- Task 5.1: Settings, LLM Providers & Connector Health Types ---
+
+export interface LlmProviderConfig {
+  provider: string;
+  name: string;
+  has_key: boolean;
+  masked_key: string;
+  default_model: string;
+  base_url?: string | null;
+  is_enabled: boolean;
+  status: "connected" | "disconnected" | "disabled" | string;
+  updated_at?: string | null;
+}
+
+export interface LlmProviderUpdatePayload {
+  provider: string;
+  api_key?: string | null;
+  default_model?: string | null;
+  base_url?: string | null;
+  is_enabled?: boolean;
+}
+
+export interface LlmTestResult {
+  success: boolean;
+  provider: string;
+  model?: string;
+  latency_ms?: number;
+  message: string;
+}
+
+export interface ConnectorHealthItem {
+  id: string;
+  name: string;
+  category: "runtime" | "storage" | "external" | string;
+  healthy: boolean;
+  status: "ready" | "connected" | "disconnected" | "missing" | "error" | string;
+  message?: string | null;
+  details?: Record<string, any> | null;
+  last_checked: string;
+}
+
+export interface UserProfileSettings {
+  id: string;
+  theme: "dark" | "light" | "system" | string;
+  language: "vi" | "en" | string;
+  daily_token_limit: number;
+  daily_usd_limit: number;
+  auto_backup: boolean;
+  preferences?: Record<string, any>;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ProfileUpdatePayload {
+  theme?: string;
+  language?: string;
+  daily_token_limit?: number;
+  daily_usd_limit?: number;
+  auto_backup?: boolean;
+  preferences?: Record<string, any>;
+}
+
+
 

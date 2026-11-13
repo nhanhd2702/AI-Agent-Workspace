@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   CircleDashed,
   AlertCircle,
+  Settings,
 } from "lucide-react";
 import { SidebarTaskItem, TimeGroup } from "@/lib/types";
 
@@ -37,6 +38,7 @@ const PRIMARY_NAV_ITEMS: NavItem[] = [
   { id: "library", label: "Thư viện", icon: FolderClosed },
   { id: "brain", label: "Brain", icon: Brain },
   { id: "customer_chat", label: "Hội thoại khách", icon: MessageSquare },
+  { id: "settings", label: "Cài đặt", icon: Settings },
 ];
 
 const TIME_GROUP_CONFIG: { key: TimeGroup; label: string }[] = [
