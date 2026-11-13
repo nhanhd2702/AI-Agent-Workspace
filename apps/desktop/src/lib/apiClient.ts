@@ -39,17 +39,36 @@ export interface ApiClientConfig {
   token?: string;
 }
 
+export interface BackendConnectionInfo {
+  port: number;
+  token: string;
+}
+
 declare global {
   interface Window {
     __LOCAL_AUTH_TOKEN__?: string;
+    __TAURI_INTERNALS__?: unknown;
+    __TAURI__?: unknown;
   }
 }
 
 export class ApiClient {
   private baseUrl: string;
   private token?: string;
+  private explicitBaseUrl: boolean;
+  private explicitToken: boolean;
+  private tauriSyncPromise: Promise<void> | null = null;
 
   constructor(config?: ApiClientConfig) {
+    this.explicitBaseUrl = Boolean(
+      config?.baseUrl ||
+      (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_API_URL)
+    );
+    this.explicitToken = Boolean(
+      config?.token ||
+      (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_LOCAL_AUTH_TOKEN)
+    );
+
     this.baseUrl = (
       config?.baseUrl ||
       (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_API_URL) ||
@@ -59,8 +78,54 @@ export class ApiClient {
     this.token = config?.token;
   }
 
+  public getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
+  public getToken(): string | undefined {
+    return this.token;
+  }
+
   public setToken(token: string): void {
     this.token = token;
+    this.explicitToken = true;
+  }
+
+  /**
+   * Dynamically query Tauri runtime for sidecar loopback port and session token.
+   * If running in Tauri webview and not explicitly overridden, updates baseUrl and auth token.
+   */
+  public async syncTauriBackendConnection(): Promise<void> {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const hasTauri = Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
+    if (!hasTauri) {
+      return;
+    }
+
+    if (!this.tauriSyncPromise) {
+      this.tauriSyncPromise = (async () => {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const conn = await invoke<BackendConnectionInfo>("get_backend_connection");
+          if (conn) {
+            if (conn.port && !this.explicitBaseUrl) {
+              this.baseUrl = `http://127.0.0.1:${conn.port}`;
+            }
+            if (conn.token && !this.explicitToken) {
+              this.token = conn.token;
+              window.__LOCAL_AUTH_TOKEN__ = conn.token;
+            }
+          }
+        } catch {
+          // Graceful fallback to static/dev defaults when invoke is unavailable
+        }
+      })();
+    }
+
+    return this.tauriSyncPromise;
   }
 
   private resolveToken(): string {
@@ -77,6 +142,9 @@ export class ApiClient {
   }
 
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    if (typeof window !== "undefined" && (window.__TAURI_INTERNALS__ || window.__TAURI__)) {
+      await this.syncTauriBackendConnection();
+    }
     const url = `${this.baseUrl}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
     const token = this.resolveToken();
 
@@ -766,6 +834,9 @@ export class ApiClient {
       });
     }
 
+    if (typeof window !== "undefined" && (window.__TAURI_INTERNALS__ || window.__TAURI__)) {
+      await this.syncTauriBackendConnection();
+    }
     const formData = new FormData();
     formData.append("file", fileOrContent);
     const headers: Record<string, string> = {};
@@ -819,6 +890,9 @@ export class ApiClient {
   }
 
   public async uploadBrainDocument(file: File, collection: string = "default"): Promise<any> {
+    if (typeof window !== "undefined" && (window.__TAURI_INTERNALS__ || window.__TAURI__)) {
+      await this.syncTauriBackendConnection();
+    }
     const formData = new FormData();
     formData.append("file", file);
     formData.append("collection", collection);
@@ -1063,6 +1137,9 @@ export class ApiClient {
     if (options?.task_id) formData.append("task_id", options.task_id);
     if (options?.category) formData.append("category", options.category);
 
+    if (typeof window !== "undefined" && (window.__TAURI_INTERNALS__ || window.__TAURI__)) {
+      await this.syncTauriBackendConnection();
+    }
     const token = this.resolveToken();
     const res = await fetch(`${this.baseUrl}/api/v1/files/upload`, {
       method: "POST",
@@ -1091,6 +1168,9 @@ export class ApiClient {
    * Batch package selected file IDs into a single ZIP archive download.
    */
   public async exportFilesZip(fileIds: string[]): Promise<Blob> {
+    if (typeof window !== "undefined" && (window.__TAURI_INTERNALS__ || window.__TAURI__)) {
+      await this.syncTauriBackendConnection();
+    }
     const token = this.resolveToken();
     const res = await fetch(`${this.baseUrl}/api/v1/files/export`, {
       method: "POST",
@@ -1139,3 +1219,7 @@ export class ApiClient {
 }
 
 export const defaultApiClient = new ApiClient();
+
+if (typeof window !== "undefined") {
+  defaultApiClient.syncTauriBackendConnection().catch(() => {});
+}

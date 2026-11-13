@@ -126,3 +126,31 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
 
 app = create_app()
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="AI Agent Workspace Backend Daemon")
+    parser.add_argument("--port", type=int, default=None, help="Port to listen on")
+    parser.add_argument("--token", type=str, default=None, help="Local auth token")
+    parser.add_argument("--workspace", type=str, default=None, help="Workspace directory")
+    args, _ = parser.parse_known_args()
+
+    if args.port:
+        os.environ["BACKEND_PORT"] = str(args.port)
+    if args.token:
+        os.environ["LOCAL_AUTH_TOKEN"] = args.token
+    if args.workspace:
+        os.environ["WORKSPACE_DIR"] = args.workspace
+
+    get_settings.cache_clear()
+    runtime_settings = get_settings()
+    uvicorn.run(
+        create_app(runtime_settings),
+        host="127.0.0.1",
+        port=runtime_settings.backend_port,
+        log_level="info",
+    )
