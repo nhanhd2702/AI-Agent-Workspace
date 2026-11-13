@@ -721,16 +721,24 @@ export class ApiClient {
     });
   }
 
-  public async deleteProduct(productId: string): Promise<{ status: string; product_id: string }> {
+  public async deleteProduct(
+    productId: string,
+    projectId?: string
+  ): Promise<{ status: string; product_id: string }> {
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
     return this.request<{ status: string; product_id: string }>(
-      `/api/v1/brain/products/${encodeURIComponent(productId)}`,
+      `/api/v1/brain/products/${encodeURIComponent(productId)}${query}`,
       { method: "DELETE" }
     );
   }
 
-  public async getProductPriceHistory(productId: string): Promise<PriceHistoryItem[]> {
+  public async getProductPriceHistory(
+    productId: string,
+    projectId?: string
+  ): Promise<PriceHistoryItem[]> {
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
     return this.request<PriceHistoryItem[]>(
-      `/api/v1/brain/products/${encodeURIComponent(productId)}/history`
+      `/api/v1/brain/products/${encodeURIComponent(productId)}/history${query}`
     );
   }
 

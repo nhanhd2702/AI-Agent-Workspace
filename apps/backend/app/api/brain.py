@@ -53,7 +53,7 @@ class ProductUpsertPayload(BaseModel):
     project_id: Optional[str] = "proj-default"
     sku: str
     name: str
-    price_vnd: int = 0
+    price_vnd: int = Field(default=0, ge=0)
     tier_type: Optional[str] = None
     short_desc: Optional[str] = None
     full_desc: Optional[str] = None
@@ -357,13 +357,17 @@ async def upsert_product(
         prod = service.upsert_product(db, data, project_id=payload.project_id or "proj-default")
         return mask_secrets(_serialize_product(prod))
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        err_msg = str(exc)
+        if "không thuộc dự án" in err_msg:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=err_msg)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_msg)
 
 
 @router.delete("/products/{product_id}")
 async def delete_product(
     request: Request,
     product_id: str,
+    project_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> Any:
     """Deletes a product from database and ChromaDB vector index."""
@@ -372,19 +376,23 @@ async def delete_product(
         chroma_dir=settings.resolved_chroma_dir,
         workspace_root=settings.workspace_dir,
     )
-    deleted = service.delete_product(db, product_id)
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Sáº£n pháº©m khÃ´ng tá»“n táº¡i",
-        )
-    return {"status": "deleted", "product_id": product_id}
+    try:
+        deleted = service.delete_product(db, product_id, project_id=project_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Sản phẩm không tồn tại",
+            )
+        return {"status": "deleted", "product_id": product_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
 
 @router.get("/products/{product_id}/history")
 async def get_product_history(
     request: Request,
     product_id: str,
+    project_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> Any:
     """Retrieves chronological price change audit log for a product."""
@@ -393,8 +401,11 @@ async def get_product_history(
         chroma_dir=settings.resolved_chroma_dir,
         workspace_root=settings.workspace_dir,
     )
-    history = service.get_price_history(db, product_id)
-    return mask_secrets(history)
+    try:
+        history = service.get_price_history(db, product_id, project_id=project_id)
+        return mask_secrets(history)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
 
 @router.post("/products/import-csv")

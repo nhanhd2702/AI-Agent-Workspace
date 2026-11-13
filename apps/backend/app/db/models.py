@@ -37,6 +37,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -397,12 +398,15 @@ class BrandProfile(Base):
 class Product(Base):
     """Product catalog item with VND pricing and historical price audit trail."""
     __tablename__ = "products"
+    __table_args__ = (
+        UniqueConstraint("project_id", "sku", name="uq_project_sku"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     project_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("projects.id", ondelete="CASCADE"), default="proj-default", nullable=False
     )
-    sku: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    sku: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     price_vnd: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tier_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

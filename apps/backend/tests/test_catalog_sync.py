@@ -295,3 +295,206 @@ def test_brain_api_brand_profile_and_products_flow(test_env):
     # Confirm deleted
     resp_list_after = client.get("/api/v1/brain/products")
     assert not any(item["id"] == prod_id for item in resp_list_after.json())
+
+
+def test_tenant_isolation_probe(test_env):
+    """Different projects can have products with the same SKU without collision or cross-overwrite."""
+    db_factory = test_env["db_factory"]
+    service: CatalogService = test_env["service"]
+    client: TestClient = test_env["client"]
+
+    from app.db.models import Project
+
+    with db_factory() as db:
+        if not db.get(Project, "proj-alpha"):
+            db.add(Project(id="proj-alpha", name="Project Alpha"))
+        if not db.get(Project, "proj-beta"):
+            db.add(Project(id="proj-beta", name="Project Beta"))
+        db.commit()
+
+    with db_factory() as db:
+        # 1. Project A creates SKU "SHARED-SKU"
+        p_a = service.upsert_product(
+            db,
+            {"sku": "SHARED-SKU", "name": "Dự án A - Sp 1", "price_vnd": 100000},
+            project_id="proj-alpha",
+        )
+        assert p_a.project_id == "proj-alpha"
+        assert p_a.price_vnd == 100000
+        p_a_id = p_a.id
+
+        # 2. Project B creates product with SAME SKU "SHARED-SKU"
+        p_b = service.upsert_product(
+            db,
+            {"sku": "SHARED-SKU", "name": "Dự án B - Sp 1", "price_vnd": 250000},
+            project_id="proj-beta",
+        )
+        assert p_b.project_id == "proj-beta"
+        assert p_b.price_vnd == 250000
+        p_b_id = p_b.id
+
+        # Ensure different IDs and no overwrite
+        assert p_a_id != p_b_id
+
+        # Reload Project A product and ensure untouched
+        reloaded_a = db.get(Product, p_a_id)
+        assert reloaded_a.name == "Dự án A - Sp 1"
+        assert reloaded_a.price_vnd == 100000
+
+        # 3. Project B attempts to overwrite Project A product by ID -> raises ValueError
+        with pytest.raises(ValueError, match="không thuộc dự án này"):
+            service.upsert_product(
+                db,
+                {"id": p_a_id, "sku": "HACK-SKU", "name": "Hack Attempt", "price_vnd": 500},
+                project_id="proj-beta",
+            )
+
+        # 4. Project B attempts to view Project A product history -> raises ValueError
+        with pytest.raises(ValueError, match="không thuộc dự án này"):
+            service.get_price_history(db, p_a_id, project_id="proj-beta")
+
+        # 5. Project B attempts to delete Project A product -> raises ValueError
+        with pytest.raises(ValueError, match="không thuộc dự án này"):
+            service.delete_product(db, p_a_id, project_id="proj-beta")
+
+    # 6. Verify HTTP API enforcing HTTP 403 on cross-tenant attempts
+    # Cross-project upsert by ID
+    resp_cross_upsert = client.post(
+        "/api/v1/brain/products",
+        json={
+            "id": p_a_id,
+            "project_id": "proj-beta",
+            "sku": "HACK",
+            "name": "Hack from API",
+            "price_vnd": 50000,
+        },
+    )
+    assert resp_cross_upsert.status_code == 403
+    assert "không thuộc dự án này" in resp_cross_upsert.json()["detail"]
+
+    # Cross-project get price history
+    resp_cross_hist = client.get(f"/api/v1/brain/products/{p_a_id}/history?project_id=proj-beta")
+    assert resp_cross_hist.status_code == 403
+
+    # Cross-project delete
+    resp_cross_del = client.delete(f"/api/v1/brain/products/{p_a_id}?project_id=proj-beta")
+    assert resp_cross_del.status_code == 403
+
+
+def test_negative_price_validation(test_env):
+    """Negative prices are rejected at both service level (ValueError) and API level (400 or 422)."""
+    db_factory = test_env["db_factory"]
+    service: CatalogService = test_env["service"]
+    client: TestClient = test_env["client"]
+
+    # 1. Service-level ValueError
+    with db_factory() as db:
+        with pytest.raises(ValueError, match="không được là số âm"):
+            service.upsert_product(
+                db,
+                {"sku": "NEG-SRV", "name": "Giá âm", "price_vnd": -50000},
+                project_id="proj-default",
+            )
+
+    # 2. API-level rejection
+    resp_api = client.post(
+        "/api/v1/brain/products",
+        json={"sku": "NEG-API", "name": "Giá âm API", "price_vnd": -1000},
+    )
+    assert resp_api.status_code in (400, 422)
+
+
+def test_csv_formula_injection_sanitization(test_env):
+    """CSV cells with formula characters (=, +, -, @) are sanitized with leading single quote."""
+    db_factory = test_env["db_factory"]
+    service: CatalogService = test_env["service"]
+
+    csv_content = (
+        "sku,name,price_vnd,tier_type,short_desc,full_desc,deliverables,policies\n"
+        "=CMD|calc,@SUM(1+1),500000,+VIP,-ShortDesc,-FullDesc,+Deliv 1;@Deliv 2,=Policy 1\n"
+    )
+
+    with db_factory() as db:
+        res = service.import_csv(db, csv_content, project_id="proj-default")
+        assert res["imported_count"] == 1
+        assert len(res["errors"]) == 0
+
+        prod = db.query(Product).filter_by(project_id="proj-default", sku="'=CMD|calc").first()
+        assert prod is not None
+        assert prod.sku == "'=CMD|calc"
+        assert prod.name == "'@SUM(1+1)"
+        assert prod.tier_type == "'+VIP"
+        assert prod.short_desc == "'-ShortDesc"
+        assert prod.full_desc == "'-FullDesc"
+        assert prod.deliverables == ["'+Deliv 1", "'@Deliv 2"]
+        assert prod.policies == ["'=Policy 1"]
+
+
+def test_csv_over_500_rows_rejected(test_env):
+    """CSV files containing more than 500 data rows are explicitly rejected without importing."""
+    db_factory = test_env["db_factory"]
+    service: CatalogService = test_env["service"]
+
+    # Build CSV with 505 data rows
+    lines = ["sku,name,price_vnd\n"]
+    for i in range(1, 506):
+        lines.append(f"ROW-{i},Product {i},10000\n")
+    large_csv = "".join(lines)
+
+    with db_factory() as db:
+        res = service.import_csv(db, large_csv, project_id="proj-default")
+        assert res["imported_count"] == 0
+        assert len(res["errors"]) == 1
+        assert res["errors"][0]["row"] == 0
+        assert "vượt quá giới hạn tối đa 500 dòng sản phẩm" in res["errors"][0]["error"]
+
+        # Ensure no products were inserted into the DB
+        prods = db.query(Product).filter(Product.sku.like("ROW-%")).all()
+        assert len(prods) == 0
+
+
+def test_csv_batched_chroma_sync(test_env):
+    """CSV import syncs all products to ChromaDB in a single batch."""
+    db_factory = test_env["db_factory"]
+    service: CatalogService = test_env["service"]
+    chroma_dir = test_env["chroma_dir"]
+
+    csv_content = (
+        "sku,name,price_vnd,short_desc\n"
+        "BATCH-01,Laptop Gaming ASUS ROG,25000000,May tinh choi game manh me\n"
+        "BATCH-02,Ban phim co Khong day,1500000,Ban phim co bluetooth\n"
+        "BATCH-03,Tai nghe Chuyen dung Studio,3200000,Tai nghe am thanh trung thuc\n"
+    )
+
+    with db_factory() as db:
+        res = service.import_csv(db, csv_content, project_id="proj-default")
+        assert res["imported_count"] == 3
+        assert len(res["errors"]) == 0
+
+    # Verify vector retriever can find batch products in ChromaDB
+    retriever = BrainRetriever(chroma_dir=chroma_dir, default_min_similarity=0.3)
+    hits = retriever.search(query="Laptop Gaming ASUS", collections=["products"], top_k=2)
+    assert len(hits) > 0
+    assert any("BATCH-01" in h.text for h in hits)
+
+
+def test_chroma_sync_failure_logging(test_env, caplog):
+    """Vector sync failure is logged with logger.error and does not crash the database operation."""
+    import logging
+    from unittest.mock import patch
+
+    db_factory = test_env["db_factory"]
+    service: CatalogService = test_env["service"]
+
+    with patch.object(service.chroma_client, "get_or_create_collection", side_effect=RuntimeError("Chroma simulated down")):
+        with caplog.at_level(logging.ERROR):
+            with db_factory() as db:
+                prod = service.upsert_product(
+                    db,
+                    {"sku": "CHROMA-FAIL", "name": "Chroma Fail Safe", "price_vnd": 300000},
+                    project_id="proj-default",
+                )
+                assert prod is not None
+                assert prod.sku == "CHROMA-FAIL"
+
+            assert any("ChromaDB vector sync failed" in r.message for r in caplog.records)

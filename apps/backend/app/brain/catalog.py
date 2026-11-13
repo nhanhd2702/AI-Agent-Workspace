@@ -11,10 +11,26 @@ import csv
 from datetime import datetime, timezone
 import io
 import json
+import logging
 from pathlib import Path
 import re
 from typing import Any, Optional
 import uuid
+
+logger = logging.getLogger(__name__)
+
+
+def sanitize_csv_formula(val: Optional[str]) -> Optional[str]:
+    """Disarms CSV Formula Injection (CWE-1236).
+
+    Prepends a single quote to text fields starting with =, +, -, @, \\t, or \\r.
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + str(val)
+    return str(val)
 
 from sqlalchemy.orm import Session
 
@@ -184,8 +200,8 @@ class CatalogService:
 
             col.upsert(ids=[profile.id], documents=[doc_text], metadatas=[meta])
             BrainRetriever.clear_cache()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("ChromaDB vector sync failed: %s", exc, exc_info=True)
 
     # --------------------------------------------------------------------------
     # Product Catalog Management
@@ -218,8 +234,10 @@ class CatalogService:
             f"CÃ¢u há» i thÆ°á» ng gáº·p (FAQs):\n{faqs_str}"
         )
 
-    def _sync_product_to_chroma(self, product: Product) -> None:
-        """Syncs single product document into ChromaDB collection 'products'."""
+    def _sync_products_batch_to_chroma(self, products: list[Product]) -> None:
+        """Batch syncs multiple products into ChromaDB collection 'products' in a single operation."""
+        if not products:
+            return
         try:
             col_name = normalize_collection_name("products")
             col = self.chroma_client.get_or_create_collection(
@@ -227,21 +245,33 @@ class CatalogService:
                 metadata={"hnsw:space": "cosine"},
             )
 
-            doc_text = self._product_to_text(product)
-            meta = {
-                "doc_id": product.id,
-                "doc_title": f"{product.sku} - {product.name}",
-                "collection": "products",
-                "sku": product.sku,
-                "price_vnd": int(product.price_vnd),
-                "is_active": bool(product.is_active),
-                "project_id": str(product.project_id),
-            }
+            ids: list[str] = []
+            documents: list[str] = []
+            metadatas: list[dict[str, Any]] = []
 
-            col.upsert(ids=[product.id], documents=[doc_text], metadatas=[meta])
+            for product in products:
+                doc_text = self._product_to_text(product)
+                meta = {
+                    "doc_id": product.id,
+                    "doc_title": f"{product.sku} - {product.name}",
+                    "collection": "products",
+                    "sku": product.sku,
+                    "price_vnd": int(product.price_vnd),
+                    "is_active": bool(product.is_active),
+                    "project_id": str(product.project_id),
+                }
+                ids.append(product.id)
+                documents.append(doc_text)
+                metadatas.append(meta)
+
+            col.upsert(ids=ids, documents=documents, metadatas=metadatas)
             BrainRetriever.clear_cache()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("ChromaDB vector sync failed: %s", exc, exc_info=True)
+
+    def _sync_product_to_chroma(self, product: Product) -> None:
+        """Syncs single product document into ChromaDB collection 'products'."""
+        self._sync_products_batch_to_chroma([product])
 
     def _remove_product_from_chroma(self, product_id: str) -> None:
         """Removes product document from ChromaDB collection 'products'."""
@@ -250,28 +280,35 @@ class CatalogService:
             col = self.chroma_client.get_collection(name=col_name)
             col.delete(ids=[product_id])
             BrainRetriever.clear_cache()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("ChromaDB vector sync failed: %s", exc, exc_info=True)
 
     def upsert_product(
         self,
         db: Session,
         data: dict[str, Any],
         project_id: str = "proj-default",
+        sync_vector: bool = True,
     ) -> Product:
         """Creates or updates a product, logs price changes to price_history, and syncs vector."""
         sku = str(data.get("sku", "")).strip()
         if not sku:
-            raise ValueError("MÃ£ SKU khÃ´ng Ä‘Æ°á»£c Ä‘á»ƒ trá»‘ng")
+            raise ValueError("Mã SKU không được để trống")
 
-        # Find existing by ID or SKU
+        new_price = int(data.get("price_vnd", 0))
+        if new_price < 0:
+            raise ValueError("Giá sản phẩm không được là số âm")
+
+        # Find existing by ID or SKU within scoped project
         prod: Optional[Product] = None
         if data.get("id"):
             prod = db.get(Product, data["id"])
-        if not prod:
-            prod = db.query(Product).filter_by(sku=sku).first()
+            if prod and prod.project_id != project_id:
+                raise ValueError("Sản phẩm không thuộc dự án này")
 
-        new_price = int(data.get("price_vnd", 0))
+        if not prod:
+            prod = db.query(Product).filter_by(project_id=project_id, sku=sku).first()
+
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if not prod:
@@ -286,7 +323,7 @@ class CatalogService:
             ]
             prod = Product(
                 id=prod_id,
-                project_id=data.get("project_id", project_id),
+                project_id=project_id,
                 sku=sku,
                 name=data.get("name", ""),
                 price_vnd=new_price,
@@ -334,14 +371,24 @@ class CatalogService:
         db.commit()
         db.refresh(prod)
 
-        # Synchronize to ChromaDB immediately
-        self._sync_product_to_chroma(prod)
+        # Synchronize to ChromaDB if requested
+        if sync_vector:
+            self._sync_product_to_chroma(prod)
         return prod
 
-    def get_price_history(self, db: Session, product_id: str) -> list[dict[str, Any]]:
+    def get_price_history(
+        self,
+        db: Session,
+        product_id: str,
+        project_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
         """Returns the price change history list for a product."""
         prod = db.get(Product, product_id)
-        if not prod or not prod.price_history:
+        if not prod:
+            return []
+        if project_id is not None and prod.project_id != project_id:
+            raise ValueError("Sản phẩm không thuộc dự án này")
+        if not prod.price_history:
             return []
         return list(prod.price_history)
 
@@ -357,11 +404,18 @@ class CatalogService:
             query = query.filter(Product.is_active == True)  # noqa: E712
         return query.order_by(Product.created_at.desc()).all()
 
-    def delete_product(self, db: Session, product_id: str) -> bool:
+    def delete_product(
+        self,
+        db: Session,
+        product_id: str,
+        project_id: Optional[str] = None,
+    ) -> bool:
         """Deletes a product from the database and removes it from ChromaDB."""
         prod = db.get(Product, product_id)
         if not prod:
             return False
+        if project_id is not None and prod.project_id != project_id:
+            raise ValueError("Sản phẩm không thuộc dự án này")
 
         db.delete(prod)
         db.commit()
@@ -388,7 +442,7 @@ class CatalogService:
         rows = list(reader)
 
         if not rows:
-            return {"imported_count": 0, "errors": [{"row": 1, "sku": "", "error": "Tá»‡p CSV trá»‘ng"}]}
+            return {"imported_count": 0, "errors": [{"row": 1, "sku": "", "error": "Tệp CSV trống"}]}
 
         # Parse header
         raw_headers = [h.strip().lower() for h in rows[0]]
@@ -406,53 +460,80 @@ class CatalogService:
         imported_count = 0
         errors: list[dict[str, Any]] = []
 
-        # Limit to 500 data rows
-        data_rows = rows[1:501]
+        # Filter non-empty data rows
+        data_rows_with_indices = [
+            (idx, r) for idx, r in enumerate(rows[1:], start=2)
+            if r and any(cell.strip() for cell in r)
+        ]
 
-        for line_idx, row in enumerate(data_rows, start=2):
-            if not row or not any(cell.strip() for cell in row):
-                continue  # skip empty lines
+        # Enforce maximum 500 data rows limit
+        if len(data_rows_with_indices) > 500:
+            return {
+                "imported_count": 0,
+                "errors": [
+                    {
+                        "row": 0,
+                        "sku": "",
+                        "error": "Tệp CSV vượt quá giới hạn tối đa 500 dòng sản phẩm",
+                    }
+                ],
+            }
 
+        imported_products: list[Product] = []
+
+        for line_idx, row in data_rows_with_indices:
             def get_val(col_idx: Optional[int]) -> str:
                 if col_idx is not None and col_idx < len(row):
                     return row[col_idx].strip()
                 return ""
 
-            sku = get_val(sku_col)
-            name = get_val(name_col)
+            raw_sku = get_val(sku_col)
+            raw_name = get_val(name_col)
             price_str = get_val(price_col)
 
-            if not sku:
-                errors.append({"row": line_idx, "sku": "", "error": "Thiáº¿u mÃ£ SKU"})
+            if not raw_sku:
+                errors.append({"row": line_idx, "sku": "", "error": "Thiếu mã SKU"})
                 continue
-            if not name:
-                errors.append({"row": line_idx, "sku": sku, "error": "Thiáº¿u tÃªn sáº£n pháº©m"})
+            if not raw_name:
+                errors.append({"row": line_idx, "sku": raw_sku, "error": "Thiếu tên sản phẩm"})
                 continue
 
             # Parse price
             try:
+                # Check original string for negative sign
+                if "-" in price_str:
+                    errors.append({"row": line_idx, "sku": raw_sku, "error": "Giá không được là số âm"})
+                    continue
                 # Remove currency symbols and dots/commas if formatted
                 clean_price_str = re.sub(r"[^\d]", "", price_str)
                 if not clean_price_str:
                     clean_price_str = "0"
                 price_val = int(clean_price_str)
-                # Check original string for negative sign
-                if "-" in price_str:
-                    errors.append({"row": line_idx, "sku": sku, "error": "GiÃ¡ khÃ´ng Ä‘Æ°á»£c lÃ  sá»‘ Ã¢m"})
-                    continue
             except Exception:
-                errors.append({"row": line_idx, "sku": sku, "error": f"GiÃ¡ khÃ´ng há»£p lá»‡: {price_str}"})
+                errors.append({"row": line_idx, "sku": raw_sku, "error": f"Giá không hợp lệ: {price_str}"})
                 continue
 
-            tier_type = get_val(header_map.get("tier_type") or header_map.get("tier"))
-            short_desc = get_val(header_map.get("short_desc") or header_map.get("motangan"))
-            full_desc = get_val(header_map.get("full_desc") or header_map.get("motachitiet"))
+            # Sanitize CSV Formula Injection (CWE-1236)
+            sku = sanitize_csv_formula(raw_sku)
+            name = sanitize_csv_formula(raw_name)
+
+            tier_type = sanitize_csv_formula(get_val(header_map.get("tier_type") or header_map.get("tier")))
+            short_desc = sanitize_csv_formula(get_val(header_map.get("short_desc") or header_map.get("motangan")))
+            full_desc = sanitize_csv_formula(get_val(header_map.get("full_desc") or header_map.get("motachitiet")))
             deliv_raw = get_val(header_map.get("deliverables") or header_map.get("quyenloi"))
             pol_raw = get_val(header_map.get("policies") or header_map.get("chinhsach"))
 
-            # Deliverables and policies list parsing
-            deliv_list = [d.strip() for d in re.split(r"[;\n]", deliv_raw) if d.strip()] if deliv_raw else []
-            pol_list = [p.strip() for p in re.split(r"[;\n]", pol_raw) if p.strip()] if pol_raw else []
+            # Deliverables and policies list parsing with formula sanitization
+            deliv_list = [
+                sanitize_csv_formula(d.strip())
+                for d in re.split(r"[;\n]", deliv_raw)
+                if d.strip()
+            ] if deliv_raw else []
+            pol_list = [
+                sanitize_csv_formula(p.strip())
+                for p in re.split(r"[;\n]", pol_raw)
+                if p.strip()
+            ] if pol_raw else []
 
             prod_dict = {
                 "sku": sku,
@@ -467,9 +548,15 @@ class CatalogService:
             }
 
             try:
-                self.upsert_product(db, prod_dict, project_id=project_id)
+                # Upsert to SQLite without immediate individual ChromaDB sync
+                prod = self.upsert_product(db, prod_dict, project_id=project_id, sync_vector=False)
+                imported_products.append(prod)
                 imported_count += 1
             except Exception as exc:
-                errors.append({"row": line_idx, "sku": sku, "error": str(exc)})
+                errors.append({"row": line_idx, "sku": raw_sku, "error": str(exc)})
+
+        # Batch synchronize all imported products to ChromaDB in a single operation
+        if imported_products:
+            self._sync_products_batch_to_chroma(imported_products)
 
         return {"imported_count": imported_count, "errors": errors}
