@@ -11,6 +11,8 @@ import {
   CsvImportResult,
   Department,
   ExecutionMode,
+  FileItem,
+  FileStorageSummary,
   InboxConversation,
   InboxMessage,
   LlmProviderConfig,
@@ -1008,6 +1010,131 @@ export class ApiClient {
       throw new ApiError(`Xuất CSV thất bại (${res.status})`, res.status);
     }
     return res.blob();
+  }
+
+  // --- File Library & Storage APIs (Task 5.3) ---
+
+  /**
+   * List files in workspace library with optional filters.
+   */
+  public async listFiles(filters?: {
+    file_type?: string;
+    project_id?: string;
+    search?: string;
+  }): Promise<FileItem[]> {
+    const params = new URLSearchParams();
+    if (filters?.file_type && filters.file_type !== "all") {
+      params.append("file_type", filters.file_type);
+    }
+    if (filters?.project_id) {
+      params.append("project_id", filters.project_id);
+    }
+    if (filters?.search) {
+      params.append("search", filters.search);
+    }
+    const query = params.toString() ? `?${params.toString()}` : "";
+    const res = await this.request<FileItem[]>(`/api/v1/files${query}`);
+    return res || [];
+  }
+
+  /**
+   * Get storage usage summary vs 5GB quota limit.
+   */
+  public async getStorageSummary(): Promise<FileStorageSummary> {
+    return this.request<FileStorageSummary>("/api/v1/files/storage");
+  }
+
+  /**
+   * Upload a file with optional project/task organization.
+   */
+  public async uploadFile(
+    file: File,
+    options?: {
+      project_id?: string;
+      task_slug?: string;
+      task_id?: string;
+      category?: string;
+    }
+  ): Promise<FileItem> {
+    const formData = new FormData();
+    formData.append("file", file);
+    if (options?.project_id) formData.append("project_id", options.project_id);
+    if (options?.task_slug) formData.append("task_slug", options.task_slug);
+    if (options?.task_id) formData.append("task_id", options.task_id);
+    if (options?.category) formData.append("category", options.category);
+
+    const token = this.resolveToken();
+    const res = await fetch(`${this.baseUrl}/api/v1/files/upload`, {
+      method: "POST",
+      headers: {
+        "X-Local-Auth-Token": token,
+      },
+      body: formData,
+    });
+
+    if (!res.ok) {
+      let errDetail = `Tải lên thất bại (${res.status})`;
+      try {
+        const body = await res.json();
+        if (body.detail) errDetail = body.detail;
+      } catch {
+        // fallback to default
+      }
+      throw new ApiError(errDetail, res.status);
+    }
+
+    const json = await res.json();
+    return json.data;
+  }
+
+  /**
+   * Batch package selected file IDs into a single ZIP archive download.
+   */
+  public async exportFilesZip(fileIds: string[]): Promise<Blob> {
+    const token = this.resolveToken();
+    const res = await fetch(`${this.baseUrl}/api/v1/files/export`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Local-Auth-Token": token,
+      },
+      body: JSON.stringify({ file_ids: fileIds }),
+    });
+
+    if (!res.ok) {
+      let errDetail = `Xuất ZIP thất bại (${res.status})`;
+      try {
+        const body = await res.json();
+        if (body.detail) errDetail = body.detail;
+      } catch {
+        // fallback
+      }
+      throw new ApiError(errDetail, res.status);
+    }
+
+    return res.blob();
+  }
+
+  /**
+   * Delete a file from disk and database.
+   */
+  public async deleteFile(fileId: string): Promise<{ deleted: boolean; id: string }> {
+    return this.request<{ deleted: boolean; id: string }>(
+      `/api/v1/files/${encodeURIComponent(fileId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  /**
+   * Clean up files older than N days from temp/, frames/, and cache/.
+   */
+  public async cleanupTempFiles(
+    days: number = 7
+  ): Promise<{ cleaned_files: number; freed_bytes: number }> {
+    return this.request<{ cleaned_files: number; freed_bytes: number }>(
+      `/api/v1/files/cleanup?days=${days}`,
+      { method: "POST" }
+    );
   }
 }
 

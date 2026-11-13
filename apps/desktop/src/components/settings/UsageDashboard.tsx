@@ -227,7 +227,7 @@ export function UsageDashboard({
               {quota.exceeded ? "Cảnh báo vượt hạn mức: " : "Cảnh báo hạn mức hàng ngày: "}
             </span>
             Đã chi tiêu ${(quota.spent_today_usd ?? 0).toFixed(3)} / ${(quota.daily_limit_usd ?? 0).toFixed(2)} USD (
-            {quota.percentage_used?.toFixed(1) ?? "0"}%).
+            {(quota.utilization_pct ?? quota.percentage_used ?? 0).toFixed(1)}%).
           </div>
         </div>
       )}

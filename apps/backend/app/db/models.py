@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for AI Agent Workspace (Văn Phòng AI).
 
-Defines all 18 persistence entities:
+Defines all 19 persistence entities:
 1. Project
 2. Department
 3. Agent
@@ -19,6 +19,7 @@ Defines all 18 persistence entities:
 16. ConnectorConfig
 17. UserSettings
 18. TaskAuditLog
+19. FileAsset
 """
 
 from __future__ import annotations
@@ -542,3 +543,33 @@ class TaskAuditLog(Base):
     )
 
     task: Mapped["Task"] = relationship("Task", back_populates="audit_logs")
+
+
+class FileAsset(Base):
+    """File asset stored or uploaded in workspace library (F03/F06)."""
+    __tablename__ = "file_assets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    mime_type: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    category: Mapped[str] = mapped_column(String(32), default="upload")
+    file_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
+        if "metadata" in kwargs and "file_metadata" not in kwargs:
+            kwargs["file_metadata"] = kwargs.pop("metadata")
+        super().__init__(**kwargs)
+

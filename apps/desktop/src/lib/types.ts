@@ -508,7 +508,9 @@ export interface QuotaStatusItem {
   daily_limit_usd: number;
   spent_today_usd: number;
   remaining_today_usd?: number;
+  remaining_usd?: number;
   percentage_used?: number;
+  utilization_pct?: number;
   warning_triggered: boolean;
   exceeded: boolean;
   daily_token_limit?: number;
@@ -528,6 +530,28 @@ export interface MonitoringDashboardData {
   task_stats: TaskStatsItem;
   quota?: QuotaStatusItem;
 }
+
+export interface FileItem {
+  id: string;
+  project_id?: string | null;
+  task_id?: string | null;
+  name: string;
+  file_path: string;
+  file_type: "image" | "video" | "audio" | "document" | "code" | "other" | string;
+  mime_type?: string | null;
+  size_bytes: number;
+  category?: string;
+  created_at?: string | null;
+}
+
+export interface FileStorageSummary {
+  used_bytes: number;
+  max_bytes: number;
+  percentage: number;
+  used_mb: number;
+  max_gb: number;
+}
+
 
 
 

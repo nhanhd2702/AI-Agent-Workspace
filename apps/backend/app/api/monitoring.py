@@ -41,7 +41,8 @@ def _sanitize_csv_cell(value: Any) -> Any:
     if value is None:
         return ""
     val_str = str(value)
-    if val_str and val_str[0] in ("=", "+", "-", "@", "\t", "\r"):
+    stripped = val_str.lstrip()
+    if stripped and stripped[0] in ("=", "+", "-", "@", "\t", "\r"):
         return f"'{val_str}"
     return val_str
 

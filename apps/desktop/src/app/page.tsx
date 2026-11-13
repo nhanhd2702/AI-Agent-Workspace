@@ -145,6 +145,7 @@ export default function HomePage() {
           if (typeof window !== "undefined") {
             if (navId === "office") window.location.assign("/office");
             else if (navId === "board") window.location.assign("/board");
+            else if (navId === "library") window.location.assign("/library");
             else if (navId === "brain") window.location.assign("/brain");
             else if (navId === "customer_chat" || navId === "inbox") window.location.assign("/inbox");
             else if (navId === "settings") window.location.assign("/settings");
