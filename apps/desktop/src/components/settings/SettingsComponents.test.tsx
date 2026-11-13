@@ -237,13 +237,14 @@ describe("SettingsComponents Unit & Integration Tests (Task 5.1)", () => {
   });
 
   describe("SettingsPage Integration", () => {
-    it("renders 3 tabs and switches between LLM, Connectors, and Profile views", async () => {
+    it("renders 4 tabs and switches between LLM, Connectors, Profile, and Monitoring views", async () => {
       render(<SettingsPage />);
 
-      // Verify 3 tabs are present
+      // Verify 4 tabs are present
       expect(screen.getByRole("tab", { name: /Cấu hình AI \(LLM\)/i })).toBeInTheDocument();
       expect(screen.getByRole("tab", { name: /Kết nối & Công cụ \(Connectors\)/i })).toBeInTheDocument();
       expect(screen.getByRole("tab", { name: /Hồ sơ & Giao diện \(Profile\)/i })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: /Giám sát & Chi phí/i })).toBeInTheDocument();
 
       // Default tab is LLM
       expect(screen.getByText(/Quản lý API Key các nhà cung cấp mô hình AI/i)).toBeInTheDocument();
@@ -255,6 +256,10 @@ describe("SettingsComponents Unit & Integration Tests (Task 5.1)", () => {
       // Switch to Profile tab
       fireEvent.click(screen.getByRole("tab", { name: /Hồ sơ & Giao diện \(Profile\)/i }));
       expect(screen.getByText(/Tùy chỉnh giao diện, ngôn ngữ và hạn mức chi tiêu/i)).toBeInTheDocument();
+
+      // Switch to Monitoring tab
+      fireEvent.click(screen.getByRole("tab", { name: /Giám sát & Chi phí/i }));
+      expect(screen.getByText(/Giám Sát & Chi Phí Token/i)).toBeInTheDocument();
     });
   });
 });

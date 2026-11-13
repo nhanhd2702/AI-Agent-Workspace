@@ -16,6 +16,7 @@ import {
   LlmProviderConfig,
   LlmProviderUpdatePayload,
   LlmTestResult,
+  MonitoringDashboardData,
   ParsedTask,
   PriceHistoryItem,
   ProductItem,
@@ -971,6 +972,42 @@ export class ApiClient {
       body: JSON.stringify(payload),
     });
     return res.data;
+  }
+
+  /**
+   * Retrieve monitoring dashboard metrics (KPI summary, agent/model breakdown, daily trends, task stats).
+   */
+  public async getMonitoringDashboard(
+    period: "today" | "7d" | "30d" | "all" | string = "7d"
+  ): Promise<MonitoringDashboardData> {
+    const res = await this.request<ApiResponse<MonitoringDashboardData>>(
+      `/api/v1/monitoring/dashboard?period=${encodeURIComponent(period)}`
+    );
+    return res.data;
+  }
+
+  /**
+   * Get direct URL to download CSV export of usage records.
+   */
+  public getMonitoringCsvUrl(period: string = "7d"): string {
+    return `${this.baseUrl}/api/v1/monitoring/export.csv?period=${encodeURIComponent(period)}`;
+  }
+
+  /**
+   * Export usage records as CSV Blob with auth header.
+   */
+  public async exportMonitoringCsv(period: string = "7d"): Promise<Blob> {
+    const url = this.getMonitoringCsvUrl(period);
+    const token = this.resolveToken();
+    const res = await fetch(url, {
+      headers: {
+        "X-Local-Auth-Token": token,
+      },
+    });
+    if (!res.ok) {
+      throw new ApiError(`Xuất CSV thất bại (${res.status})`, res.status);
+    }
+    return res.blob();
   }
 }
 

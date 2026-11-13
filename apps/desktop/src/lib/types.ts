@@ -468,5 +468,67 @@ export interface ProfileUpdatePayload {
   preferences?: Record<string, any>;
 }
 
+export interface AgentUsageStat {
+  agent_id: string;
+  agent_name: string;
+  requests: number;
+  tokens: number;
+  total_tokens?: number;
+  cost_usd: number;
+  percentage?: number;
+}
+
+export interface ModelUsageStat {
+  model_name: string;
+  requests: number;
+  tokens: number;
+  total_tokens?: number;
+  cost_usd: number;
+}
+
+export interface DailyTrendItem {
+  date: string;
+  tokens: number;
+  cost_usd: number;
+  requests: number;
+}
+
+export interface TaskStatsItem {
+  total: number;
+  total_tasks?: number;
+  completed: number;
+  completed_tasks?: number;
+  failed: number;
+  failed_tasks?: number;
+  in_progress: number;
+  success_rate_pct: number;
+}
+
+export interface QuotaStatusItem {
+  daily_limit_usd: number;
+  spent_today_usd: number;
+  remaining_today_usd?: number;
+  percentage_used?: number;
+  warning_triggered: boolean;
+  exceeded: boolean;
+  daily_token_limit?: number;
+  tokens_spent_today?: number;
+}
+
+export interface MonitoringDashboardData {
+  period: "today" | "7d" | "30d" | "all" | string;
+  total_tokens: number;
+  total_cost_usd: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_requests: number;
+  by_agent: AgentUsageStat[];
+  by_model: ModelUsageStat[];
+  daily_trends: DailyTrendItem[];
+  task_stats: TaskStatsItem;
+  quota?: QuotaStatusItem;
+}
+
+
 
 

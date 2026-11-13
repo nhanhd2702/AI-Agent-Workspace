@@ -19,10 +19,12 @@ import {
   DollarSign,
   Coins,
   DatabaseBackup,
+  Activity,
 } from "lucide-react";
 import { SidebarNav } from "@/components/layout/SidebarNav";
 import { LlmConfigForm } from "@/components/settings/LlmConfigForm";
 import { ConnectorHealthList } from "@/components/settings/ConnectorHealthList";
+import { UsageDashboard } from "@/components/settings/UsageDashboard";
 import { defaultApiClient } from "@/lib/apiClient";
 import {
   LlmProviderConfig,
@@ -32,7 +34,7 @@ import {
   ProfileUpdatePayload,
 } from "@/lib/types";
 
-export type SettingsTab = "llm" | "connectors" | "profile";
+export type SettingsTab = "llm" | "connectors" | "profile" | "monitoring";
 
 const DEFAULT_MOCK_PROVIDERS: Record<string, LlmProviderConfig> = {
   gemini: {
@@ -389,6 +391,21 @@ export default function SettingsPage() {
               <User className="w-3.5 h-3.5" />
               <span>Hồ sơ & Giao diện (Profile)</span>
             </button>
+
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "monitoring"}
+              onClick={() => setActiveTab("monitoring")}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+                activeTab === "monitoring"
+                  ? "bg-sky-500 text-white shadow-sm font-semibold"
+                  : "text-gray-400 hover:text-gray-200 hover:bg-gray-900"
+              }`}
+            >
+              <Activity className="w-3.5 h-3.5" />
+              <span>Giám sát & Chi phí</span>
+            </button>
           </div>
         </header>
 
@@ -643,6 +660,13 @@ export default function SettingsPage() {
                   </button>
                 </div>
               </form>
+            </div>
+          )}
+
+          {/* Tab 4: Giám sát & Chi phí (Monitoring) */}
+          {activeTab === "monitoring" && (
+            <div className="max-w-5xl mx-auto">
+              <UsageDashboard />
             </div>
           )}
         </div>
