@@ -21,6 +21,14 @@ from app.mcp.external_apis import (
     extract_channel_identifier,
 )
 from app.mcp.gateway import McpGateway
+from app.mcp.messaging_bridge import (
+    BaseChannelAdapter,
+    MessagingBridge,
+    MockChannelAdapter,
+    TelegramChannelAdapter,
+    TokenBucketRateLimiter,
+    ZaloChannelAdapter,
+)
 from app.mcp.security import (
     SecurityPolicyError,
     validate_safe_http_url,
@@ -34,6 +42,7 @@ from app.mcp.shell_server import (
 )
 
 __all__ = [
+    "BaseChannelAdapter",
     "BrowserActionResult",
     "BrowserController",
     "BrowserGateStatus",
@@ -43,6 +52,8 @@ __all__ = [
     "DEFAULT_ALLOWED_EXECUTABLES",
     "ExternalApiError",
     "McpGateway",
+    "MessagingBridge",
+    "MockChannelAdapter",
     "NotionClient",
     "NotionPageResult",
     "SecurityPolicyError",
@@ -51,9 +62,12 @@ __all__ = [
     "ShellExecutor",
     "ShellResult",
     "ShellTimeoutError",
+    "TelegramChannelAdapter",
+    "TokenBucketRateLimiter",
     "TranscriptResult",
     "VideoMeta",
     "YouTubeClient",
+    "ZaloChannelAdapter",
     "build_connector_client",
     "extract_channel_identifier",
     "validate_safe_http_url",

@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api.agents import agents_router, departments_router
 from app.api.artifacts import files_router, router as artifacts_router
 from app.api.brain import router as brain_router
+from app.api.inbox import router as inbox_router
 from app.api.monitoring import router as monitoring_router
 from app.api.projects import router as projects_router
 from app.api.reviews import router as reviews_router
@@ -67,6 +68,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(artifacts_router)
     app.include_router(files_router)
     app.include_router(brain_router)
+    app.include_router(inbox_router)
     app.include_router(monitoring_router)
     app.include_router(reviews_router)
     app.include_router(ws_router)
@@ -91,8 +93,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if request.method == "OPTIONS":
             return await call_next(request)
 
-        # Enforce X-Local-Auth-Token on /api/v1/* endpoints
+        # Enforce X-Local-Auth-Token on /api/v1/* endpoints (exempting webhooks)
         if request.url.path.startswith("/api/v1"):
+            if request.url.path.startswith("/api/v1/inbox/webhook"):
+                return await call_next(request)
             token = request.headers.get("X-Local-Auth-Token")
             if not token or not secrets.compare_digest(
                 token.encode("utf-8"),

@@ -6,9 +6,12 @@ import {
   BrainDocumentItem,
   BrandProfile,
   BrandTemplate,
+  ConnectorStatus,
   CsvImportResult,
   Department,
   ExecutionMode,
+  InboxConversation,
+  InboxMessage,
   ParsedTask,
   PriceHistoryItem,
   ProductItem,
@@ -832,6 +835,61 @@ export class ApiClient {
       );
     }
     return resp.json();
+  }
+
+  // --- Task 4.6: Multi-channel Messaging & Inbox Endpoints ---
+
+  public async getConversations(filter?: {
+    status?: string;
+    channel?: string;
+    project_id?: string;
+  }): Promise<InboxConversation[]> {
+    const params = new URLSearchParams();
+    if (filter?.status) params.set("status", filter.status);
+    if (filter?.channel) params.set("channel", filter.channel);
+    if (filter?.project_id) params.set("project_id", filter.project_id);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    return this.request<InboxConversation[]>(`/api/v1/inbox/conversations${qs}`);
+  }
+
+  public async getConversation(convId: string): Promise<InboxConversation> {
+    return this.request<InboxConversation>(`/api/v1/inbox/conversations/${encodeURIComponent(convId)}`);
+  }
+
+  public async getConversationMessages(convId: string): Promise<InboxMessage[]> {
+    return this.request<InboxMessage[]>(`/api/v1/inbox/conversations/${encodeURIComponent(convId)}/messages`);
+  }
+
+  public async takeoverConversation(convId: string): Promise<{ success: boolean; conversation: InboxConversation }> {
+    return this.request<{ success: boolean; conversation: InboxConversation }>(
+      `/api/v1/inbox/conversations/${encodeURIComponent(convId)}/takeover`,
+      { method: "POST" }
+    );
+  }
+
+  public async releaseConversation(convId: string): Promise<{ success: boolean; conversation: InboxConversation }> {
+    return this.request<{ success: boolean; conversation: InboxConversation }>(
+      `/api/v1/inbox/conversations/${encodeURIComponent(convId)}/release`,
+      { method: "POST" }
+    );
+  }
+
+  public async sendOperatorReply(
+    convId: string,
+    content: string,
+    attachments?: any[]
+  ): Promise<InboxMessage> {
+    return this.request<InboxMessage>(
+      `/api/v1/inbox/conversations/${encodeURIComponent(convId)}/reply`,
+      {
+        method: "POST",
+        body: JSON.stringify({ content, attachments }),
+      }
+    );
+  }
+
+  public async getConnectorsStatus(): Promise<ConnectorStatus[]> {
+    return this.request<ConnectorStatus[]>("/api/v1/inbox/connectors/status");
   }
 }
 

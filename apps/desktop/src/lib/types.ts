@@ -363,3 +363,47 @@ export interface SemanticSearchHit {
   page?: number | null;
 }
 
+export interface InboxMessage {
+  id: string;
+  conversation_id: string;
+  sender_type: "customer" | "agent" | "human" | "system" | string;
+  sender_id?: string | null;
+  sender_name?: string | null;
+  content: string;
+  attachments?: any[];
+  metadata?: Record<string, any>;
+  created_at?: string;
+}
+
+export interface InboxConversation {
+  id: string;
+  project_id: string;
+  channel: "zalo" | "telegram" | "internal" | string;
+  channel_conv_id?: string | null;
+  title?: string | null;
+  participant_name?: string | null;
+  status: "open" | "waiting" | "in_progress" | "closed" | string;
+  is_human_takeover: boolean;
+  created_at?: string;
+  updated_at?: string;
+  last_message?: {
+    id: string;
+    sender_type: string;
+    sender_name?: string | null;
+    content: string;
+    created_at?: string;
+  } | null;
+  unread_count?: number;
+}
+
+export interface ConnectorStatus {
+  id: string;
+  name: string;
+  provider: "zalo" | "telegram" | "internal" | string;
+  status: "connected" | "disconnected" | "expired" | "needs_reauth" | string;
+  is_enabled: boolean;
+  last_sync_at?: string | null;
+  qr_code_url?: string | null;
+}
+
+

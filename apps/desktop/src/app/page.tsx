@@ -140,7 +140,15 @@ export default function HomePage() {
         activeNav={activeNav}
         onNewTask={handleNewTask}
         onSelectTask={handleSelectTask}
-        onNavigate={setActiveNav}
+        onNavigate={(navId) => {
+          setActiveNav(navId);
+          if (typeof window !== "undefined") {
+            if (navId === "office") window.location.assign("/office");
+            else if (navId === "board") window.location.assign("/board");
+            else if (navId === "brain") window.location.assign("/brain");
+            else if (navId === "customer_chat" || navId === "inbox") window.location.assign("/inbox");
+          }
+        }}
       />
 
       {/* Main Workspace Viewport */}
