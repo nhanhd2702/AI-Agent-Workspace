@@ -1,48 +1,50 @@
 "use client";
 
-import React from "react";
+import React, { useState } from "react";
 import Link from "next/link";
 import {
+  Search,
   Plus,
-  MessageSquare,
-  FolderKanban,
   Building2,
-  Brain,
-  Inbox,
-  FolderClosed,
-  Settings,
   Clock,
+  FolderClosed,
+  Brain,
+  MessageCircle,
+  Settings,
+  BookOpen,
+  SunMoon,
+  Folder,
+  Circle,
   CheckCircle2,
-  CircleDashed,
   AlertCircle,
+  Loader2,
 } from "lucide-react";
 import { SidebarTaskItem, TimeGroup } from "@/lib/types";
 
+export interface ExtendedSidebarTaskItem extends SidebarTaskItem {
+  agentId?: string;
+  hasUnread?: boolean;
+}
+
 export interface SidebarNavProps {
-  tasks?: SidebarTaskItem[];
+  tasks?: ExtendedSidebarTaskItem[];
   selectedTaskId?: string;
   activeNav?: string;
+  officeBadge?: number;
+  brainBadge?: number;
   onNewTask?: () => void;
   onSelectTask?: (id: string) => void;
   onNavigate?: (navId: string) => void;
   className?: string;
 }
 
-interface NavItem {
-  id: string;
-  label: string;
-  href: string;
-  icon: React.ElementType;
-}
-
-const PRIMARY_NAV_ITEMS: NavItem[] = [
-  { id: "chat", label: "💬 Tổng hành dinh", href: "/", icon: MessageSquare },
-  { id: "board", label: "📋 Bảng công việc", href: "/board", icon: FolderKanban },
-  { id: "office", label: "🏢 Phòng ban & 12 Agent", href: "/office", icon: Building2 },
-  { id: "brain", label: "🧠 Kho tri thức & SP (Brain)", href: "/brain", icon: Brain },
-  { id: "inbox", label: "📥 Hộp thư khách (Zalo/Tele)", href: "/inbox", icon: Inbox },
-  { id: "library", label: "📁 Thư viện xuất file", href: "/library", icon: FolderClosed },
-  { id: "settings", label: "⚙️ Cài đặt & API / CLI", href: "/settings", icon: Settings },
+// 5 Standard Menu Items according to Tako specifications
+export const TAKO_PRIMARY_NAV = [
+  { id: "office", label: "Văn phòng AI", href: "/office", icon: Building2 },
+  { id: "auto", label: "Tự động", href: "/board", icon: Clock },
+  { id: "library", label: "Thư viện", href: "/library", icon: FolderClosed },
+  { id: "brain", label: "Brain", href: "/brain", icon: Brain },
+  { id: "inbox", label: "Hội thoại khách", href: "/inbox", icon: MessageCircle },
 ];
 
 const TIME_GROUP_CONFIG: { key: TimeGroup; label: string }[] = [
@@ -51,24 +53,96 @@ const TIME_GROUP_CONFIG: { key: TimeGroup; label: string }[] = [
   { key: "past7days", label: "7 ngày qua" },
 ];
 
+// Helper to render distinct Chibi Agent Avatars
+export function AgentChibiAvatar({ agentId, size = "md" }: { agentId?: string; size?: "sm" | "md" }) {
+  const norm = (agentId || "").toLowerCase();
+  const dim = size === "sm" ? "w-5 h-5 text-[10px]" : "w-6 h-6 text-xs";
+
+  if (norm.includes("research") || norm.includes("tím")) {
+    // DeepResearcher: Purple with glasses
+    return (
+      <div
+        className={`${dim} rounded-full bg-purple-500/20 border border-purple-400/40 text-purple-600 flex items-center justify-center font-bold shrink-0 shadow-xs`}
+        title={agentId || "DeepResearcher"}
+      >
+        <span className="scale-90 font-mono">👓</span>
+      </div>
+    );
+  }
+
+  if (norm.includes("writer") || norm.includes("content") || norm.includes("xanh lá")) {
+    // ContentWriter: Green with bag
+    return (
+      <div
+        className={`${dim} rounded-full bg-emerald-500/20 border border-emerald-400/40 text-emerald-600 flex items-center justify-center font-bold shrink-0 shadow-xs`}
+        title={agentId || "ContentWriter"}
+      >
+        <span className="scale-90 font-mono">🎒</span>
+      </div>
+    );
+  }
+
+  if (norm.includes("ui") || norm.includes("design") || norm.includes("đỏ")) {
+    // UIDesigner: Red bean with beanie
+    return (
+      <div
+        className={`${dim} rounded-full bg-rose-500/20 border border-rose-400/40 text-rose-600 flex items-center justify-center font-bold shrink-0 shadow-xs`}
+        title={agentId || "UIDesigner"}
+      >
+        <span className="scale-90 font-mono">🧶</span>
+      </div>
+    );
+  }
+
+  if (norm.includes("video") || norm.includes("mực")) {
+    // VideoEditor: Blue octopus
+    return (
+      <div
+        className={`${dim} rounded-full bg-blue-500/20 border border-blue-400/40 text-blue-600 flex items-center justify-center font-bold shrink-0 shadow-xs`}
+        title={agentId || "VideoEditor"}
+      >
+        <span className="scale-90 font-mono">🐙</span>
+      </div>
+    );
+  }
+
+  // Default: Master Commander Blue with Headphones
+  return (
+    <div
+      className={`${dim} rounded-full bg-indigo-500/20 border border-indigo-400/40 text-indigo-600 flex items-center justify-center font-bold shrink-0 shadow-xs`}
+      title={agentId || "Người điều phối"}
+    >
+      <span className="scale-90 font-mono">🎧</span>
+    </div>
+  );
+}
+
 export function SidebarNav({
   tasks = [],
   selectedTaskId,
-  activeNav = "chat",
+  activeNav,
+  officeBadge = 2,
+  brainBadge = 1,
   onNewTask,
   onSelectTask,
   onNavigate,
   className = "",
 }: SidebarNavProps) {
+  const [searchQuery, setSearchQuery] = useState("");
+
   // Group tasks by time bucket
-  const groupedTasks: Record<TimeGroup, SidebarTaskItem[]> = {
+  const groupedTasks: Record<TimeGroup, ExtendedSidebarTaskItem[]> = {
     today: [],
     yesterday: [],
     past7days: [],
     older: [],
   };
 
-  for (const task of tasks) {
+  const filteredTasks = searchQuery.trim()
+    ? tasks.filter((t) => t.title.toLowerCase().includes(searchQuery.toLowerCase()))
+    : tasks;
+
+  for (const task of filteredTasks) {
     const groupKey = task.group || "today";
     if (groupedTasks[groupKey]) {
       groupedTasks[groupKey].push(task);
@@ -77,116 +151,199 @@ export function SidebarNav({
     }
   }
 
-  const renderStatusIcon = (status?: string) => {
+  const renderStatusDot = (status?: string) => {
     switch (status) {
-      case "completed":
-        return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />;
       case "running":
-        return <CircleDashed className="w-3.5 h-3.5 text-sky-500 animate-spin shrink-0" />;
+        return <span className="w-2 h-2 rounded-full bg-blue-500 shrink-0 animate-pulse" title="Đang chạy" />;
+      case "done":
+      case "completed":
+        return <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" title="Hoàn tất" />;
+      case "awaiting_review":
+      case "waiting_review":
+        return <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0" title="Chờ anh duyệt" />;
       case "failed":
-        return <AlertCircle className="w-3.5 h-3.5 text-rose-500 shrink-0" />;
+      case "error":
+        return <span className="w-2 h-2 rounded-full bg-rose-500 shrink-0" title="Có lỗi" />;
       default:
-        return <Clock className="w-3.5 h-3.5 text-gray-400 shrink-0" />;
+        return <span className="w-1.5 h-1.5 rounded-full bg-slate-300 dark:bg-slate-600 shrink-0" />;
     }
   };
 
   return (
     <aside
-      className={`w-64 bg-gray-900 border-r border-gray-800 text-gray-200 flex flex-col h-full select-none ${className}`}
+      className={`w-64 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 flex flex-col h-full select-none shrink-0 ${className}`}
       data-testid="sidebar-nav"
     >
-      {/* Brand & Workspace Title */}
-      <div className="p-4 border-b border-gray-800 flex items-center justify-between">
-        <Link href="/" className="flex items-center gap-2.5 hover:opacity-90 transition-opacity">
-          <div className="w-8 h-8 rounded-lg bg-sky-600 flex items-center justify-center font-bold text-white shadow-sm">
-            AI
-          </div>
-          <div>
-            <h2 className="text-sm font-semibold tracking-wide text-white">Văn Phòng AI</h2>
-            <p className="text-xs text-gray-400">Master Commander</p>
-          </div>
-        </Link>
+      {/* Search Input Bar with ⌘K */}
+      <div className="p-3 pb-2">
+        <div className="relative flex items-center">
+          <Search className="w-4 h-4 absolute left-3 text-slate-400 pointer-events-none" />
+          <input
+            type="text"
+            placeholder="Tìm kiếm..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-9 pr-10 py-1.5 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-lg text-xs placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition-all"
+          />
+          <kbd className="absolute right-2.5 px-1.5 py-0.5 text-[10px] font-semibold text-slate-400 bg-slate-200/60 dark:bg-slate-700/60 rounded border border-slate-300/60 dark:border-slate-600">
+            ⌘K
+          </kbd>
+        </div>
       </div>
 
-      {/* Top Primary Action: Tạo task mới */}
-      <div className="p-3">
+      {/* Prominent [+] Tạo task mới Button */}
+      <div className="px-3 pb-3">
         <button
           type="button"
           onClick={onNewTask}
-          className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg bg-sky-500 hover:bg-sky-600 text-white font-medium text-sm transition-colors shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-offset-2 focus:ring-offset-gray-900 cursor-pointer"
           aria-label="Tạo task mới"
+          className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 active:scale-[0.98] text-white font-medium text-xs md:text-sm shadow-sm shadow-indigo-500/20 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 dark:focus:ring-offset-slate-900"
         >
-          <Plus className="w-4 h-4" />
+          <Plus className="w-4 h-4 stroke-[2.5]" />
           <span>Tạo task mới</span>
         </button>
       </div>
 
-      {/* Primary Navigation Items with Next.js Links */}
-      <nav className="px-3 py-1 space-y-1">
-        {PRIMARY_NAV_ITEMS.map((item) => {
+      {/* 5 Standard Primary Menus */}
+      <nav className="px-3 space-y-0.5">
+        {TAKO_PRIMARY_NAV.map((item) => {
           const Icon = item.icon;
-          const isActive =
-            activeNav === item.id ||
-            (item.id === "chat" && activeNav === "workspace") ||
-            (item.id === "inbox" && activeNav === "customer_chat");
+          const isActive = activeNav === item.id;
+          const badgeCount = item.id === "office" ? officeBadge : item.id === "brain" ? brainBadge : 0;
+
           return (
             <Link
               key={item.id}
               href={item.href}
               onClick={() => onNavigate?.(item.id)}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs md:text-sm font-medium transition-colors text-left cursor-pointer ${
+              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs md:text-sm font-medium transition-colors cursor-pointer ${
                 isActive
-                  ? "bg-gray-800 text-sky-400 font-semibold shadow-sm border border-gray-750"
-                  : "text-gray-400 hover:text-gray-100 hover:bg-gray-800/60"
+                  ? "bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 font-semibold"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-100/70 dark:hover:bg-slate-800/60"
               }`}
             >
-              <Icon className="w-4 h-4 shrink-0" />
-              <span className="truncate">{item.label}</span>
+              <div className="flex items-center gap-2.5 truncate">
+                <Icon className={`w-4 h-4 shrink-0 ${isActive ? "text-indigo-600 dark:text-indigo-400" : "text-slate-400"}`} />
+                <span className="truncate">{item.label}</span>
+              </div>
+              {badgeCount > 0 && (
+                <span
+                  className={`px-1.5 py-0.2 rounded-full text-[11px] font-bold ${
+                    item.id === "office"
+                      ? "bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-400"
+                      : "bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-400"
+                  }`}
+                >
+                  {badgeCount}
+                </span>
+              )}
             </Link>
           );
         })}
       </nav>
 
-      {/* Separator */}
-      <div className="px-4 py-2">
-        <div className="h-px bg-gray-800" />
+      {/* Divider */}
+      <div className="my-2 border-t border-slate-100 dark:border-slate-800/80 mx-3" />
+
+      {/* Scrollable middle area: PROJECTS & TASKS */}
+      <div className="flex-1 overflow-y-auto px-3 space-y-4 text-xs">
+        {/* PROJECTS */}
+        <div>
+          <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400 uppercase tracking-wider px-2 mb-1">
+            <span>PROJECTS</span>
+            <button
+              type="button"
+              className="hover:text-indigo-600 dark:hover:text-indigo-400 p-0.5 rounded cursor-pointer"
+              title="Thêm Project"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800/50 cursor-pointer">
+              <Folder className="w-3.5 h-3.5 text-slate-400" />
+              <span className="truncate">Solopreneur Marketing</span>
+            </div>
+          </div>
+        </div>
+
+        {/* TASKS LIST WITH CHIBI AVATARS */}
+        <div>
+          <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider px-2 mb-2">
+            <span>TASKS</span>
+            <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+          </div>
+
+          <div className="space-y-3">
+            {TIME_GROUP_CONFIG.map(({ key, label }) => {
+              const groupList = groupedTasks[key];
+              if (!groupList || groupList.length === 0) return null;
+
+              return (
+                <div key={key} className="space-y-1">
+                  <span className="text-[10px] font-medium text-slate-400 px-2 block">
+                    {label}
+                  </span>
+                  <div className="space-y-0.5">
+                    {groupList.map((task) => {
+                      const isSelected = selectedTaskId === task.id;
+                      return (
+                        <button
+                          key={task.id}
+                          type="button"
+                          onClick={() => onSelectTask?.(task.id)}
+                          className={`w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg text-left transition-colors cursor-pointer group ${
+                            isSelected
+                              ? "bg-indigo-50/80 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 font-medium"
+                              : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-100/70 dark:hover:bg-slate-800/50"
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 truncate">
+                            <AgentChibiAvatar agentId={task.agentId} size="sm" />
+                            <span className="truncate text-xs leading-snug">{task.title}</span>
+                          </div>
+                          {renderStatusDot(task.status)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+
+            {filteredTasks.length === 0 && (
+              <p className="text-[11px] text-slate-400 italic px-2">Chưa có tác vụ nào</p>
+            )}
+          </div>
+        </div>
       </div>
 
-      {/* Time-grouped Task History List */}
-      <div className="flex-1 overflow-y-auto px-3 py-1 space-y-4">
-        {TIME_GROUP_CONFIG.map(({ key, label }) => {
-          const items = groupedTasks[key];
-          return (
-            <div key={key} className="space-y-1">
-              <div className="px-2 text-xs font-semibold uppercase tracking-wider text-gray-500">
-                {label}
-              </div>
-              {items.length === 0 ? (
-                <div className="px-2 py-1 text-xs text-gray-600 italic">Chưa có task</div>
-              ) : (
-                items.map((task) => {
-                  const isSelected = selectedTaskId === task.id;
-                  return (
-                    <button
-                      key={task.id}
-                      type="button"
-                      onClick={() => onSelectTask?.(task.id)}
-                      className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs transition-colors text-left truncate cursor-pointer ${
-                        isSelected
-                          ? "bg-sky-950/60 text-sky-300 font-medium border border-sky-800/60"
-                          : "text-gray-300 hover:bg-gray-800/50 hover:text-gray-100"
-                      }`}
-                      title={task.title}
-                    >
-                      {renderStatusIcon(task.status)}
-                      <span className="truncate flex-1">{task.title}</span>
-                    </button>
-                  );
-                })
-              )}
-            </div>
-          );
-        })}
+      {/* Footer Utilities: Settings, Docs, Theme */}
+      <div className="p-3 border-t border-slate-100 dark:border-slate-800/80 flex items-center justify-between text-xs text-slate-500">
+        <Link
+          href="/settings"
+          onClick={() => onNavigate?.("settings")}
+          className="flex items-center gap-2 px-2 py-1 rounded-lg hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+        >
+          <Settings className="w-4 h-4 text-slate-400" />
+          <span>Cài đặt</span>
+        </Link>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            className="p-1.5 rounded-lg hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 cursor-pointer"
+            title="Tài liệu hướng dẫn"
+          >
+            <BookOpen className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
+            className="p-1.5 rounded-lg hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 cursor-pointer"
+            title="Đổi giao diện Sáng / Tối"
+          >
+            <SunMoon className="w-4 h-4" />
+          </button>
+        </div>
       </div>
     </aside>
   );
