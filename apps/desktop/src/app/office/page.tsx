@@ -20,7 +20,10 @@ import {
   X,
 } from "lucide-react";
 import { SidebarNav } from "@/components/layout/SidebarNav";
-import { Office3DCanvas } from "@/components/office/Office3DCanvas";
+import { Office3DCanvas, AgentVisual } from "@/components/office/Office3DCanvas";
+import { OfficeKpiRibbon } from "@/components/office/OfficeKpiRibbon";
+import { OfficeActivityFeed } from "@/components/office/OfficeActivityFeed";
+import { AgentDetailModal } from "@/components/office/AgentDetailModal";
 import { ApiClient } from "@/lib/apiClient";
 import type { Agent, Department } from "@/lib/types";
 
@@ -77,6 +80,7 @@ export default function OfficePage() {
   const [isLoading, setIsLoading] = useState(true);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"3d" | "cards">("3d");
+  const [selectedVisualAgent, setSelectedVisualAgent] = useState<AgentVisual | null>(null);
 
   // Add/Assign agent modal state
   const [targetDept, setTargetDept] = useState<OfficeDepartment | null>(null);
@@ -363,6 +367,15 @@ export default function OfficePage() {
             <div className="text-xs text-gray-400">Đang tải sơ đồ văn phòng AI...</div>
           ) : (
             <div className="space-y-6 max-w-7xl mx-auto">
+              {/* Top KPI Ribbon */}
+              <OfficeKpiRibbon
+                tokenCount="561K"
+                runningCount={2}
+                waitingReviewCount={1}
+                completedCount={8}
+                commanderBrief="Chào anh! Đội Content đang viết 2 kịch bản, 1 việc đang chờ anh duyệt."
+              />
+
               {/* View Switcher Bar */}
               <div className="flex items-center justify-between p-3 rounded-2xl bg-gray-900 border border-gray-800">
                 <div className="flex items-center gap-2">
@@ -393,7 +406,7 @@ export default function OfficePage() {
                 </div>
                 <span className="text-[11px] text-gray-500 hidden sm:inline">
                   {viewMode === "3d"
-                    ? "Góc nhìn Isometric 4 phòng ban & 12 Agent"
+                    ? "Góc nhìn Isometric 4 phòng ban & 22 Chibi Agent"
                     : "Quản lý chi tiết vai trò & mô hình từng Agent"}
                 </span>
               </div>
@@ -401,7 +414,10 @@ export default function OfficePage() {
               {/* 3D Office Canvas View */}
               {viewMode === "3d" && (
                 <div className="space-y-4">
-                  <Office3DCanvas />
+                  <Office3DCanvas
+                    onSelectAgent={(agent) => setSelectedVisualAgent(agent)}
+                    className="h-[560px] w-full"
+                  />
                 </div>
               )}
 
@@ -525,6 +541,28 @@ export default function OfficePage() {
           )}
         </div>
       </main>
+
+      {/* Right-hand Activity Feed "Vừa làm gì" */}
+      <aside className="w-80 lg:w-96 shrink-0 h-full hidden xl:block">
+        <OfficeActivityFeed />
+      </aside>
+
+      {/* Agent Detail Modal (opens on Chibi avatar click) */}
+      {selectedVisualAgent && (
+        <AgentDetailModal
+          agent={selectedVisualAgent}
+          onClose={() => setSelectedVisualAgent(null)}
+          onUseAgent={(ag) => {
+            setSelectedVisualAgent(null);
+            if (typeof window !== "undefined") {
+              window.location.assign(`/?agent=${encodeURIComponent(ag.name)}`);
+            }
+          }}
+          onConfigure={() => {
+            setSelectedVisualAgent(null);
+          }}
+        />
+      )}
 
       {/* Modal: + Thêm vào phòng */}
       {targetDept && (

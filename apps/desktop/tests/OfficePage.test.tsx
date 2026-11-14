@@ -99,16 +99,16 @@ describe("OfficePage", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Đội Content")).toBeInTheDocument();
+      expect(screen.getAllByText("Đội Content").length).toBeGreaterThan(0);
     });
 
-    expect(screen.getByText("Đội Funnels")).toBeInTheDocument();
+    expect(screen.getAllByText("Đội Funnels").length).toBeGreaterThan(0);
     expect(screen.getByText("Nghiên cứu & Phát triển")).toBeInTheDocument();
     expect(screen.getByText("Thương mại điện tử")).toBeInTheDocument();
     expect(screen.getByText("Chưa vào phòng")).toBeInTheDocument();
 
-    expect(screen.getByText("Đang chạy")).toBeInTheDocument();
-    expect(screen.getByText("Nghỉ")).toBeInTheDocument();
+    expect(screen.getAllByText("Đang chạy").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Nghỉ").length).toBeGreaterThan(0);
     expect(screen.getByText("4 kỹ năng")).toBeInTheDocument();
 
     const addButtons = screen.getAllByRole("button", { name: /\+ thêm vào phòng/i });
@@ -159,7 +159,7 @@ describe("OfficePage", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Đội Content")).toBeInTheDocument();
+      expect(screen.getAllByText("Đội Content").length).toBeGreaterThan(0);
     });
 
     const addButtons = screen.getAllByRole("button", { name: /\+ thêm vào phòng/i });
