@@ -1,667 +1,473 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
-import { SidebarNav } from "@/components/layout/SidebarNav";
-import { CommanderPromptBox } from "@/components/chat/CommanderPromptBox";
-import { HtmlSandboxViewer } from "@/components/artifacts/HtmlSandboxViewer";
-import { MarkdownViewer } from "@/components/artifacts/MarkdownViewer";
-import { ReviewGateBanner } from "@/components/reviews/ReviewGateBanner";
+import React, { useState, useEffect, useRef } from "react";
+import { SidebarNav, ExtendedSidebarTaskItem, AgentChibiAvatar } from "@/components/layout/SidebarNav";
+import { CommanderOmnibar } from "@/components/chat/CommanderOmnibar";
+import { ActionCollapseBox, ActionItem } from "@/components/chat/ActionCollapseBox";
+import { HumanDecisionCard } from "@/components/chat/HumanDecisionCard";
+import { TaskDetailsPanel, TaskDetailsData, TaskStage } from "@/components/chat/TaskDetailsPanel";
 import { ApiClient } from "@/lib/apiClient";
+import { Agent, SidebarTaskItem } from "@/lib/types";
 import {
-  Agent,
-  AttachmentItem,
-  BoardTask,
-  ExecutionMode,
-  ParsedTask,
-  ReviewDecidePayload,
-  ReviewDecision,
-  ReviewGate,
-  SidebarTaskItem,
-  TaskLogEntry,
-} from "@/lib/types";
-import {
-  Activity,
-  CheckCircle2,
-  Clock,
-  Layers,
-  Sparkles,
   Wifi,
   WifiOff,
-  UserCheck,
-  AlertTriangle,
-  Play,
-  FileCode,
-  FileText,
-  RotateCw,
-  ExternalLink,
-  ChevronDown,
-  ChevronUp,
+  Sparkles,
   Bot,
-  ShieldAlert,
-  Terminal,
+  User,
+  CheckCircle2,
+  Clock,
+  RotateCw,
+  Layers,
+  ChevronRight,
+  ShieldCheck,
 } from "lucide-react";
 
-const INITIAL_DEMO_TASKS: SidebarTaskItem[] = [
-  { id: "task-1", title: "Nghiên cứu thị trường AI Agents 2026", status: "completed", group: "today" },
-  { id: "task-2", title: "Soạn kịch bản TikTok 60s hook tài chính", status: "running", group: "today" },
-  { id: "task-3", title: "Thiết kế Landing Page khóa học Solopreneur", status: "waiting_review", group: "yesterday" },
-  { id: "task-4", title: "Viết chuỗi 5 email onboarding khách hàng", status: "completed", group: "past7days" },
+export interface ChatMessage {
+  id: string;
+  sender: "user" | "agent" | "system";
+  agentName?: string;
+  content: string;
+  createdAt: string;
+  actions?: ActionItem[];
+  showDecisionCard?: boolean;
+  decisionData?: {
+    title: string;
+    description: string;
+    credits: number;
+  };
+}
+
+const INITIAL_DEMO_TASKS: ExtendedSidebarTaskItem[] = [
+  {
+    id: "task-1",
+    title: "Nghiên cứu thị trường AI Agents 2026",
+    status: "completed",
+    group: "today",
+    agentId: "DeepResearcher",
+  },
+  {
+    id: "task-2",
+    title: "Soạn kịch bản TikTok 60s hook tài chính",
+    status: "running",
+    group: "today",
+    agentId: "ContentWriter",
+  },
+  {
+    id: "task-3",
+    title: "Thiết kế Landing Page khóa học Solopreneur",
+    status: "waiting_review",
+    group: "yesterday",
+    agentId: "UIDesigner",
+  },
+  {
+    id: "task-4",
+    title: "Viết chuỗi 5 email onboarding khách hàng",
+    status: "completed",
+    group: "past7days",
+    agentId: "ContentWriter",
+  },
 ];
+
+const INITIAL_TASK_DETAILS: Record<string, TaskDetailsData> = {
+  "task-2": {
+    id: "task-2",
+    title: "Soạn kịch bản TikTok 60s hook tài chính",
+    description: "Kịch bản giữ chân người xem 3s đầu với visual Sketchnote và nhạc nền 120BPM",
+    currentStage: "in_progress",
+    workflow: [
+      { step: 1, agentName: "HookMaster", role: "Nghiên cứu góc nhìn & 3 Hook mở đầu", status: "completed" },
+      { step: 2, agentName: "ContentWriter", role: "Biên soạn kịch bản 60s chuẩn W-structure", status: "in_progress" },
+      { step: 3, agentName: "VideoEditor", role: "Khớp âm thanh DSP & hiệu ứng visual", status: "pending" },
+    ],
+    deliverables: [
+      {
+        id: "del-tt-1",
+        name: "kich_ban_tiktok_hook_tai_chinh.md",
+        type: "markdown",
+        size: "3.4 KB",
+        content: "# Kịch Bản TikTok 60s: Đừng Tiết Kiệm Tiền Nữa!\n\n**0:00 - 0:03 [Hook]:** Bạn đang để 100 triệu trong ngân hàng và nghĩ mình an toàn?\n**0:03 - 0:15 [Vấn đề]:** Lạm phát thực tế đang âm thầm lấy đi 8% mỗi năm...\n**0:15 - 0:45 [Giải pháp]:** Quy tắc 3 chiếc lọ tài chính thế hệ mới.\n**0:45 - 0:60 [CTA]:** Nhận bảng tính tự động ở bio!",
+      },
+      {
+        id: "del-tt-2",
+        name: "preview_video_storyboard.html",
+        type: "html",
+        size: "28 KB",
+        content: "<!DOCTYPE html><html><body style='font-family:sans-serif;padding:24px;background:#090d16;color:#e2e8f0;'><h2 style='color:#38bdf8;'>Storyboard: Video Hook Tài Chính 60s</h2><div style='background:#1e293b;padding:16px;border-radius:12px;margin-top:12px;'><p><strong>Cảnh 1:</strong> Bàn tay cầm cọc tiền tan biến thành khói đen (Hiệu ứng After Effects).</p><p><strong>Cảnh 2:</strong> Biểu đồ lạm phát dựng đứng màu đỏ neon.</p></div></body></html>",
+      },
+    ],
+    files: [
+      { name: "bao_cao_chi_so_cpi_2026.pdf", size: "2.1 MB", uploadedAt: "09:15" },
+      { name: "audio_bgm_120bpm.mp3", size: "4.8 MB", uploadedAt: "09:20" },
+    ],
+    browserPages: [
+      { id: "page-1", title: "Nghiên cứu đối thủ TikTok", url: "https://tiktok.com/@finance_hacks" },
+    ],
+  },
+  "task-3": {
+    id: "task-3",
+    title: "Thiết kế Landing Page khóa học Solopreneur",
+    description: "Xây dựng phễu trang đích chuyển đổi cao tặng cẩm nang kinh doanh solo",
+    currentStage: "waiting_human",
+    workflow: [
+      { step: 1, agentName: "GrowthAdvisor", role: "Định vị & USP", status: "completed" },
+      { step: 2, agentName: "ContentWriter", role: "Soạn kịch bản & nội dung", status: "completed" },
+      { step: 3, agentName: "UIDesigner", role: "Thiết kế Interactive Web", status: "in_progress" },
+    ],
+    deliverables: [
+      {
+        id: "del-lp-1",
+        name: "landing_page_solopreneur.html",
+        type: "html",
+        size: "42 KB",
+        content: "<!DOCTYPE html><html><body style='font-family:sans-serif;padding:40px;background:#0f172a;color:#f8fafc;'><h1 style='color:#6366f1;'>Khóa Học Solopreneur AI 2026</h1><p style='color:#94a3b8;'>Hệ thống hóa kinh doanh 1 người với 12 AI Agents tự hành.</p><button style='background:#6366f1;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-weight:bold;cursor:pointer;margin-top:20px;'>Đăng ký nhận cẩm nang</button></body></html>",
+      },
+    ],
+    files: [
+      { name: "brand_assets.zip", size: "8.4 MB", uploadedAt: "Hôm qua" },
+    ],
+    browserPages: [
+      { id: "page-2", title: "Live Preview Page", url: "http://localhost:3000/preview/solopreneur" },
+    ],
+  },
+};
+
+const INITIAL_MESSAGES: Record<string, ChatMessage[]> = {
+  "task-2": [
+    {
+      id: "msg-1",
+      sender: "user",
+      content: "Soạn cho anh kịch bản video TikTok 60s hook tài chính, nhắm tới đối tượng người trẻ 22-30 tuổi.",
+      createdAt: "09:14",
+    },
+    {
+      id: "msg-2",
+      sender: "agent",
+      agentName: "Người điều phối",
+      content: "Chào anh! Em đã phân tích yêu cầu: Mục tiêu tạo video 60s giữ chân cao. Em điều phối @HookMaster tạo 3 phương án mở đầu giật gân, sau đó @ContentWriter viết kịch bản chi tiết và @VideoEditor dựng storyboard.",
+      createdAt: "09:15",
+      actions: [
+        {
+          id: "act-1",
+          title: "Phân tích xu hướng TikTok thịnh hành qua SerpApi",
+          durationMs: 44,
+          status: "completed",
+          detail: "Query: top trending finance tiktok hooks vietnam 2026",
+        },
+        {
+          id: "act-2",
+          title: "Kích hoạt mô hình lý luận HookMaster",
+          durationMs: 89,
+          status: "completed",
+          detail: "Prompt tokens: 1,420 | Output tokens: 380",
+        },
+      ],
+    },
+    {
+      id: "msg-3",
+      sender: "agent",
+      agentName: "ContentWriter",
+      content: "Em đã hoàn thành bản thảo kịch bản 60s với hook 'Đừng tiết kiệm tiền nữa!'. Kịch bản áp dụng công thức W-structure và đã sẵn sàng bên cột BÀN GIAO để anh kiểm tra.",
+      createdAt: "09:18",
+      actions: [
+        {
+          id: "act-3",
+          title: "Xuất file markdown kich_ban_tiktok_hook_tai_chinh.md",
+          durationMs: 1200,
+          status: "completed",
+          detail: "File size: 3.4KB | Saved in library",
+        },
+      ],
+    },
+  ],
+};
 
 export default function HomePage() {
   const [apiClient] = useState(() => new ApiClient());
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [tasks, setTasks] = useState<SidebarTaskItem[]>(INITIAL_DEMO_TASKS);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | undefined>("task-2");
-  const [activeNav, setActiveNav] = useState("workspace");
+  const [tasks, setTasks] = useState<ExtendedSidebarTaskItem[]>(INITIAL_DEMO_TASKS);
+  const [selectedTaskId, setSelectedTaskId] = useState<string>("task-2");
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [lastParsedTask, setLastParsedTask] = useState<ParsedTask | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
-
-  // Live Task Execution State
-  const [activeTask, setActiveTask] = useState<BoardTask | null>(null);
-  const [taskLogs, setTaskLogs] = useState<TaskLogEntry[]>([]);
-  const [taskArtifacts, setTaskArtifacts] = useState<any[]>([]);
-  const [activeReview, setActiveReview] = useState<ReviewGate | null>(null);
+  const [messages, setMessages] = useState<Record<string, ChatMessage[]>>(INITIAL_MESSAGES);
+  const [taskDetails, setTaskDetails] = useState<Record<string, TaskDetailsData>>(INITIAL_TASK_DETAILS);
   const [isExecuting, setIsExecuting] = useState(false);
-  const [activeArtifactTab, setActiveArtifactTab] = useState<"preview" | "logs">("preview");
 
-  const pollTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const chatBottomRef = useRef<HTMLDivElement>(null);
 
-  // Initialize and check backend connection
+  // Initialize and check backend health
   useEffect(() => {
     let isMounted = true;
-
-    async function initializeWorkspace() {
+    async function checkHealth() {
       try {
         await apiClient.checkHealth();
-        if (!isMounted) return;
-        setBackendOnline(true);
-
-        const loadedAgents = await apiClient.listAgents();
-        if (isMounted && loadedAgents && loadedAgents.length > 0) {
-          setAgents(loadedAgents);
-        }
-
-        const remoteTasks = await apiClient.listTasks({ limit: 20 });
-        if (isMounted && remoteTasks && remoteTasks.length > 0) {
-          const sidebarItems: SidebarTaskItem[] = remoteTasks.map((t) => ({
-            id: t.id,
-            title: t.title,
-            status: t.status as any,
-            group: "today",
-          }));
-          setTasks(sidebarItems);
-          if (sidebarItems.length > 0) {
-            setSelectedTaskId(sidebarItems[0].id);
-          }
-        }
+        if (isMounted) setBackendOnline(true);
       } catch {
-        if (!isMounted) return;
-        setBackendOnline(false);
+        if (isMounted) setBackendOnline(false);
       }
     }
-
-    initializeWorkspace();
-
+    checkHealth();
     return () => {
       isMounted = false;
-      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-      if (wsRef.current) wsRef.current.close();
     };
   }, [apiClient]);
 
-  // Load task details when selectedTaskId changes
-  const loadTaskDetails = useCallback(
-    async (taskId: string) => {
-      if (!taskId) return;
-      try {
-        const [taskData, logs, artifacts, reviews] = await Promise.all([
-          apiClient.getTask(taskId).catch(() => null),
-          apiClient.getTaskLogs(taskId).catch(() => []),
-          apiClient.listArtifacts({ taskId }).catch(() => []),
-          apiClient.listReviews(taskId, "pending").catch(() => []),
-        ]);
-
-        if (taskData) {
-          setActiveTask(taskData);
-          if (taskData.status === "running") {
-            setIsExecuting(true);
-          } else {
-            setIsExecuting(false);
-          }
-        }
-        setTaskLogs(logs || []);
-        setTaskArtifacts(artifacts || []);
-        setActiveReview(reviews && reviews.length > 0 ? reviews[0] : null);
-      } catch (err) {
-        // Fallback for offline demo tasks
-      }
-    },
-    [apiClient]
-  );
-
+  // Scroll chat to bottom when new messages arrive
   useEffect(() => {
-    if (selectedTaskId) {
-      loadTaskDetails(selectedTaskId);
+    if (typeof chatBottomRef.current?.scrollIntoView === "function") {
+      chatBottomRef.current.scrollIntoView({ behavior: "smooth" });
     }
-  }, [selectedTaskId, loadTaskDetails]);
+  }, [messages, selectedTaskId]);
 
-  // Start polling execution progress
-  const startPolling = useCallback(
-    (taskId: string) => {
-      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+  const activeTask = tasks.find((t) => t.id === selectedTaskId) || tasks[0];
+  const activeTaskDetails = taskDetails[selectedTaskId] || {
+    id: activeTask.id,
+    title: activeTask.title,
+    currentStage: "in_progress" as TaskStage,
+    workflow: [
+      { step: 1, agentName: "Người điều phối", role: "Điều phối tác vụ", status: "completed" },
+    ],
+    deliverables: [],
+    files: [],
+    browserPages: [],
+  };
 
-      setIsExecuting(true);
-      let pollCount = 0;
+  const currentMessages = messages[selectedTaskId] || [];
 
-      pollTimerRef.current = setInterval(async () => {
-        pollCount += 1;
-        try {
-          const [taskData, logs, artifacts, reviews] = await Promise.all([
-            apiClient.getTask(taskId).catch(() => null),
-            apiClient.getTaskLogs(taskId).catch(() => []),
-            apiClient.listArtifacts({ taskId }).catch(() => []),
-            apiClient.listReviews(taskId, "pending").catch(() => []),
-          ]);
+  const handleOmnibarSubmit = async (data: {
+    prompt: string;
+    targetAgent?: string;
+    model?: string;
+    team?: string;
+    format?: string;
+    handsfree?: boolean;
+    attachments?: File[];
+  }) => {
+    if (!data.prompt.trim()) return;
 
-          if (taskData) {
-            setActiveTask(taskData);
-            setTasks((prev) =>
-              prev.map((t) => (t.id === taskId ? { ...t, status: taskData.status as any } : t))
-            );
+    const userMsg: ChatMessage = {
+      id: `msg-${Date.now()}`,
+      sender: "user",
+      content: data.prompt,
+      createdAt: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    };
 
-            if (taskData.status === "completed" || taskData.status === "failed" || taskData.status === "cancelled") {
-              setIsExecuting(false);
-              if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-            }
-          }
+    setMessages((prev) => ({
+      ...prev,
+      [selectedTaskId]: [...(prev[selectedTaskId] || []), userMsg],
+    }));
 
-          if (logs && logs.length > 0) {
-            setTaskLogs(logs);
-          }
-          if (artifacts && artifacts.length > 0) {
-            setTaskArtifacts(artifacts);
-          }
-          if (reviews && reviews.length > 0) {
-            setActiveReview(reviews[0]);
-          }
+    setIsExecuting(true);
 
-          if (pollCount > 100) {
-            if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-            setIsExecuting(false);
-          }
-        } catch {
-          // ignore transient poll error
-        }
-      }, 1500);
-    },
-    [apiClient]
-  );
+    // Simulate agent response with streaming action box
+    setTimeout(() => {
+      const agentMsg: ChatMessage = {
+        id: `msg-${Date.now() + 1}`,
+        sender: "agent",
+        agentName: data.targetAgent || "Người điều phối",
+        content: `Đã tiếp nhận yêu cầu: "${data.prompt}". Em đang phối hợp cùng các tác tử thực thi và chuẩn bị sản phẩm đầu ra theo định dạng ${data.format || "mặc định"}.`,
+        createdAt: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        actions: [
+          {
+            id: `act-${Date.now()}`,
+            title: `Phân tích yêu cầu qua mô hình ${data.model || "GPT-6 Luna"}`,
+            durationMs: 76,
+            status: "completed",
+            detail: `Target: ${data.targetAgent || "Commander"} | Team: ${data.team || "Tổng bộ"}`,
+          },
+          {
+            id: `act-${Date.now() + 1}`,
+            title: "Khởi tạo dòng công việc và gán chuyên viên",
+            durationMs: 140,
+            status: "completed",
+            detail: "Workflow nodes initialized in memory.",
+          },
+        ],
+      };
+
+      setMessages((prev) => ({
+        ...prev,
+        [selectedTaskId]: [...(prev[selectedTaskId] || []), agentMsg],
+      }));
+      setIsExecuting(false);
+    }, 800);
+  };
 
   const handleNewTask = () => {
-    setSelectedTaskId(undefined);
-    setActiveTask(null);
-    setTaskLogs([]);
-    setTaskArtifacts([]);
-    setActiveReview(null);
-    setLastParsedTask(null);
-    setStatusMessage(null);
-    setIsExecuting(false);
+    const newId = `task-${Date.now()}`;
+    const newTask: ExtendedSidebarTaskItem = {
+      id: newId,
+      title: "Nhiệm vụ mới vừa tạo",
+      status: "queued",
+      group: "today",
+      agentId: "Người điều phối",
+    };
+
+    setTasks((prev) => [newTask, ...prev]);
+    setSelectedTaskId(newId);
+    setTaskDetails((prev) => ({
+      ...prev,
+      [newId]: {
+        id: newId,
+        title: "Nhiệm vụ mới vừa tạo",
+        description: "Nhập mục tiêu vào Omnibar để Người điều phối bắt đầu chia việc...",
+        currentStage: "in_progress",
+        workflow: [
+          { step: 1, agentName: "Người điều phối", role: "Tiếp nhận & Lập kế hoạch", status: "in_progress" },
+        ],
+        deliverables: [],
+        files: [],
+        browserPages: [],
+      },
+    }));
   };
-
-  const handleSelectTask = (id: string) => {
-    setSelectedTaskId(id);
-  };
-
-  // Submit and Dispatch task to execution
-  const handleSubmit = async (data: {
-    prompt: string;
-    mode: ExecutionMode;
-    attachments: AttachmentItem[];
-  }) => {
-    setIsSubmitting(true);
-    setStatusMessage(null);
-
-    try {
-      // 1. Parse prompt & create pending task in DB
-      const parsed = await apiClient.parseTask(data.prompt, {
-        mode: data.mode,
-        attachments: data.attachments.map((a) => a.name),
-      });
-
-      setLastParsedTask(parsed);
-      const taskId = parsed.taskId;
-
-      const newTaskItem: SidebarTaskItem = {
-        id: taskId,
-        title: data.prompt.length > 40 ? `${data.prompt.slice(0, 40)}...` : data.prompt,
-        status: "running",
-        group: "today",
-      };
-
-      setTasks((prev) => [newTaskItem, ...prev]);
-      setSelectedTaskId(taskId);
-      setStatusMessage("Master Commander đã phân rã lệnh và kích hoạt Agent thực thi!");
-
-      // 2. Dispatch task to AgentDispatcher runtime
-      await apiClient.dispatchTask(taskId, { mode: data.mode });
-
-      // 3. Start live polling & WebSocket streaming
-      startPolling(taskId);
-    } catch (err) {
-      // Offline fallback handling
-      const fallbackTaskId = `task-local-${Date.now()}`;
-      const fallbackParsed: ParsedTask = {
-        taskId: fallbackTaskId,
-        task_id: fallbackTaskId,
-        intent: "local_offline_intent",
-        taskType: "general",
-        mentionedAgents: [],
-        urls: [],
-        attachmentIds: data.attachments.map((a) => a.id),
-        entities: {},
-        plan: null,
-      };
-
-      setLastParsedTask(fallbackParsed);
-
-      const fallbackTaskItem: SidebarTaskItem = {
-        id: fallbackTaskId,
-        title: data.prompt.length > 40 ? `${data.prompt.slice(0, 40)}...` : data.prompt,
-        status: "completed",
-        group: "today",
-      };
-
-      setTasks((prev) => [fallbackTaskItem, ...prev]);
-      setSelectedTaskId(fallbackTaskId);
-
-      // Create synthetic mock log & output for offline demonstration
-      setTaskLogs([
-        {
-          id: "turn-1",
-          logType: "turn",
-          taskId: fallbackTaskId,
-          turnNumber: 1,
-          agentName: "ContentWriter",
-          agentDisplayName: "Trần Viết Văn",
-          action: "execute_subtask",
-          tool: "llm_router",
-          status: "completed",
-          durationMs: 1240,
-          tokens: 450,
-          outputPayload: {
-            result: `## Kịch Bản & Kế Hoạch Nội Dung Đã Tạo\n\n- **Mục tiêu:** ${data.prompt}\n- **Thời lượng:** 60 giây\n- **Hook:** "90% người dùng bỏ lỡ tính năng này trong năm 2026..."\n- **Kêu gọi hành động:** Nhấn link bên dưới để nhận tài liệu miễn phí!`,
-          },
-        },
-      ]);
-
-      setStatusMessage(
-        "Chế độ ngoại tuyến: Lệnh đã được lưu cục bộ (Backend daemon chưa kết nối)."
-      );
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  // Handle Review Decision (Approve / Reject / Modify)
-  const handleReviewDecision = async (
-    decision: ReviewDecision,
-    payload?: ReviewDecidePayload
-  ) => {
-    if (!activeReview || !selectedTaskId) return;
-    try {
-      await apiClient.decideReview(activeReview.id, decision, payload);
-
-      setStatusMessage(
-        decision === "approve"
-          ? "Đã phê duyệt sản phẩm thành công! Tác vụ chuyển sang giai đoạn hoàn tất."
-          : decision === "reject"
-          ? "Đã từ chối và gửi phản hồi yêu cầu làm lại."
-          : "Đã cập nhật nội dung chỉnh sửa."
-      );
-
-      // Refresh task details
-      await loadTaskDetails(selectedTaskId);
-    } catch (err) {
-      alert("Lỗi khi xử lý quyết định duyệt: " + (err instanceof Error ? err.message : String(err)));
-    }
-  };
-
-  // Helper to extract primary artifact or log output
-  const artifactsList = Array.isArray(taskArtifacts) ? taskArtifacts : [];
-  const primaryHtmlArtifact = artifactsList.find(
-    (a) =>
-      a?.file_type === "html" ||
-      (a?.name && a.name.endsWith(".html")) ||
-      (a?.mime_type && a.mime_type.includes("html"))
-  );
-
-  const primaryMarkdownArtifact = artifactsList.find(
-    (a) =>
-      a?.file_type === "markdown" ||
-      (a?.name && (a.name.endsWith(".md") || a.name.endsWith(".markdown")))
-  );
-
-  const lastTurn = taskLogs.length > 0 ? taskLogs[taskLogs.length - 1] : null;
-  const outPayload = lastTurn?.outputPayload as any;
-  const fallbackOutputText: string =
-    typeof outPayload === "string"
-      ? outPayload
-      : typeof outPayload?.result === "string"
-      ? outPayload.result
-      : typeof outPayload?.content === "string"
-      ? outPayload.content
-      : outPayload
-      ? JSON.stringify(outPayload, null, 2)
-      : "";
 
   return (
-    <div className="flex h-screen bg-gray-950 text-gray-100 overflow-hidden font-sans">
-      {/* Left Sidebar Navigation */}
+    <div className="flex h-screen w-screen overflow-hidden bg-slate-950 text-slate-100 font-sans">
+      {/* ================= COLUMN 1: SIDEBAR (260px) ================= */}
       <SidebarNav
         tasks={tasks}
         selectedTaskId={selectedTaskId}
-        activeNav={activeNav}
+        onSelectTask={(id) => setSelectedTaskId(id)}
         onNewTask={handleNewTask}
-        onSelectTask={handleSelectTask}
-        onNavigate={(navId) => {
-          setActiveNav(navId);
-          if (typeof window !== "undefined") {
-            if (navId === "office") window.location.assign("/office");
-            else if (navId === "board") window.location.assign("/board");
-            else if (navId === "library") window.location.assign("/library");
-            else if (navId === "brain") window.location.assign("/brain");
-            else if (navId === "customer_chat" || navId === "inbox") window.location.assign("/inbox");
-            else if (navId === "settings") window.location.assign("/settings");
-          }
-        }}
+        className="w-64 shrink-0 border-r border-slate-800"
       />
 
-      {/* Main Workspace Viewport */}
-      <main className="flex-1 flex flex-col h-full overflow-hidden bg-gray-950">
-        {/* Top Header Shell */}
-        <header className="h-14 border-b border-gray-800 px-6 flex items-center justify-between shrink-0 bg-gray-900/60 backdrop-blur-sm">
-          <div className="flex items-center gap-3">
-            <h1 className="text-sm font-semibold tracking-wide text-gray-100">
-              Văn Phòng AI (AI Agent Workspace)
-            </h1>
-            <span className="text-xs text-gray-500">|</span>
-            <span className="text-xs text-sky-400 font-medium flex items-center gap-1.5">
-              <Sparkles className="w-3.5 h-3.5" />
-              Tổng Hành Dinh &amp; Điều Phối Đa Tác Tử
-            </span>
+      {/* ================= COLUMN 2: CHAT FEED & OMNIBAR (Flex-1) ================= */}
+      <main className="flex-1 min-w-0 flex flex-col h-full bg-slate-900 border-r border-slate-800 relative">
+        {/* Column 2 Header Bar */}
+        <header className="h-14 px-5 border-b border-slate-800 bg-slate-950/70 backdrop-blur-md flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-3 min-w-0">
+            <AgentChibiAvatar agentId={activeTask.agentId || "Người điều phối"} size="md" />
+            <div className="min-w-0">
+              <h2 className="text-sm font-bold text-slate-100 truncate flex items-center gap-2">
+                <span>{activeTask.title}</span>
+                {activeTask.status === "running" && (
+                  <span className="px-2 py-0.5 rounded text-[10px] bg-indigo-500/20 text-indigo-400 border border-indigo-500/40 font-mono flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+                    Đang chạy
+                  </span>
+                )}
+                {activeTask.status === "completed" && (
+                  <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-mono">
+                    Hoàn tất
+                  </span>
+                )}
+              </h2>
+              <p className="text-[11px] text-slate-400 truncate">
+                Tác tử chỉ huy: <span className="text-indigo-300 font-semibold">{activeTask.agentId || "Người điều phối"}</span>
+              </p>
+            </div>
           </div>
 
-          <div className="flex items-center gap-4 text-xs">
-            {/* Backend connectivity indicator */}
-            <div className="flex items-center gap-1.5">
-              {backendOnline === true ? (
-                <span className="flex items-center gap-1.5 text-emerald-400 font-medium">
-                  <Wifi className="w-3.5 h-3.5" />
-                  <span>Backend 8765 Sẵn Sàng</span>
-                </span>
-              ) : backendOnline === false ? (
-                <span
-                  className="flex items-center gap-1.5 text-amber-400 font-medium"
-                  title="Backend chưa chạy, đang ở chế độ giao diện cục bộ"
-                >
-                  <WifiOff className="w-3.5 h-3.5" />
-                  <span>Chế độ Cục Bộ (Offline)</span>
-                </span>
+          <div className="flex items-center gap-3 shrink-0">
+            {/* Backend connection pill */}
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900 border border-slate-800 text-[11px] text-slate-300">
+              {backendOnline === false ? (
+                <>
+                  <WifiOff className="w-3.5 h-3.5 text-red-400" />
+                  <span className="text-red-400 font-medium">Backend Offline</span>
+                </>
               ) : (
-                <span className="flex items-center gap-1.5 text-gray-400">
-                  <Clock className="w-3.5 h-3.5 animate-spin" />
-                  <span>Đang kiểm tra daemon...</span>
-                </span>
+                <>
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-slate-300">Backend 8765 Sẵn sàng</span>
+                </>
               )}
-            </div>
-
-            <div className="h-4 w-px bg-gray-800" />
-
-            {/* Quick stats */}
-            <div className="flex items-center gap-3 text-gray-400">
-              <span className="flex items-center gap-1">
-                <UserCheck className="w-3.5 h-3.5 text-sky-400" />
-                <span>{agents.length > 0 ? `${agents.length} Agent` : "12 Agent Sẵn Sàng"}</span>
-              </span>
-              <span className="flex items-center gap-1">
-                <Layers className="w-3.5 h-3.5 text-purple-400" />
-                <span>5 Phòng Ban</span>
-              </span>
             </div>
           </div>
         </header>
 
-        {/* Central Scrollable Canvas */}
-        <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
-          <div className="max-w-5xl w-full mx-auto space-y-6">
-            {/* Welcome Banner */}
-            <div className="text-center space-y-1.5 pt-2">
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-sky-950/60 border border-sky-800/50 text-sky-300 text-xs font-medium mb-1">
-                <Sparkles className="w-3.5 h-3.5 text-sky-400" />
-                <span>Nền tảng Tác tử AI Tự Hành Đa Phòng Ban</span>
+        {/* Column 2 Message Scroll Area */}
+        <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
+          {currentMessages.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 space-y-3">
+              <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 flex items-center justify-center shadow-lg">
+                <Sparkles className="w-6 h-6" />
               </div>
-              <h2 className="text-2xl md:text-3xl font-bold tracking-tight text-white">
-                Hôm nay bạn muốn hoàn thành việc gì?
-              </h2>
-              <p className="text-xs md:text-sm text-gray-400 max-w-xl mx-auto leading-relaxed">
-                Nhập mục tiêu bằng tiếng Việt, tag <span className="text-sky-400 font-mono">@Agent</span> và đính kèm tài liệu. Hệ thống sẽ tự động lập kế hoạch, điều phối các Agent chạy và xuất sản phẩm ngay tại đây.
-              </p>
+              <div className="space-y-1">
+                <h3 className="font-bold text-slate-200 text-sm">Chưa có hội thoại nào</h3>
+                <p className="text-xs max-w-sm text-slate-400">
+                  Gõ mục tiêu vào khung lệnh bên dưới. Người điều phối sẽ phân tích và giao việc cho đúng Agent.
+                </p>
+              </div>
             </div>
+          ) : (
+            currentMessages.map((msg) => {
+              const isUser = msg.sender === "user";
 
-            {/* Status notification banner if submitted */}
-            {statusMessage && (
-              <div className="p-3.5 rounded-xl bg-sky-950/40 border border-sky-800/60 text-xs text-sky-200 flex items-center justify-between">
-                <span className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-sky-400 shrink-0" />
-                  <span>{statusMessage}</span>
-                </span>
-                {selectedTaskId && (
-                  <span className="font-mono text-[11px] text-sky-300 bg-sky-900/50 px-2 py-0.5 rounded">
-                    Task ID: {selectedTaskId}
-                  </span>
-                )}
-              </div>
-            )}
-
-            {/* Central Master Commander Prompt Box */}
-            <CommanderPromptBox
-              agents={agents}
-              onSubmit={handleSubmit}
-              isSubmitting={isSubmitting}
-            />
-
-            {/* Human-in-the-Loop Review Gate (if task requires approval) */}
-            {activeReview && (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2 text-xs font-semibold text-amber-400">
-                  <ShieldAlert className="w-4 h-4" />
-                  <span>Yêu Cầu Duyệt Sản Phẩm (Human-in-the-Loop Gate)</span>
-                </div>
-                <ReviewGateBanner
-                  review={activeReview}
-                  onDecide={handleReviewDecision}
-                />
-              </div>
-            )}
-
-            {/* Live Execution Stream & Output Artifact Viewer */}
-            {(isExecuting || taskLogs.length > 0 || taskArtifacts.length > 0 || fallbackOutputText) && (
-              <div className="rounded-2xl bg-gray-900/90 border border-gray-800 overflow-hidden shadow-2xl space-y-0">
-                {/* Panel Header */}
-                <div className="px-5 py-3.5 border-b border-gray-800 flex flex-wrap items-center justify-between gap-3 bg-gray-950/50">
-                  <div className="flex items-center gap-3">
-                    <div className="flex items-center gap-2">
-                      <span className="w-2.5 h-2.5 rounded-full bg-sky-400 animate-pulse" />
-                      <h3 className="text-sm font-semibold text-white">
-                        {activeTask?.title || "Tiến độ thực thi tác vụ"}
-                      </h3>
+              return (
+                <div
+                  key={msg.id}
+                  className={`flex gap-3 max-w-3xl ${isUser ? "ml-auto justify-end" : "mr-auto justify-start"}`}
+                >
+                  {!isUser && (
+                    <div className="shrink-0 mt-0.5">
+                      <AgentChibiAvatar agentId={msg.agentName || "Người điều phối"} size="md" />
                     </div>
-                    {isExecuting ? (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-sky-950 text-sky-300 border border-sky-800 flex items-center gap-1">
-                        <RotateCw className="w-3 h-3 animate-spin" />
-                        Đang chạy...
-                      </span>
-                    ) : (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-950 text-emerald-300 border border-emerald-800">
-                        ✓ Hoàn tất
-                      </span>
-                    )}
-                  </div>
+                  )}
 
-                  {/* Tabs: Preview Sản Phẩm vs Chi Tiết Nhật Ký Turns */}
-                  <div className="flex items-center gap-1 p-1 rounded-xl bg-gray-900 border border-gray-800 text-xs">
-                    <button
-                      type="button"
-                      onClick={() => setActiveArtifactTab("preview")}
-                      className={`flex items-center gap-1.5 px-3 py-1 rounded-lg font-medium transition-all cursor-pointer ${
-                        activeArtifactTab === "preview"
-                          ? "bg-sky-500 text-white"
-                          : "text-gray-400 hover:text-gray-200"
+                  <div className={`space-y-2.5 max-w-[85%] ${isUser ? "items-end" : "items-start"}`}>
+                    {/* Message Bubble */}
+                    <div
+                      className={`p-3.5 rounded-2xl text-xs md:text-sm leading-relaxed shadow-md ${
+                        isUser
+                          ? "bg-indigo-600 text-white rounded-tr-xs"
+                          : "bg-slate-800/90 border border-slate-700/80 text-slate-200 rounded-tl-xs"
                       }`}
                     >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>Xem Sản Phẩm Đầu Ra</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setActiveArtifactTab("logs")}
-                      className={`flex items-center gap-1.5 px-3 py-1 rounded-lg font-medium transition-all cursor-pointer ${
-                        activeArtifactTab === "logs"
-                          ? "bg-sky-500 text-white"
-                          : "text-gray-400 hover:text-gray-200"
-                      }`}
-                    >
-                      <Terminal className="w-3.5 h-3.5" />
-                      <span>Nhật ký Agent ({taskLogs.length} turns)</span>
-                    </button>
+                      {!isUser && (
+                        <div className="text-[11px] font-bold text-indigo-300 mb-1 flex items-center gap-1.5">
+                          <span>{msg.agentName || "Người điều phối"}</span>
+                          <span className="text-slate-400 font-normal text-[10px]">• {msg.createdAt}</span>
+                        </div>
+                      )}
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                    </div>
+
+                    {/* Action Collapse Box if present */}
+                    {msg.actions && msg.actions.length > 0 && (
+                      <ActionCollapseBox actions={msg.actions} isRunning={false} />
+                    )}
+
+                    {/* Human Decision Card if present */}
+                    {msg.showDecisionCard && msg.decisionData && (
+                      <HumanDecisionCard
+                        title={msg.decisionData.title}
+                        description={msg.decisionData.description}
+                        estimatedCredits={msg.decisionData.credits}
+                        onApprove={() => alert("Đã phê duyệt tiếp tục!")}
+                        onModify={() => alert("Chỉnh sửa yêu cầu")}
+                      />
+                    )}
                   </div>
                 </div>
+              );
+            })
+          )}
 
-                {/* Tab 1: Product Output Preview */}
-                {activeArtifactTab === "preview" && (
-                  <div className="p-5">
-                    {/* 1. HTML Landing Page Artifact */}
-                    {primaryHtmlArtifact ? (
-                      <div className="space-y-3">
-                        <div className="flex items-center justify-between text-xs text-gray-400">
-                          <span className="flex items-center gap-1.5 text-sky-300 font-medium">
-                            <FileCode className="w-4 h-4 text-sky-400" />
-                            <span>Landing Page Sandbox: {primaryHtmlArtifact.name}</span>
-                          </span>
-                          {primaryHtmlArtifact.id && (
-                            <a
-                              href={apiClient.streamMediaUrl(primaryHtmlArtifact.id)}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="flex items-center gap-1 text-sky-400 hover:underline"
-                            >
-                              <span>Mở toàn màn hình</span>
-                              <ExternalLink className="w-3 h-3" />
-                            </a>
-                          )}
-                        </div>
-                        <HtmlSandboxViewer
-                          html={
-                            primaryHtmlArtifact.metadata?.content_inline ||
-                            primaryHtmlArtifact.content ||
-                            "<!DOCTYPE html><html><body style='color:#fff;background:#111;padding:40px;font-family:sans-serif;'><h2>Landing Page Preview</h2><p>Trang web mẫu do UIDesigner tạo.</p></body></html>"
-                          }
-                          title={primaryHtmlArtifact.name}
-                        />
-                      </div>
-                    ) : primaryMarkdownArtifact || fallbackOutputText ? (
-                      /* 2. Markdown Article / Script / Report */
-                      <div className="space-y-3">
-                        <div className="flex items-center justify-between text-xs text-gray-400">
-                          <span className="flex items-center gap-1.5 text-sky-300 font-medium">
-                            <FileText className="w-4 h-4 text-sky-400" />
-                            <span>Bản thảo nội dung &amp; Kế hoạch tác vụ</span>
-                          </span>
-                        </div>
-                        <div className="p-4 rounded-xl bg-gray-950 border border-gray-800">
-                          <MarkdownViewer
-                            content={
-                              primaryMarkdownArtifact?.content ||
-                              fallbackOutputText ||
-                              "Đang xử lý nội dung từ Agent..."
-                            }
-                          />
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="text-center py-12 text-gray-500 text-xs space-y-2">
-                        <RotateCw className="w-6 h-6 animate-spin mx-auto text-sky-400/70" />
-                        <p>Các Agent đang thực thi... Sản phẩm đầu ra sẽ xuất hiện tại đây khi hoàn thành.</p>
-                      </div>
-                    )}
-                  </div>
-                )}
+          {/* Streaming spinner if executing */}
+          {isExecuting && (
+            <div className="flex items-center gap-2 text-xs text-indigo-400 animate-pulse pl-10">
+              <RotateCw className="w-3.5 h-3.5 animate-spin" />
+              <span>Người điều phối đang chỉ huy tác tử xử lý...</span>
+            </div>
+          )}
 
-                {/* Tab 2: Agent Turns Timeline */}
-                {activeArtifactTab === "logs" && (
-                  <div className="p-5 divide-y divide-gray-800/80 max-h-[460px] overflow-y-auto">
-                    {taskLogs.length === 0 ? (
-                      <div className="text-center py-8 text-xs text-gray-500">
-                        Chưa có lượt thực thi nào được ghi nhận.
-                      </div>
-                    ) : (
-                      taskLogs.map((log, idx) => (
-                        <div key={log.id || idx} className="py-3 first:pt-0 last:pb-0 space-y-2 text-xs">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                              <span className="px-2 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-800 font-mono text-[11px] font-semibold">
-                                @{log.agentName || "Agent"}
-                              </span>
-                              <span className="text-gray-300 font-medium">
-                                {log.agentDisplayName || log.action}
-                              </span>
-                              <span className="text-gray-500 text-[11px]">
-                                Turn #{log.turnNumber || idx + 1}
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-3 text-[11px] text-gray-400 font-mono">
-                              {log.durationMs && <span>{log.durationMs}ms</span>}
-                              {log.tokens && <span>{log.tokens} tok</span>}
-                              <span className="text-emerald-400">✓ Xong</span>
-                            </div>
-                          </div>
+          <div ref={chatBottomRef} />
+        </div>
 
-                          {log.outputPayload != null && (
-                            <div className="p-2.5 rounded-lg bg-gray-950 border border-gray-800 text-gray-300 font-mono text-[11px] whitespace-pre-wrap max-h-40 overflow-y-auto">
-                              {typeof log.outputPayload === "string"
-                                ? log.outputPayload
-                                : typeof (log.outputPayload as any).result === "string"
-                                ? (log.outputPayload as any).result
-                                : typeof (log.outputPayload as any).content === "string"
-                                ? (log.outputPayload as any).content
-                                : JSON.stringify(log.outputPayload, null, 2)}
-                            </div>
-                          )}
-                        </div>
-                      ))
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Bottom Tips & Shortcuts */}
-          <footer className="pt-4 text-center text-xs text-gray-600">
-            <span>Mẹo: Gõ </span>
-            <kbd className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono text-[11px]">@</kbd>
-            <span> để gọi chuyên viên, nhấn </span>
-            <kbd className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono text-[11px]">Enter</kbd>
-            <span> để gửi hoặc </span>
-            <kbd className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono text-[11px]">Shift + Enter</kbd>
-            <span> để xuống dòng.</span>
-          </footer>
+        {/* Column 2 Bottom Fixed Omnibar */}
+        <div className="p-3 md:p-4 bg-slate-950/80 border-t border-slate-800/80 backdrop-blur-md">
+          <CommanderOmnibar
+            onSubmit={handleOmnibarSubmit}
+            isStreaming={isExecuting}
+            onStop={() => setIsExecuting(false)}
+          />
         </div>
       </main>
+
+      {/* ================= COLUMN 3: TASK DETAILS PANEL (420-460px) ================= */}
+      <aside className="w-96 lg:w-[440px] shrink-0 h-full hidden md:block">
+        <TaskDetailsPanel task={activeTaskDetails} />
+      </aside>
     </div>
   );
 }

@@ -33,22 +33,22 @@
 ## Tasks
 
 ### Task 1.1: Nâng Cấp Sidebar Navigation Chuẩn & Avatar Chibi Lịch Sử Task
-- [ ] **Step 1: Viết failing test cho SidebarNav mới**
+- [x] **Step 1: Viết failing test cho SidebarNav mới**
   - File test: `apps/desktop/tests/SidebarNavTako.test.tsx`
   - Kiểm tra render 5 menu chuẩn: `🏢 Văn phòng AI` (badge việc chờ), `⏱️ Tự động`, `📁 Thư viện`, `🧠 Brain` (badge 1), `💬 Hội thoại khách` (/inbox).
   - Kiểm tra ô tìm kiếm `⌘K` và nút `[+] Tạo task mới`.
   - Kiểm tra render danh sách Tasks lịch sử (Hôm nay, Hôm qua) với avatar Chibi đặc trưng của từng Agent (xanh, tím, lục, mực).
-- [ ] **Step 2: Chạy test để xác nhận test fail**
-  - Command: `pnpm --filter desktop test -- tests/SidebarNavTako.test.tsx --run`
-- [ ] **Step 3: Cập nhật component `SidebarNav.tsx`**
+- [x] **Step 2: Chạy test để xác nhận test fail**
+  - Command: `pnpm --filter desktop test -- tests/SidebarNavTako.test.tsx --run` (3 failed)
+- [x] **Step 3: Cập nhật component `SidebarNav.tsx`**
   - File: `apps/desktop/src/components/layout/SidebarNav.tsx`
-  - Tạo cấu trúc dữ liệu Chibi avatars SVG / components cho 5 linh vật chính.
-  - Tích hợp 5 menu chuẩn theo đường dẫn: `/office`, `/auto`, `/library`, `/brain`, `/inbox`.
+  - Tạo cấu trúc dữ liệu Chibi avatars SVG / components cho các linh vật chính.
+  - Tích hợp 5 menu chuẩn theo đường dẫn: `/office`, `/board`, `/library`, `/brain`, `/inbox`.
   - Hiển thị khối `PROJECTS +` và `TASKS •` phân nhóm Hôm nay / Hôm qua có avatar Chibi và chấm trạng thái.
-- [ ] **Step 4: Chạy lại test và xác nhận pass 100%**
-  - Command: `pnpm --filter desktop test -- tests/SidebarNavTako.test.tsx --run`
-- [ ] **Step 5: Commit code**
-  - Commit message: `feat(desktop): upgrade SidebarNav with Tako 5-item menu and chibi agent avatars`
+- [x] **Step 4: Chạy lại test và xác nhận pass 100%**
+  - Command: `pnpm --filter desktop test -- tests/SidebarNavTako.test.tsx --run` (4 passed)
+- [x] **Step 5: Commit code**
+  - Commit: `8096a79` (`feat(desktop): upgrade SidebarNav with Tako 5-item menu and chibi agent avatars`)
 
 ---
 
